@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="vibra-bg" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#191C28" />
+      <stop offset="100%" stop-color="#0B0C12" />
+    </linearGradient>
+    <linearGradient id="vibra-wave-outer" x1="14" y1="18" x2="50" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7A94FF" />
+      <stop offset="50%" stop-color="#4F6BFF" />
+      <stop offset="100%" stop-color="#8B5CF6" />
+    </linearGradient>
+    <linearGradient id="vibra-wave-inner" x1="20" y1="18" x2="44" y2="40" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#A8BCFF" />
+      <stop offset="100%" stop-color="#6A80FF" />
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#vibra-bg)" stroke="rgba(122,144,255,0.28)" stroke-width="2" />
+  <path
+    d="M15 20C19.5 20 21.8 22.8 25.4 30.2L30.2 40.4C31 42 33 42 33.8 40.4L38.6 30.2C42.2 22.8 44.5 20 49 20"
+    stroke="url(#vibra-wave-inner)"
+    stroke-width="3.2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M17 26.5C20.6 27.1 22.8 30.4 25.8 36.8L29.9 45.2C30.8 47 33.2 47 34.1 45.2L38.2 36.8C41.2 30.4 43.4 27.1 47 26.5"
+    stroke="url(#vibra-wave-outer)"
+    stroke-width="2.8"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    opacity="0.88"
+  />
+  <path
+    d="M21 34C23.4 35.4 25.4 38.6 27.5 42.8L29.8 47.4C30.7 49.2 33.3 49.2 34.2 47.4L36.5 42.8C38.6 38.6 40.6 35.4 43 34"
+    stroke="#4F6BFF"
+    stroke-width="2.2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    opacity="0.6"
+  />
+</svg>

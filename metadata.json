@@ -1,0 +1,6 @@
+{
+  "name": "VIBRA",
+  "description": "AI Music Discovery & Streaming Platform powered by YouTube Data API v3 and Gemini",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
