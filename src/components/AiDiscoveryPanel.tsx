@@ -70,7 +70,7 @@ export function AiDiscoveryPanel({
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           placeholder='Try "I want emotional Hindi songs" or "Play something energetic"'
-          className="flex-1 h-12 px-4 rounded-xl bg-[#090A0F] border border-white/10 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:border-[#4F6BFF]"
+          className="flex-1 h-12 pl-[11px] pr-4 py-[14px] rounded-xl bg-[#090A0F] border border-white/10 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:border-[#4F6BFF]"
         />
         <button
           type="submit"
@@ -99,9 +99,14 @@ export function AiDiscoveryPanel({
       {error && <ApiNoticeBanner title="AI Discovery Notice" message={error} />}
 
       {loading && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 pt-2">
+        <div className="flex gap-3.5 sm:gap-4 overflow-x-auto pb-2 no-scrollbar pt-2">
           {Array.from({ length: 4 }).map((_, i) => (
-            <TrackCardSkeleton key={i} />
+            <div
+              key={i}
+              className="w-[235px] sm:w-[255px] md:w-[265px] lg:w-[275px] shrink-0"
+            >
+              <TrackCardSkeleton />
+            </div>
           ))}
         </div>
       )}
@@ -166,14 +171,18 @@ export function AiDiscoveryPanel({
           )}
 
           {result.tracks.length > 0 && (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="flex gap-3.5 sm:gap-4 overflow-x-auto pb-2 snap-x snap-mandatory no-scrollbar">
               {result.tracks.map((track) => (
-                <TrackCard
+                <div
                   key={track.id}
-                  track={track}
-                  queueContext={result.tracks}
-                  onAddToPlaylist={onAddToPlaylist}
-                />
+                  className="w-[235px] sm:w-[255px] md:w-[265px] lg:w-[275px] shrink-0 snap-start"
+                >
+                  <TrackCard
+                    track={track}
+                    queueContext={result.tracks}
+                    onAddToPlaylist={onAddToPlaylist}
+                  />
+                </div>
               ))}
             </div>
           )}

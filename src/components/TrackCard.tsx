@@ -116,24 +116,24 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
           className="text-left min-w-0 flex-1 focus:outline-none"
         >
           <h3
-            className={`text-sm font-semibold leading-snug line-clamp-2 ${
-              isCurrent ? 'text-[#7A90FF]' : 'text-white group-hover:text-white'
+            className={`text-sm sm:text-[15px] font-semibold leading-snug line-clamp-2 break-words ${
+              isCurrent ? 'text-[#8CA2FF]' : 'text-white group-hover:text-white'
             }`}
           >
             {track.title}
           </h3>
-          <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-slate-400">
-            <span className="truncate max-w-[140px]">{track.artist}</span>
+          <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs sm:text-[13px] font-medium text-slate-300">
+            <span className="line-clamp-1 break-words">{track.artist}</span>
             {track.viewCount && (
               <>
-                <span aria-hidden="true">·</span>
-                <span className="font-mono-tabular whitespace-nowrap">{track.viewCount}</span>
+                <span aria-hidden="true" className="text-slate-500">·</span>
+                <span className="font-mono-tabular whitespace-nowrap text-slate-300">{track.viewCount}</span>
               </>
             )}
             {timestampLabel && (
               <>
-                <span aria-hidden="true">·</span>
-                <span className="whitespace-nowrap text-slate-500">{timestampLabel}</span>
+                <span aria-hidden="true" className="text-slate-500">·</span>
+                <span className="whitespace-nowrap text-slate-400">{timestampLabel}</span>
               </>
             )}
           </div>
@@ -146,7 +146,7 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
             onClick={() => toggleFavourite(track)}
             aria-label={fav ? `Remove ${track.title} from favourites` : `Add ${track.title} to favourites`}
             title={fav ? 'Remove from favourites' : 'Save to favourites'}
-            className={`min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg transition-colors ${
+            className={`min-h-[40px] min-w-[38px] sm:min-w-[40px] flex items-center justify-center rounded-lg transition-colors ${
               fav ? 'text-rose-400 hover:bg-rose-500/10' : 'text-slate-400 hover:text-white hover:bg-white/5'
             }`}
           >
@@ -158,7 +158,7 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
             onClick={() => onAddToPlaylist(track)}
             aria-label={`Add ${track.title} to playlist`}
             title="Add to playlist"
-            className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg text-slate-400 hover:text-[#7A90FF] hover:bg-white/5 transition-colors"
+            className="min-h-[40px] min-w-[38px] sm:min-w-[40px] flex items-center justify-center rounded-lg text-slate-400 hover:text-[#7A90FF] hover:bg-white/5 transition-colors"
           >
             <PlusSquare className="w-4 h-4" />
           </button>
@@ -168,7 +168,7 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
               type="button"
               onClick={() => setMenuOpen((v) => !v)}
               aria-label={`More actions for ${track.title}`}
-              className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-white/5 transition-colors"
+              className="min-h-[40px] min-w-[38px] sm:min-w-[40px] flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-white/5 transition-colors"
             >
               <MoreHorizontal className="w-4 h-4" />
             </button>
@@ -317,21 +317,21 @@ export function TrackRow({
       </button>
 
       <button type="button" onClick={handlePlay} className="min-w-0 flex-1 text-left">
-        <p className={`text-sm font-medium truncate ${isCurrent ? 'text-[#7A90FF]' : 'text-white'}`}>
+        <p className={`text-[13px] sm:text-[15px] font-semibold line-clamp-2 break-words leading-snug ${isCurrent ? 'text-[#8CA2FF]' : 'text-white'}`}>
           {track.title}
         </p>
-        <div className="flex items-center gap-1.5 text-xs text-slate-400 truncate mt-0.5">
-          <span className="truncate">{track.artist}</span>
+        <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs sm:text-[13px] font-medium text-slate-300 mt-0.5">
+          <span className="line-clamp-1 break-words">{track.artist}</span>
           {track.viewCount && (
             <>
-              <span aria-hidden="true">·</span>
-              <span className="font-mono-tabular shrink-0">{track.viewCount}</span>
+              <span aria-hidden="true" className="text-slate-500">·</span>
+              <span className="font-mono-tabular shrink-0 text-slate-300">{track.viewCount}</span>
             </>
           )}
           {timestampLabel && (
             <>
-              <span aria-hidden="true">·</span>
-              <span className="shrink-0 text-slate-500">{timestampLabel}</span>
+              <span aria-hidden="true" className="text-slate-500">·</span>
+              <span className="shrink-0 text-slate-400">{timestampLabel}</span>
             </>
           )}
         </div>
@@ -364,7 +364,7 @@ export function TrackRow({
         <button
           type="button"
           onClick={() => onAddToPlaylist(track)}
-          className="min-h-[36px] px-2.5 flex items-center justify-center gap-1.5 rounded-lg bg-white/[0.05] hover:bg-[#4F6BFF]/20 border border-white/[0.08] hover:border-[#4F6BFF]/40 text-xs font-medium text-slate-200 hover:text-white transition-colors"
+          className="min-h-[40px] min-w-[40px] px-2.5 flex items-center justify-center gap-1.5 rounded-lg bg-white/[0.05] hover:bg-[#4F6BFF]/20 border border-white/[0.08] hover:border-[#4F6BFF]/40 text-xs font-medium text-slate-200 hover:text-white transition-colors"
           aria-label={`Add ${track.title} to playlist`}
           title="Add to playlist"
         >

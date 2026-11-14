@@ -114,13 +114,13 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
   const activeLangMeta = INDIA_LANGUAGE_OPTIONS.find((l) => l.id === indiaLang);
 
   return (
-    <div className="space-y-10 pb-8">
+    <div className="space-y-8 sm:space-y-10 pb-8">
       {/* Greeting & Hero Section */}
-      <section className="space-y-5">
-        <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
+      <section className="space-y-4 sm:space-y-5">
+        <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3 sm:gap-4">
           <div>
             <p className="text-xs font-medium text-[#7A90FF] tracking-wide">{greeting}</p>
-            <h1 className="text-2xl sm:text-3xl lg:text-4xl font-bold text-white tracking-tight mt-1 text-balance">
+            <h1 className="text-xl sm:text-3xl lg:text-4xl font-bold text-white tracking-tight mt-0.5 sm:mt-1 text-balance">
               Soundscapes tailored to your moment
             </h1>
           </div>
@@ -143,7 +143,7 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
         </div>
 
         {/* India Multi-Language Music Filter Strip */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-2.5 sm:gap-3">
           <div
             className="flex items-center gap-1 p-1 rounded-xl bg-[#11131A] border border-white/[0.07] overflow-x-auto no-scrollbar max-w-full"
             role="tablist"
@@ -158,7 +158,7 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
                   role="tab"
                   aria-selected={active}
                   onClick={() => setIndiaLang(opt.id)}
-                  className={`px-3.5 py-2 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
+                  className={`px-3 sm:px-3.5 py-2 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
                     active
                       ? 'bg-[#4F6BFF] text-white'
                       : 'text-slate-400 hover:text-white hover:bg-white/[0.04]'
@@ -175,7 +175,7 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
         </div>
 
         {/* Hero Feature Banner */}
-        <div className="relative rounded-2xl overflow-hidden border border-white/[0.08] bg-[#11131A] min-h-[220px] sm:min-h-[250px] flex items-end">
+        <div className="relative rounded-2xl overflow-hidden border border-white/[0.08] bg-[#11131A] min-h-[190px] sm:min-h-[240px] flex items-end">
           <img
             src={HERO_BANNER_IMAGE}
             alt="VIBRA Studio Console"
@@ -183,12 +183,12 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
           />
           <div className="absolute inset-0 bg-gradient-to-r from-[#090A0F]/95 via-[#090A0F]/75 to-[#090A0F]/30" />
 
-          <div className="relative z-10 p-6 sm:p-8 max-w-2xl space-y-4">
+          <div className="relative z-10 p-5 sm:p-8 max-w-2xl space-y-3 sm:space-y-4">
             <p className="text-xs font-medium text-[#7A90FF]">VIBRA Discovery</p>
-            <h2 className="text-xl sm:text-2xl font-bold text-white leading-snug text-balance">
+            <h2 className="text-lg sm:text-2xl font-bold text-white leading-snug text-balance">
               Stream trending hits, high-energy mixes, or ask Vibra AI for your exact mood.
             </h2>
-            <div className="flex flex-wrap items-center gap-3 pt-1">
+            <div className="flex flex-wrap items-center gap-2.5 sm:gap-3 pt-1">
               <button
                 type="button"
                 onClick={() => {
@@ -196,7 +196,7 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
                   if (first) playTrack(first, categories.trending.tracks);
                   else onNavigate('search');
                 }}
-                className="h-11 px-5 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-sm font-semibold inline-flex items-center gap-2 whitespace-nowrap transition-colors"
+                className="h-10 sm:h-11 px-4 sm:px-5 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-xs sm:text-sm font-semibold inline-flex items-center gap-2 whitespace-nowrap transition-colors"
               >
                 <Play className="w-4 h-4 fill-current" />
                 <span>Play Trending Mix</span>
@@ -204,7 +204,7 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
               <button
                 type="button"
                 onClick={() => onNavigate('explore')}
-                className="h-11 px-5 rounded-xl bg-white/10 hover:bg-white/15 backdrop-blur-md border border-white/15 text-white text-sm font-medium inline-flex items-center gap-2 whitespace-nowrap transition-colors"
+                className="h-10 sm:h-11 px-4 sm:px-5 rounded-xl bg-white/10 hover:bg-white/15 backdrop-blur-md border border-white/15 text-white text-xs sm:text-sm font-medium inline-flex items-center gap-2 whitespace-nowrap transition-colors"
               >
                 <Sparkles className="w-4 h-4 text-[#7A90FF]" />
                 <span>Open AI Mood Studio</span>
@@ -227,9 +227,9 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
         />
       )}
 
-      {/* Recently Played Section */}
+      {/* Recently Played Section — Horizontal Scroll Carousel */}
       {recentlyPlayed.length > 0 && (
-        <section className="space-y-4">
+        <section className="space-y-3.5 sm:space-y-4">
           <div className="flex items-center justify-between gap-4">
             <div>
               <h2 className="text-lg sm:text-xl font-bold text-white">Recently Played</h2>
@@ -244,9 +244,12 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
             </button>
           </div>
 
-          <div className="flex gap-4 overflow-x-auto no-scrollbar pb-2 snap-x">
-            {recentlyPlayed.slice(0, 8).map((item) => (
-              <div key={`${item.track.id}_${item.playedAt}`} className="w-[240px] sm:w-[260px] shrink-0 snap-start">
+          <div className="flex gap-3.5 sm:gap-4 overflow-x-auto pb-2 snap-x snap-mandatory no-scrollbar -mx-3.5 px-3.5 sm:mx-0 sm:px-0">
+            {recentlyPlayed.slice(0, 10).map((item) => (
+              <div
+                key={`${item.track.id}_${item.playedAt}`}
+                className="w-[235px] sm:w-[255px] md:w-[265px] lg:w-[275px] shrink-0 snap-start"
+              >
                 <TrackCard
                   track={item.track}
                   queueContext={recentlyPlayed.map((r) => r.track)}
@@ -259,25 +262,27 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
         </section>
       )}
 
-      {/* Four Primary Discovery Categories in Exact Requested Order */}
+      {/* Four Primary Discovery Categories — Horizontal Scroll Carousels */}
       {DISCOVERY_CATEGORIES.map((cat) => {
         const state = categories[cat.id];
         return (
-          <section key={cat.id} className="space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div>
-                <h2 className="text-xl sm:text-2xl font-bold text-white tracking-tight">
+          <section key={cat.id} className="space-y-3.5 sm:space-y-4">
+            <div className="flex flex-wrap items-start sm:items-center justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <h2 className="text-lg sm:text-2xl font-bold text-white tracking-tight">
                   {cat.title}
                 </h2>
-                <p className="text-xs sm:text-sm text-slate-400 mt-0.5">{cat.subtitle}</p>
+                <p className="text-xs sm:text-sm text-slate-300 mt-0.5 leading-snug">
+                  {cat.subtitle}
+                </p>
               </div>
 
-              <div className="flex items-center gap-2 self-start sm:self-auto">
+              <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
                 {state.tracks.length > 0 && (
                   <button
                     type="button"
                     onClick={() => playTrack(state.tracks[0], state.tracks)}
-                    className="h-9 px-3.5 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] text-xs font-medium text-white inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                    className="h-9 px-3 sm:px-3.5 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] text-xs font-medium text-white inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
                   >
                     <Play className="w-3.5 h-3.5 fill-current" />
                     <span>Play All</span>
@@ -293,7 +298,7 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
                     })
                   }
                   disabled={state.loading}
-                  className="h-9 px-3.5 rounded-xl bg-[#11131A] hover:bg-[#181B26] border border-white/10 text-xs font-medium text-slate-200 inline-flex items-center gap-1.5 whitespace-nowrap transition-colors disabled:opacity-50"
+                  className="h-9 px-3 sm:px-3.5 rounded-xl bg-[#11131A] hover:bg-[#181B26] border border-white/10 text-xs font-medium text-slate-200 inline-flex items-center gap-1.5 whitespace-nowrap transition-colors disabled:opacity-50"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${state.loading ? 'animate-spin' : ''}`} />
                   <span>{cat.id === 'energetic' ? 'AI Refresh' : 'Refresh'}</span>
@@ -321,11 +326,16 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
               </div>
             )}
 
-            {/* Category Content */}
+            {/* Category Content: Horizontal Scroll Carousel Across All Devices */}
             {state.loading ? (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                {Array.from({ length: 4 }).map((_, idx) => (
-                  <TrackCardSkeleton key={idx} />
+              <div className="flex gap-3.5 sm:gap-4 overflow-x-auto pb-2 no-scrollbar -mx-3.5 px-3.5 sm:mx-0 sm:px-0">
+                {Array.from({ length: 5 }).map((_, idx) => (
+                  <div
+                    key={idx}
+                    className="w-[235px] sm:w-[255px] md:w-[265px] lg:w-[275px] shrink-0"
+                  >
+                    <TrackCardSkeleton />
+                  </div>
                 ))}
               </div>
             ) : state.error ? (
@@ -345,28 +355,19 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
               <div className="rounded-xl bg-[#11131A] border border-white/[0.06] px-4 py-8 text-center text-sm text-slate-400">
                 No tracks found for this category right now. Try refreshing.
               </div>
-            ) : cat.id === 'trending' ? (
-              /* Trending Now Horizontal Carousel on mobile/tablet, 4-col grid on desktop */
-              <div className="flex lg:grid lg:grid-cols-4 gap-4 overflow-x-auto no-scrollbar pb-2 snap-x">
-                {state.tracks.slice(0, 8).map((track) => (
-                  <div key={track.id} className="w-[260px] sm:w-[280px] lg:w-auto shrink-0 snap-start">
+            ) : (
+              <div className="flex gap-3.5 sm:gap-4 overflow-x-auto pb-2 snap-x snap-mandatory no-scrollbar -mx-3.5 px-3.5 sm:mx-0 sm:px-0">
+                {state.tracks.map((track) => (
+                  <div
+                    key={track.id}
+                    className="w-[235px] sm:w-[255px] md:w-[265px] lg:w-[275px] shrink-0 snap-start"
+                  >
                     <TrackCard
                       track={track}
                       queueContext={state.tracks}
                       onAddToPlaylist={onAddToPlaylist}
                     />
                   </div>
-                ))}
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                {state.tracks.slice(0, 8).map((track) => (
-                  <TrackCard
-                    key={track.id}
-                    track={track}
-                    queueContext={state.tracks}
-                    onAddToPlaylist={onAddToPlaylist}
-                  />
                 ))}
               </div>
             )}

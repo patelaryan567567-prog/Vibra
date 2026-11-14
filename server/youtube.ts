@@ -1,8 +1,14 @@
+import fs from 'node:fs';
 import type { CategoryId, IndiaLanguageFilter, Track } from '../src/types/music.ts';
-import { generateTrendingViralSongs } from './gemini.ts';
+import {
+  generateCategoryQueries,
+  generateTrendingViralSongs,
+  hasConfiguredGeminiKeys,
+} from './gemini.ts';
 
 const YT_API_BASE = 'https://www.googleapis.com/youtube/v3';
 const FETCH_TIMEOUT_MS = 8000;
+const DISK_CACHE_PATH = '/tmp/vibra-yt-cache-v2.json';
 
 export class YouTubeApiError extends Error {
   status: number;
@@ -24,10 +30,12 @@ class TtlCache<T> {
   private map = new Map<string, CacheEntry<T>>();
   private maxEntries: number;
   private defaultTtlMs: number;
+  private onDirty?: () => void;
 
-  constructor(maxEntries: number, defaultTtlMs: number) {
+  constructor(maxEntries: number, defaultTtlMs: number, onDirty?: () => void) {
     this.maxEntries = maxEntries;
     this.defaultTtlMs = defaultTtlMs;
+    this.onDirty = onDirty;
   }
 
   get(key: string): T | undefined {
@@ -53,15 +61,95 @@ class TtlCache<T> {
       }
     }
     this.map.set(key, { data, expiresAt: Date.now() + ttlMs });
+    this.onDirty?.();
+  }
+
+  exportValidEntries(): Array<[string, CacheEntry<T>]> {
+    const now = Date.now();
+    const out: Array<[string, CacheEntry<T>]> = [];
+    for (const [k, v] of this.map.entries()) {
+      if (v.expiresAt > now) out.push([k, v]);
+    }
+    return out;
+  }
+
+  importEntries(entries: Array<[string, CacheEntry<T>]> | undefined): void {
+    if (!Array.isArray(entries)) return;
+    const now = Date.now();
+    for (const [k, v] of entries) {
+      if (typeof k === 'string' && v && v.expiresAt > now && v.data !== undefined) {
+        this.map.set(k, v);
+      }
+    }
   }
 }
 
-const videoCache = new TtlCache<Track>(600, 120 * 60 * 1000);
-const trendingCache = new TtlCache<Track[]>(32, 60 * 60 * 1000);
-const categoryCache = new TtlCache<Track[]>(96, 30 * 60 * 1000);
-const searchCache = new TtlCache<{ tracks: Track[]; nextPageToken?: string }>(160, 30 * 60 * 1000);
-const relatedCache = new TtlCache<Track[]>(100, 60 * 60 * 1000);
-const suggestionsCache = new TtlCache<string[]>(120, 60 * 60 * 1000);
+let diskSaveTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleDiskCacheSave() {
+  if (diskSaveTimer) return;
+  diskSaveTimer = setTimeout(() => {
+    diskSaveTimer = null;
+    try {
+      const payload = {
+        video: videoCache.exportValidEntries(),
+        trending: trendingCache.exportValidEntries(),
+        category: categoryCache.exportValidEntries(),
+        search: searchCache.exportValidEntries(),
+        related: relatedCache.exportValidEntries(),
+        handleUploads: handleUploadsCache.exportValidEntries(),
+        playlistIds: playlistVideoIdsCache.exportValidEntries(),
+        videoChannelIds: videoChannelIdCache.exportValidEntries(),
+        videoTags: videoMetaCache.exportValidEntries(),
+      };
+      fs.writeFile(DISK_CACHE_PATH, JSON.stringify(payload), () => {});
+    } catch {
+      // ignore read-only fs errors
+    }
+  }, 2500);
+}
+
+const videoCache = new TtlCache<Track>(1200, 12 * 60 * 60 * 1000, scheduleDiskCacheSave);
+const trendingCache = new TtlCache<Track[]>(48, 6 * 60 * 60 * 1000, scheduleDiskCacheSave);
+const categoryCache = new TtlCache<Track[]>(120, 6 * 60 * 60 * 1000, scheduleDiskCacheSave);
+const searchCache = new TtlCache<{ tracks: Track[]; nextPageToken?: string }>(
+  250,
+  4 * 60 * 60 * 1000,
+  scheduleDiskCacheSave
+);
+const relatedCache = new TtlCache<Track[]>(160, 6 * 60 * 60 * 1000, scheduleDiskCacheSave);
+const handleUploadsCache = new TtlCache<string>(250, 7 * 24 * 60 * 60 * 1000, scheduleDiskCacheSave);
+const playlistVideoIdsCache = new TtlCache<string[]>(250, 6 * 60 * 60 * 1000, scheduleDiskCacheSave);
+const videoChannelIdCache = new TtlCache<string>(1200, 7 * 24 * 60 * 60 * 1000, scheduleDiskCacheSave);
+const videoMetaCache = new TtlCache<string>(1200, 12 * 60 * 60 * 1000, scheduleDiskCacheSave);
+const suggestionsCache = new TtlCache<string[]>(200, 6 * 60 * 60 * 1000);
+
+// Hydrate warm cache across dev restarts / Cloud Run warm containers
+try {
+  if (fs.existsSync(DISK_CACHE_PATH)) {
+    const raw = JSON.parse(fs.readFileSync(DISK_CACHE_PATH, 'utf8')) as {
+      video?: Array<[string, CacheEntry<Track>]>;
+      trending?: Array<[string, CacheEntry<Track[]>]>;
+      category?: Array<[string, CacheEntry<Track[]>]>;
+      search?: Array<[string, CacheEntry<{ tracks: Track[]; nextPageToken?: string }>]>;
+      related?: Array<[string, CacheEntry<Track[]>]>;
+      handleUploads?: Array<[string, CacheEntry<string>]>;
+      playlistIds?: Array<[string, CacheEntry<string[]>]>;
+      videoChannelIds?: Array<[string, CacheEntry<string>]>;
+      videoTags?: Array<[string, CacheEntry<string>]>;
+    };
+    videoCache.importEntries(raw.video);
+    trendingCache.importEntries(raw.trending);
+    categoryCache.importEntries(raw.category);
+    searchCache.importEntries(raw.search);
+    relatedCache.importEntries(raw.related);
+    handleUploadsCache.importEntries(raw.handleUploads);
+    playlistVideoIdsCache.importEntries(raw.playlistIds);
+    videoChannelIdCache.importEntries(raw.videoChannelIds);
+    videoMetaCache.importEntries(raw.videoTags);
+  }
+} catch {
+  // ignore corrupted cache file
+}
 
 const inFlight = new Map<string, Promise<unknown>>();
 
@@ -82,19 +170,31 @@ const exhaustedKeyUntil = new Map<string, number>();
 const searchExhaustedKeyUntil = new Map<string, number>();
 let activeKeyIndex = 0;
 
+interface SlotDiagnostic {
+  slot: number;
+  lastScope: 'search' | 'videos';
+  lastStatus: number;
+  lastReason: string;
+  lastMessage: string;
+  updatedAt: number;
+}
+const slotDiagnostics = new Map<number, SlotDiagnostic>();
+
 function isPlaceholderKey(raw: string): boolean {
   return !raw || /^MY_YOUTUBE_API_KEY(_\d+)?$/i.test(raw);
 }
 
 export function getYoutubeApiKeys(): string[] {
-  const candidates = [
-    process.env.YOUTUBE_API_KEY,
-    process.env.YOUTUBE_API_KEY_2,
-    process.env.YOUTUBE_API_KEY_3,
-    process.env.YOUTUBE_API_KEY_4,
-    process.env.YOUTUBE_API_KEY_5,
-    process.env.YOUTUBE_API_KEYS,
-  ];
+  const numberedEnvKeys = Object.keys(process.env)
+    .filter((name) => /^YOUTUBE_API_KEY(_\d+)?$/i.test(name))
+    .sort((a, b) => {
+      const numA = parseInt(a.match(/_KEY_(\d+)$/i)?.[1] ?? '1', 10);
+      const numB = parseInt(b.match(/_KEY_(\d+)$/i)?.[1] ?? '1', 10);
+      return numA - numB;
+    })
+    .map((name) => process.env[name]);
+
+  const candidates = [...numberedEnvKeys, process.env.YOUTUBE_API_KEYS];
 
   const unique = new Set<string>();
   for (const raw of candidates) {
@@ -125,11 +225,20 @@ function ensureYoutubeConfigured(): string[] {
   return keys;
 }
 
+export function hasAvailableSearchKey(): boolean {
+  const keys = getYoutubeApiKeys();
+  const now = Date.now();
+  return keys.some(
+    (key) => (exhaustedKeyUntil.get(key) ?? 0) <= now && (searchExhaustedKeyUntil.get(key) ?? 0) <= now
+  );
+}
+
 export function getYoutubeKeyStatus(): {
   totalKeys: number;
   activeKeySlot: number;
   exhaustedKeysCount: number;
   searchExhaustedKeysCount: number;
+  slotDiagnostics: SlotDiagnostic[];
 } {
   const keys = getYoutubeApiKeys();
   const now = Date.now();
@@ -146,6 +255,7 @@ export function getYoutubeKeyStatus(): {
     activeKeySlot: keys.length > 0 ? (activeKeyIndex % keys.length) + 1 : 0,
     exhaustedKeysCount,
     searchExhaustedKeysCount,
+    slotDiagnostics: Array.from(slotDiagnostics.values()).sort((a, b) => a.slot - b.slot),
   };
 }
 
@@ -173,21 +283,29 @@ function isPhonkTrack(title: string, channelTitle = ''): boolean {
 }
 
 const COMPILATION_TITLE_RE =
-  /\b(jukebox|nonstop|non-stop|timestamps|all trending|songs playlist|top\s+\d+\s+songs|best\s+of\s+20\d\d|songs that|gen\s*z|1\s*hour|30\s*min|full\s*album|back\s*to\s*back|#playlist|#shorts|lofi mix|slowed\s*[+&]?\s*reverb|slow\s*reverb|mashup compilation|8d\s*audio)\b/i;
+  /\b(jukebox|nonstop|non-stop|non\s+stop|timestamps|all trending|songs playlist|top\s+\d+\s+songs|best\s+of\b|songs that|gen\s*z|1\s*hour|30\s*min|\d+\s*minutes?\s+of|full\s*album|back\s*to\s*back|#playlist|#shorts|lofi\s*mix|chillout\s*lo-?fi|slowed|slow\s*reverb|mashups?|mega\s*mix|megamix|yearmix|party\s*mix|dj\s*mix|mixtape|sukoon\s*mix|8d\s*audio)\b/i;
 const CLUTTER_TITLE_RE =
-  /\b(aarti|bhajan|chalisa|mantra|stuti|bhakti|kirtan|bhojpuri|maghi|maithili|glimpse|teaser|trailer|dialogue promo|first look|motion poster|indian idol|sa re ga ma|superstar singer|whatsapp status|ringtone|became a superhit|how a song|unique dance|cover version|ai music video|ranking raaga)\b/i;
+  /\b(aarti|bhajan|chalisa|mantra|stuti|bhakti|kirtan|jai\s+jai\s+ram|ramayana|mangal\s+rang|bhojpuri|maghi|maithili|glimpse|teaser|trailer|dialogue promo|first look|motion poster|indian idol|sa re ga ma|superstar singer|whatsapp status|ringtone|became a superhit|how a song|unique dance|cover version|ai music video|ranking raaga|goldmines|gaane sune ansune|sadaabahar|90s\s*hits|co-headline|halftime show|fifa world cup)\b/i;
+const DEVOTIONAL_RE = /\b(aarti|bhajan|chalisa|mantra|stuti|bhakti|kirtan|jai\s+jai\s+ram|ramayana|mangal\s+rang)\b/i;
 const SOUTH_REGIONAL_RE =
   /[\u0980-\u09FF\u0B00-\u0DFF]|\b(tamil|telugu|malayalam|kannada|odia|bengali)\b.*\b(glimpse|teaser|promo|lyrical|song|official)\b/i;
 
-function isValidTrendingSong(track: Track, lang: IndiaLanguageFilter): boolean {
+function isValidMusicTrack(
+  track: Track,
+  lang: IndiaLanguageFilter,
+  opts?: { allowDevotional?: boolean; minViews?: number }
+): boolean {
   if (isPhonkTrack(track.title, track.channelTitle)) return false;
 
   const dur = track.durationSeconds ?? 0;
-  // Individual songs are roughly 1:05 to 8:00; blocks <1m clips/teasers and 15-60m jukeboxes
-  if (dur > 0 && (dur < 65 || dur > 480)) return false;
+  // Individual songs are roughly 1:10 to 8:00; blocks 10s status clips and 15-100m mixtapes/jukeboxes
+  if (dur > 0 && (dur < 70 || dur > 480)) return false;
 
-  // Trending viral hits in India must have meaningful real viewership (filters 37-play AI spam uploads)
-  if (typeof track.viewCountRaw === 'number' && track.viewCountRaw < 25_000) return false;
+  // Enforce high real viewership unless track is very recent (< 7 days old)
+  const publishedMs = track.publishedAt ? Date.parse(track.publishedAt) : 0;
+  const isVeryFresh = publishedMs > 0 && Date.now() - publishedMs < 7 * 24 * 60 * 60 * 1000;
+  const threshold = isVeryFresh ? 25_000 : opts?.minViews ?? 100_000;
+  if (typeof track.viewCountRaw === 'number' && track.viewCountRaw < threshold) return false;
 
   if (COMPILATION_TITLE_RE.test(track.title)) return false;
 
@@ -197,8 +315,11 @@ function isValidTrendingSong(track: Track, lang: IndiaLanguageFilter): boolean {
   if (/mp3#/i.test(track.title)) return false;
 
   if (lang !== 'english') {
-    if (CLUTTER_TITLE_RE.test(track.title) || CLUTTER_TITLE_RE.test(track.channelTitle)) {
-      return false;
+    const clutterMatch = CLUTTER_TITLE_RE.test(track.title) || CLUTTER_TITLE_RE.test(track.channelTitle);
+    if (clutterMatch) {
+      if (!(opts?.allowDevotional && DEVOTIONAL_RE.test(`${track.title} ${track.channelTitle}`))) {
+        return false;
+      }
     }
     if ((lang === 'all' || lang === 'hindi' || lang === 'mix') && SOUTH_REGIONAL_RE.test(track.title)) {
       return false;
@@ -208,11 +329,67 @@ function isValidTrendingSong(track: Track, lang: IndiaLanguageFilter): boolean {
   return true;
 }
 
+function scoreTrackQuality(track: Track, rawQuery = ''): number {
+  let score = 0;
+  const dur = track.durationSeconds ?? 0;
+  const views = track.viewCountRaw ?? 0;
+  const qLower = rawQuery.toLowerCase();
+  const titleLower = track.title.toLowerCase();
+  const channelLower = track.channelTitle.toLowerCase();
+
+  // Strongly prefer normal single-song length (1:15 to 7:30)
+  if (dur >= 75 && dur <= 450) {
+    score += 45;
+  } else if (dur > 450 && dur <= 600) {
+    score += 18;
+  } else if (dur > 600) {
+    score -= 30;
+  } else if (dur > 0 && dur < 70) {
+    score -= 80;
+  }
+
+  if (views > 0) {
+    score += Math.log10(views) * 12;
+  }
+  if (/\b(official\s*(music\s*)?(video|audio|visualiser|visualizer)|full\s*(video|song|audio)|lyric(al)?\s*video|coke studio)\b/i.test(track.title)) {
+    score += 18;
+  }
+  if (
+    /\b(t-series|zee music|yrf|sony music|saregama|tips official|desi melodies|speed records|vyrl|warner music|coke studio|universal music|rehaan records|artiste first)\b/i.test(
+      track.channelTitle
+    ) &&
+    !/\b(bhakti|sagar|devotional)\b/i.test(track.channelTitle)
+  ) {
+    score += 12;
+  }
+
+  // Exact query tokens in title boost the original song
+  const queryWords = qLower.split(/\s+/).filter((w) => w.length >= 3);
+  let matchedWords = 0;
+  for (const w of queryWords) {
+    if (titleLower.includes(w) || channelLower.includes(w)) matchedWords++;
+  }
+  if (queryWords.length > 0 && matchedWords === queryWords.length) {
+    score += 18;
+  }
+
+  // Penalize fan-edits, covers, mashups, remixes, kidz bop, 8D/16D, or bhakti unless explicitly asked for
+  if (!/\b(remix|mashup|slowed|reverb|lofi|cover|karaoke|8d|16d|kids|bhakti|bhajan)\b/i.test(qLower)) {
+    if (/\b(cover|karaoke|instrumental|8d|16d|slowed|reverb|lofi|status|ringtone|teaser|promo|glimpse|kidz\s*bop|tribute)\b/i.test(track.title) || /\b(kidz\s*bop|bhakti)\b/i.test(track.channelTitle)) {
+      score -= 45;
+    }
+    if (/\b(remix|mashups?)\b/i.test(track.title) || COMPILATION_TITLE_RE.test(track.title)) {
+      score -= 42;
+    }
+  }
+  return score;
+}
+
 export function pickBestOfficialTrack(
   candidates: Track[],
   lang: IndiaLanguageFilter = 'all'
 ): Track | undefined {
-  const valid = candidates.filter((t) => isValidTrendingSong(t, lang));
+  const valid = candidates.filter((t) => isValidMusicTrack(t, lang));
   const pool =
     valid.length > 0
       ? valid
@@ -220,8 +397,8 @@ export function pickBestOfficialTrack(
           const dur = t.durationSeconds ?? 0;
           return (
             !isPhonkTrack(t.title, t.channelTitle) &&
-            (dur === 0 || (dur >= 65 && dur <= 480)) &&
-            !/\b(slowed|slow\s*reverb|8d\s*audio|ringtone)\b/i.test(t.title)
+            (dur === 0 || (dur >= 70 && dur <= 480)) &&
+            !/\b(slowed|slow\s*reverb|8d\s*audio|ringtone|jukebox|playlist|nonstop)\b/i.test(t.title)
           );
         });
 
@@ -231,20 +408,7 @@ export function pickBestOfficialTrack(
   let bestScore = -Infinity;
 
   for (const t of pool) {
-    let score = 0;
-    const views = t.viewCountRaw ?? 0;
-    if (views > 0) {
-      score += Math.log10(views) * 10;
-    }
-    if (/\b(official\s*(music\s*)?(video|audio)|full\s*video|lyric\s*video|coke studio)\b/i.test(t.title)) {
-      score += 12;
-    }
-    if (/\b(t-series|zee music|yrf|sony music|saregama|tips official|desi melodies|speed records|vyrl|warner music|coke studio|aurora|aur)\b/i.test(t.channelTitle)) {
-      score += 10;
-    }
-    if (/\b(cover|karaoke|instrumental|8d|reverb|lofi|status)\b/i.test(t.title)) {
-      score -= 18;
-    }
+    const score = scoreTrackQuality(t);
     if (score > bestScore) {
       bestScore = score;
       bestTrack = t;
@@ -310,8 +474,11 @@ interface YouTubeVideoItem {
   id: string;
   snippet?: {
     title?: string;
+    channelId?: string;
     channelTitle?: string;
     publishedAt?: string;
+    tags?: string[];
+    description?: string;
     thumbnails?: {
       medium?: { url?: string };
       high?: { url?: string };
@@ -383,6 +550,17 @@ async function fetchYouTubeJson<T>(
 
     if (res.ok) {
       activeKeyIndex = keyIdx;
+      const existingDiag = slotDiagnostics.get(keyIdx + 1);
+      if (!existingDiag || existingDiag.lastScope === scope || scope === 'search') {
+        slotDiagnostics.set(keyIdx + 1, {
+          slot: keyIdx + 1,
+          lastScope: scope,
+          lastStatus: 200,
+          lastReason: 'ok',
+          lastMessage: `${scope} ok`,
+          updatedAt: Date.now(),
+        });
+      }
       return (await res.json()) as T;
     }
 
@@ -412,18 +590,32 @@ async function fetchYouTubeJson<T>(
           keys.length > 1
             ? `YouTube Data API quota exceeded across configured API keys. Please try again later.`
             : 'YouTube Data API daily quota exceeded. Please try again later.';
-      } else if (reason === 'keyInvalid' || reason === 'keyExpired') {
+      } else if (
+        reason === 'keyInvalid' ||
+        reason === 'keyExpired' ||
+        /API key expired|API key not valid|keyInvalid|keyExpired/i.test(rawMessage)
+      ) {
         code = 'YOUTUBE_API_KEY_INVALID';
-        message = 'The configured YOUTUBE_API_KEY is invalid. Please verify it in your environment secrets.';
+        message = 'One of the configured YOUTUBE_API_KEY entries is expired or invalid. Please renew it in your environment secrets.';
       }
     } catch {
       // ignore json parse failure
     }
 
+    slotDiagnostics.set(keyIdx + 1, {
+      slot: keyIdx + 1,
+      lastScope: scope,
+      lastStatus: res.status,
+      lastReason: reason || code,
+      lastMessage: rawMessage.slice(0, 180),
+      updatedAt: Date.now(),
+    });
+
     const isKeyOrQuotaFailure =
       code === 'YOUTUBE_QUOTA_EXCEEDED' ||
       code === 'YOUTUBE_API_KEY_INVALID' ||
       res.status === 429 ||
+      (res.status === 400 && /api\s*key/i.test(`${rawMessage} ${reason}`)) ||
       (res.status === 403 && /quota|limit|rate|key|forbidden|accessNotConfigured/i.test(`${rawMessage} ${reason}`));
 
     if (isKeyOrQuotaFailure) {
@@ -431,7 +623,7 @@ async function fetchYouTubeJson<T>(
       const isSearchMetricOnly =
         code === 'YOUTUBE_QUOTA_EXCEEDED' &&
         scope === 'search' &&
-        /search queries/i.test(rawMessage) &&
+        /search queries|quota/i.test(rawMessage) &&
         reason !== 'dailyLimitExceeded';
 
       if (isSearchMetricOnly) {
@@ -445,7 +637,7 @@ async function fetchYouTubeJson<T>(
       lastError = new YouTubeApiError(message, res.status, code);
 
       if (pos < candidateIndices.length - 1) {
-        console.warn(`[YouTube] API key #${keyIdx + 1} hit ${code}; switching to key #${candidateIndices[pos + 1] + 1}.`);
+        console.warn(`[YouTube] API key #${keyIdx + 1} hit ${code} (${reason || res.status}); switching to key #${candidateIndices[pos + 1] + 1}.`);
         continue;
       }
       throw lastError;
@@ -463,6 +655,19 @@ function mapVideoItemToTrack(item: YouTubeVideoItem, category?: CategoryId, isVi
   const channelTitle = decodeHtmlEntities(snippet.channelTitle || 'Unknown Artist');
   const durationInfo = parseIsoDuration(item.contentDetails?.duration);
   const viewInfo = formatViewCount(item.statistics?.viewCount);
+
+  if (snippet.channelId && snippet.channelId.startsWith('UC')) {
+    videoChannelIdCache.set(item.id, snippet.channelId);
+  }
+  const metaText = [
+    ...(Array.isArray(snippet.tags) ? snippet.tags.slice(0, 15) : []),
+    (snippet.description ?? '').slice(0, 220),
+  ]
+    .join(' ')
+    .toLowerCase();
+  if (metaText.trim()) {
+    videoMetaCache.set(item.id, metaText);
+  }
 
   return {
     id: item.id,
@@ -531,50 +736,151 @@ async function enrichVideoIds(
     .filter((t): t is Track => Boolean(t));
 }
 
+async function resolveHandleToUploadsPlaylist(handle: string): Promise<string | null> {
+  const cleanHandle = handle.trim().replace(/^@+/, '');
+  if (!cleanHandle) return null;
+  if (/^UU[a-zA-Z0-9_-]{18,}$/.test(cleanHandle) || /^PL[a-zA-Z0-9_-]{12,}$/.test(cleanHandle)) {
+    return cleanHandle;
+  }
+  if (/^UC[a-zA-Z0-9_-]{18,}$/.test(cleanHandle)) {
+    return `UU${cleanHandle.slice(2)}`;
+  }
+
+  const cacheKey = cleanHandle.toLowerCase();
+  const cached = handleUploadsCache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached || null;
+  }
+
+  return coalesce(`handle:${cacheKey}`, async () => {
+    try {
+      const data = await fetchYouTubeJson<{
+        items?: Array<{ contentDetails?: { relatedPlaylists?: { uploads?: string } } }>;
+      }>(
+        (apiKey) =>
+          `${YT_API_BASE}/channels?part=contentDetails&forHandle=${encodeURIComponent(
+            cleanHandle
+          )}&key=${encodeURIComponent(apiKey)}`,
+        'videos'
+      );
+      const uploads = data.items?.[0]?.contentDetails?.relatedPlaylists?.uploads ?? '';
+      handleUploadsCache.set(cacheKey, uploads);
+      return uploads || null;
+    } catch {
+      return null;
+    }
+  });
+}
+
+async function fetchPlaylistTracks(
+  source: string,
+  category?: CategoryId,
+  maxResults = 25
+): Promise<Track[]> {
+  const playlistId = await resolveHandleToUploadsPlaylist(source);
+  if (!playlistId) return [];
+
+  const cachedIds = playlistVideoIdsCache.get(playlistId);
+  let videoIds: string[] = cachedIds ?? [];
+
+  if (!cachedIds) {
+    try {
+      const data = await fetchYouTubeJson<{
+        items?: Array<{ contentDetails?: { videoId?: string } }>;
+      }>(
+        (apiKey) =>
+          `${YT_API_BASE}/playlistItems?part=contentDetails&playlistId=${encodeURIComponent(
+            playlistId
+          )}&maxResults=${Math.min(Math.max(maxResults, 1), 25)}&key=${encodeURIComponent(apiKey)}`,
+        'videos'
+      );
+      videoIds = (data.items ?? [])
+        .map((item) => item.contentDetails?.videoId)
+        .filter((id): id is string => Boolean(id));
+      playlistVideoIdsCache.set(playlistId, videoIds);
+    } catch {
+      playlistVideoIdsCache.set(playlistId, []);
+      return [];
+    }
+  }
+
+  if (videoIds.length === 0) return [];
+  return enrichVideoIds(videoIds.slice(0, maxResults), category, false);
+}
+
 const TRENDING_POOLS_BY_LANG: Record<IndiaLanguageFilter, { primary: string[]; secondary?: string[] }> = {
   all: {
     primary: [
-      'hindi viral song -jukebox -playlist -nonstop -timestamps -bhajan -aarti',
-      'bollywood new hit song -jukebox -playlist -nonstop -trailer -teaser',
-      'hindi urdu song -jukebox -playlist -nonstop -timestamps',
+      'Talha Anjum OR Kaifi Khalil OR AUR OR Afusic OR Hasan Raheem official',
+      'Jhol Coke Studio OR Pal Pal Afusic OR Ishq Faheem Abdullah OR Tu Hai Kahan OR Wishes Talwiinder official',
+      'Karan Aujla OR Shubh OR AP Dhillon OR Anuv Jain OR Faheem Abdullah official music video',
     ],
     secondary: [
-      'punjabi hindi hit song -jukebox -playlist -nonstop',
-      'coke studio hindi urdu song -jukebox -playlist',
-      'hindi indie romantic song -jukebox -playlist -nonstop',
+      'Karan Aujla OR Diljit Dosanjh OR Shubh OR Anuv Jain OR Arijit Singh official music video',
+      'Karan Aujla OR Sidhu Moose Wala OR Badshah OR Vishal Mishra OR Talwiinder official video',
+      'Talha Anjum OR Maanu OR Abdul Hannan OR Bayaan OR Asim Azhar official video',
     ],
   },
   hindi: {
     primary: [
-      'new hindi bollywood hit song -jukebox -playlist -nonstop -trailer',
-      'hindi romantic viral song -jukebox -playlist -timestamps',
-      'new hindi indie hit song -jukebox -playlist',
+      'Arijit Singh OR Vishal Mishra OR Faheem Abdullah OR Anuv Jain official music video',
+      'Pehle Bhi Main OR Aaj Ki Raat OR Sajni OR Jo Tum Mere Ho OR Ishq Faheem official',
+      'King OR Darshan Raval OR Jubin Nautiyal OR Mitraz OR Aditya Rikhari official video',
     ],
   },
   punjabi: {
     primary: [
-      'new punjabi rap hip hop hit song -jukebox -playlist -nonstop',
-      'trending punjabi pop hit song -jukebox -playlist',
-      'latest punjabi hit music video -jukebox -playlist',
+      'Karan Aujla OR Shubh OR Sidhu Moose Wala OR AP Dhillon official music video',
+      'Winning Speech Karan Aujla OR Cheques Shubh OR Softly OR Tauba Tauba OR 295 Sidhu Moose Wala official',
+      'Diljit Dosanjh OR Navaan Sandhu OR Arjan Dhillon OR Talwiinder official music video',
     ],
   },
   mix: {
     primary: [
-      'hindi urdu indie hit song -jukebox -playlist -nonstop -timestamps',
-      'coke studio hindi urdu song -jukebox -playlist',
-      'hindi romantic indie song -jukebox -playlist -nonstop',
+      'Talha Anjum OR Talhah Yunus OR Kaifi Khalil OR AUR OR Hasan Raheem official',
+      'Jhol Coke Studio OR Pal Pal Afusic OR Tu Hai Kahan OR Wishes Talwiinder OR Kahani Suno official',
+      'Abdul Hannan OR Coke Studio Pakistan OR Umair OR Maanu OR Asim Azhar official',
     ],
   },
   english: {
     primary: [
-      'trending english pop hits official music video -playlist -mix',
-      'viral english songs pop official video -playlist -mix',
-      'top english charting hits official music video -playlist',
+      'The Weeknd OR Sabrina Carpenter OR Billie Eilish OR Kendrick Lamar official music video',
+      'Lady Gaga OR Chappell Roan OR SZA OR Bruno Mars OR Travis Scott official music video',
+      'Coldplay OR Post Malone OR Ariana Grande OR Dua Lipa official video',
     ],
   },
 };
 
 let trendingRotation = 0;
+
+const VIRAL_UPLOAD_CHANNELS_BY_LANG: Record<IndiaLanguageFilter, string[]> = {
+  all: ['KaranAujla', 'cokestudio', 'SpeedRecords', 'tseries', 'TalhaAnjum', 'AnuvJain'],
+  hindi: ['tseries', 'zeemusiccompany', 'SonyMusicIndia', 'yrf', 'ArijitSingh', 'AnuvJain'],
+  punjabi: ['KaranAujla', 'SpeedRecords', 'DesiMelodies', 'DiljitDosanjh', 'APDHILLON', 'SidhuMooseWalaOfficial'],
+  mix: ['cokestudio', 'TalhaAnjum', 'KaifiKhalil', 'HasanRaheem', 'AtifAslam', 'AnuvJain'],
+  english: ['TheWeeknd', 'BillieEilish', 'SabrinaCarpenter', 'KendrickLamar', 'DuaLipa', 'BrunoMars'],
+};
+
+async function fetchChartRegion(
+  regionCode: string,
+  lang: IndiaLanguageFilter,
+  maxResults = 35
+): Promise<Track[]> {
+  const data = await fetchYouTubeJson<{ items?: YouTubeVideoItem[] }>(
+    (apiKey) =>
+      `${YT_API_BASE}/videos?part=snippet,contentDetails,statistics&chart=mostPopular&videoCategoryId=10&regionCode=${regionCode}&maxResults=${maxResults}&key=${encodeURIComponent(
+        apiKey
+      )}`,
+    'videos'
+  );
+  return (data.items ?? [])
+    .map((item) => {
+      const t = mapVideoItemToTrack(item, 'trending', false);
+      videoCache.set(item.id, t);
+      return t;
+    })
+    .filter((t) => isValidMusicTrack(t, lang));
+}
 
 export async function getTrendingMusic(
   region = 'IN',
@@ -593,122 +899,95 @@ export async function getTrendingMusic(
   }
 
   return coalesce(`${cacheKey}:${forceRefresh ? trendingRotation : 'steady'}`, async () => {
-    const cutoff180Days = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString();
     const chartRegion = lang === 'english' && safeRegion === 'IN' ? 'US' : safeRegion;
-    const buildChartUrl = (apiKey: string) =>
-      `${YT_API_BASE}/videos?part=snippet,contentDetails,statistics&chart=mostPopular&videoCategoryId=10&regionCode=${chartRegion}&maxResults=50&key=${encodeURIComponent(
-        apiKey
-      )}`;
-
-    // For All India & Hindi-Urdu Mix, also tap South Asia's Urdu-Hindi chart (costs only 1 quota unit, 0 search quota)
     const shouldFetchUrduMixChart = safeRegion === 'IN' && (lang === 'all' || lang === 'mix');
-    const buildPkChartUrl = (apiKey: string) =>
-      `${YT_API_BASE}/videos?part=snippet,contentDetails,statistics&chart=mostPopular&videoCategoryId=10&regionCode=PK&maxResults=25&key=${encodeURIComponent(
-        apiKey
-      )}`;
 
     let firstYouTubeError: YouTubeApiError | null = null;
-    const fetchChart = (buildUrl: (apiKey: string) => string) =>
-      fetchYouTubeJson<{ items?: YouTubeVideoItem[] }>(buildUrl, 'videos')
-        .then((data) =>
-          (data.items ?? [])
-            .map((item) => {
-              const t = mapVideoItemToTrack(item, 'trending', false);
-              videoCache.set(item.id, t);
-              return t;
-            })
-            .filter((t) => isValidTrendingSong(t, lang))
-        )
-        .catch((err) => {
-          if (!firstYouTubeError && err instanceof YouTubeApiError) {
-            firstYouTubeError = err;
-          }
-          return [] as Track[];
-        });
+    const safeChart = (reg: string, max: number) =>
+      fetchChartRegion(reg, lang, max).catch((err) => {
+        if (!firstYouTubeError && err instanceof YouTubeApiError) {
+          firstYouTubeError = err;
+        }
+        return [] as Track[];
+      });
 
-    const chartPromise = fetchChart(buildChartUrl);
-    const pkChartPromise = shouldFetchUrduMixChart ? fetchChart(buildPkChartUrl) : Promise.resolve([] as Track[]);
+    const chartPromise = safeChart(chartRegion, 50);
+    const pkChartPromise = shouldFetchUrduMixChart ? safeChart('PK', 25) : Promise.resolve([] as Track[]);
 
-    // Step 1: Use Gemini curation for top viral Reels/Shorts songs (kept to 4 search calls max to preserve YouTube daily quota)
-    let aiViralQueries: string[] = [];
-    const hasGemini = Boolean(process.env.GEMINI_API_KEY?.trim() && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY');
-    if (hasGemini && safeRegion === 'IN') {
-      try {
-        aiViralQueries = await generateTrendingViralSongs(lang, trendingRotation);
-      } catch (err) {
-        console.warn('Gemini trending grounding fallback:', err instanceof Error ? err.message : err);
-      }
-    }
-
-    const aiResolvedTracks: Track[] = [];
-    if (aiViralQueries.length > 0) {
-      const targetQueries = aiViralQueries.slice(0, 4);
-      const songResults = await Promise.allSettled(
-        targetQueries.map((songQuery) => {
-          const cleanSongQuery = songQuery.replace(/\s*[-–—]\s*/g, ' ').trim();
-          return searchYouTubeTracks({
-            query: cleanSongQuery,
-            type: 'songs',
-            maxResults: 5,
-            category: 'trending',
-            regionCode: safeRegion,
-            lang,
-            order: 'relevance',
-            skipLanguageBias: true,
-          });
-        })
-      );
-
-      for (const res of songResults) {
-        if (res.status === 'fulfilled') {
-          const best = pickBestOfficialTrack(res.value, lang);
-          if (best && isValidTrendingSong(best, lang)) {
-            aiResolvedTracks.push({ ...best, category: 'trending' });
-          }
-        } else if (!firstYouTubeError && res.reason instanceof YouTubeApiError) {
-          firstYouTubeError = res.reason;
+    // Only spend 100 search units if a key has active /search quota AND trending isn't rotating solely on playlistItems
+    let searchViralTracks: Track[] = [];
+    if (hasAvailableSearchKey()) {
+      let aiViralQueries: string[] = [];
+      const hasGemini = hasConfiguredGeminiKeys();
+      if (hasGemini && safeRegion === 'IN' && trendingRotation % 2 === 1) {
+        try {
+          aiViralQueries = await generateTrendingViralSongs(lang, trendingRotation);
+        } catch (err) {
+          console.warn('Gemini trending grounding fallback:', err instanceof Error ? err.message : err);
         }
       }
-    }
 
-    const [inChartTracks, pkChartTracks] = await Promise.all([chartPromise, pkChartPromise]);
-
-    // Interleave India chart + Hindi-Urdu Mix chart (filtered cleanly)
-    const chartTracks: Track[] = [];
-    const maxChartLen = Math.max(inChartTracks.length, pkChartTracks.length);
-    for (let i = 0; i < maxChartLen; i++) {
-      if (inChartTracks[i]) chartTracks.push(inChartTracks[i]);
-      if (pkChartTracks[i]) chartTracks.push(pkChartTracks[i]);
-    }
-
-    // Step 2: Only run 1 clean Search fallback if charts + AI together yielded fewer than 8 songs
-    const fallbackTracks: Track[] = [];
-    if (aiResolvedTracks.length + chartTracks.length < 8) {
       const pool = TRENDING_POOLS_BY_LANG[lang] ?? TRENDING_POOLS_BY_LANG.all;
-      const primaryQuery = pool.primary[trendingRotation % pool.primary.length];
+      const poolQuery =
+        trendingRotation % 2 === 1 && pool.secondary && pool.secondary.length > 0
+          ? pool.secondary[trendingRotation % pool.secondary.length]
+          : pool.primary[trendingRotation % pool.primary.length];
+
+      const combinedSearchQuery =
+        aiViralQueries.length >= 2
+          ? aiViralQueries
+              .slice(0, 4)
+              .map((q) => q.replace(/\s*[-–—]\s*/g, ' ').trim())
+              .filter(Boolean)
+              .join(' OR ')
+          : poolQuery;
 
       try {
-        const res = await searchYouTubeTracks({
-          query: primaryQuery,
+        const searched = await searchYouTubeTracks({
+          query: combinedSearchQuery,
           type: 'songs',
-          maxResults: 15,
+          maxResults: 25,
           category: 'trending',
           regionCode: safeRegion,
           lang,
-          order: 'viewCount',
-          publishedAfter: cutoff180Days,
+          order: 'relevance',
           skipLanguageBias: true,
         });
-        for (const t of res) {
-          if (isValidTrendingSong(t, lang)) {
-            fallbackTracks.push({ ...t, category: 'trending' });
-          }
-        }
+        searchViralTracks = searched
+          .filter((t) => isValidMusicTrack(t, lang))
+          .map((t) => ({ ...t, category: 'trending' as const }));
       } catch (err) {
         if (!firstYouTubeError && err instanceof YouTubeApiError) {
           firstYouTubeError = err;
         }
       }
+    }
+
+    // Zero-search fallback: supplement with 1-unit official artist/label upload playlists if search quota is exhausted
+    if (searchViralTracks.length < 4) {
+      const handles = VIRAL_UPLOAD_CHANNELS_BY_LANG[lang] ?? VIRAL_UPLOAD_CHANNELS_BY_LANG.all;
+      const pickA = handles[trendingRotation % handles.length];
+      const pickB = handles[(trendingRotation + 2) % handles.length];
+      const [listA, listB] = await Promise.all([
+        fetchPlaylistTracks(pickA, 'trending', 15),
+        fetchPlaylistTracks(pickB, 'trending', 15),
+      ]);
+      const combinedLists: Track[] = [];
+      const maxLen = Math.max(listA.length, listB.length);
+      for (let i = 0; i < maxLen; i++) {
+        if (listA[i]) combinedLists.push(listA[i]);
+        if (listB[i]) combinedLists.push(listB[i]);
+      }
+      searchViralTracks = combinedLists.filter((t) => isValidMusicTrack(t, lang));
+    }
+
+    const [inChartTracks, pkChartTracks] = await Promise.all([chartPromise, pkChartPromise]);
+
+    const chartTracks: Track[] = [];
+    const maxChartLen = Math.max(inChartTracks.length, pkChartTracks.length);
+    for (let i = 0; i < maxChartLen; i++) {
+      if (inChartTracks[i]) chartTracks.push(inChartTracks[i]);
+      if (pkChartTracks[i]) chartTracks.push(pkChartTracks[i]);
     }
 
     const merged: Track[] = [];
@@ -724,21 +1003,18 @@ export async function getTrendingMusic(
       merged.push({ ...track, category: 'trending' });
     };
 
-    // Rotate chart offset slightly on refresh so clicking Refresh gives fresh order even when Search quota is tight
     const rotatedChartTracks =
       trendingRotation > 0 && chartTracks.length > 4
         ? [
-            ...chartTracks.slice((trendingRotation * 3) % chartTracks.length),
-            ...chartTracks.slice(0, (trendingRotation * 3) % chartTracks.length),
+            ...chartTracks.slice((trendingRotation * 4) % chartTracks.length),
+            ...chartTracks.slice(0, (trendingRotation * 4) % chartTracks.length),
           ]
         : chartTracks;
 
-    // Prioritize Gemini viral Reels & Hindi-Urdu hits interleaved with India & South Asia chart hits
-    const loopLen = Math.max(aiResolvedTracks.length, rotatedChartTracks.length, fallbackTracks.length);
+    const loopLen = Math.max(searchViralTracks.length, rotatedChartTracks.length);
     for (let i = 0; i < loopLen; i++) {
-      if (aiResolvedTracks[i]) pushUnique(aiResolvedTracks[i]);
+      if (searchViralTracks[i]) pushUnique(searchViralTracks[i]);
       if (rotatedChartTracks[i]) pushUnique(rotatedChartTracks[i]);
-      if (fallbackTracks[i]) pushUnique(fallbackTracks[i]);
     }
 
     if (merged.length === 0) {
@@ -758,89 +1034,297 @@ const CATEGORY_QUERY_POOLS: Record<
 > = {
   energetic: {
     all: [
-      'hindi punjabi rap party workout hits',
-      'hindi gym workout motivation songs mashup',
-      'latest bollywood punjabi high energy dj remix party',
-      'desi hip hop punjabi rap upbeat gym songs',
+      'Karan Aujla OR Shubh OR Sidhu Moose Wala OR AP Dhillon official music video',
+      'Hanumankind OR Divine OR KR$NA OR Talha Anjum OR Diljit Dosanjh official video',
+      'Tauba Tauba OR Winning Speech OR Cheques Shubh OR Big Dawgs OR 295 Sidhu Moose Wala official',
     ],
     hindi: [
-      'hindi bollywood high energy workout gym songs',
-      'bollywood upbeat dance party hits dj mix',
-      'hindi motivation energetic rap songs',
+      'Badshah OR Yo Yo Honey Singh OR Divine OR KR$NA OR Raftaar official music video',
+      'Hanumankind OR Seedhe Maut OR Emiway Bantai OR King official music video',
+      'Aaj Ki Raat OR Millionaire Honey Singh OR Tauba Tauba OR Jhoome Jo Pathaan official',
     ],
     punjabi: [
-      'punjabi rap gym workout high energy hits',
-      'punjabi bhangra party upbeat hits',
-      'desi hip hop punjabi bass trap songs',
+      'Karan Aujla OR Shubh OR Sidhu Moose Wala official music video',
+      'Diljit Dosanjh OR AP Dhillon OR Gurinder Gill official music video',
+      'Navaan Sandhu OR Prem Dhillon OR Arjan Dhillon OR Cheema Y official video',
     ],
     mix: [
-      'hindi punjabi mashup dj party workout mix',
-      'bollywood upbeat reels mashup high energy',
-      'hindi english club remix workout mix',
+      'Talha Anjum OR Talhah Yunus OR Young Stunners OR Umair official',
+      'AP Dhillon OR Karan Aujla OR Shubh OR Talwiinder official music video',
+      'Kaun Talha OR Downers At Dusk OR 100 Million Divine OR Hasan Raheem official',
     ],
     english: [
-      'english workout gym motivation pop edm hits',
-      'high energy english pop dance hip hop hits',
-      'upbeat english cardio running party songs',
+      'Travis Scott OR The Weeknd OR Kendrick Lamar OR Central Cee official music video',
+      'Dua Lipa OR Calvin Harris OR Playboi Carti OR Future OR Eminem official music video',
+      'Imagine Dragons OR David Guetta OR Drake official music video',
     ],
   },
   sad: {
     all: [
-      'hindi urdu sad emotional songs bollywood heartbreak',
-      'arijit singh emotional unplugged hindi songs',
-      'hindi acoustic sad lofi heartbreak ballads',
-      'soulful hindi urdu sad melodies late night',
+      'Faheem Abdullah OR Kaifi Khalil OR AUR OR Anuv Jain OR Talha Anjum official song',
+      'B Praak OR Arijit Singh OR Vishal Mishra OR Talwiinder sad song official video',
+      'Jo Tum Mere Ho OR Tu Hai Kahan OR Kahani Suno OR Husn Anuv Jain OR Raanjhan official',
     ],
     hindi: [
-      'hindi sad emotional bollywood heartbreak songs',
-      'arijit singh emotional unplugged hindi ballads',
-      'hindi slow acoustic heartbreak songs',
+      'Arijit Singh OR Vishal Mishra OR B Praak OR Mithoon sad official song',
+      'Anuv Jain OR Faheem Abdullah OR Atif Aslam OR Darshan Raval official video',
+      'Channa Mereya OR Agar Tum Saath Ho OR Pehle Bhi Main OR Raanjhan official',
     ],
     punjabi: [
-      'punjabi sad heartbreak emotional songs',
-      'soulful punjabi sad ballads acoustic',
-      'punjabi emotional late night songs',
+      'B Praak OR Jaani OR Harrdy Sandhu OR Ammy Virk sad official song',
+      'AP Dhillon OR Talwiinder OR Shubh OR Amrinder Gill punjabi sad song official',
+      'Kya Loge Tum OR Pachtaoge OR Qismat OR Filhall OR 295 Sidhu Moose Wala official',
     ],
     mix: [
-      'hindi urdu sad lofi mashup heartbreak mix',
-      'emotional bollywood lofi slow reverb mix',
-      'hindi punjabi sad acoustic mashup',
+      'Kaifi Khalil OR AUR OR Talha Anjum OR Hasan Raheem OR Bayaan official',
+      'Maanu OR Annural Khalid OR Afusic OR Abdul Hannan OR Asim Azhar official',
+      'Tu Hai Kahan OR Kahani Suno OR Jhol OR Pal Pal Afusic OR Wishes Talwiinder official',
     ],
     english: [
-      'english sad emotional heartbreak ballads pop',
-      'sad english acoustic late night songs',
-      'emotional english r&b slow songs',
+      'Billie Eilish OR Joji OR Lord Huron OR Adele OR Lewis Capaldi official music video',
+      'The Weeknd OR Giveon OR Olivia Rodrigo OR d4vd OR Sombr official video',
+      'Coldplay OR James Arthur OR Hozier OR Cigarettes After Sex official video',
     ],
   },
   discover: {
     all: [
-      'hindi urdu lofi chill mix romantic relaxing songs',
-      'hindi romantic acoustic unplugged mix',
-      'hindi instrumental peaceful flute sitar relaxing',
-      'hindi devotional bhajan soulful peaceful music',
+      'Coke Studio Pakistan OR Ali Sethi OR Abdul Hannan OR Hasan Raheem OR Maanu official',
+      'Arijit Singh OR Jasleen Royal OR Mitraz OR Prateek Kuhad OR Atif Aslam official video',
+      'Pasoori OR Sajni Arijit OR Heeriye OR Iraaday OR Sahiba Aditya Rikhari official',
     ],
     hindi: [
-      'hindi romantic acoustic unplugged soulful songs',
-      'hindi indie chill relaxing evening songs',
-      'hindi devotional peaceful bhajan soulful',
+      'Arijit Singh OR Shreya Ghoshal OR Mohit Chauhan OR Pritam romantic official video',
+      'Jasleen Royal OR Mitraz OR Anuv Jain OR Armaan Malik official video',
+      'Kesariya OR Apna Bana Le OR Ve Kamleya OR O Maahi OR Akhiyaan Gulaab official',
     ],
     punjabi: [
-      'punjabi romantic chill acoustic soft songs',
-      'punjabi sufi folk soulful relaxing music',
-      'chill punjabi vibe drive songs',
+      'Diljit Dosanjh OR Satinder Sartaaj OR Harnoor OR Talwiinder official music video',
+      'AP Dhillon OR Gurinder Gill OR Karan Aujla chill official music video',
+      'Hass Hass OR Lover Diljit OR Waalian Harnoor OR Moonlight OR Admiring You official',
     ],
     mix: [
-      'hindi urdu lofi chill study beats mix',
-      'bollywood romantic lofi mashup relaxing',
-      'indian instrumental acoustic lofi fusion',
+      'Coke Studio Pakistan OR Abdul Hannan OR Hasan Raheem OR Kaifi Khalil official',
+      'AUR OR Maanu OR Afusic OR Ali Sethi OR Shae Gill official',
+      'Jhol Coke Studio OR Pasoori OR Iraaday OR Bikhra OR Tu Hai Kahan official',
     ],
     english: [
-      'english chill r&b acoustic relaxing indie songs',
-      'english lofi chill study ambient pop',
-      'smooth english romantic acoustic hits',
+      'SZA OR Daniel Caesar OR Frank Ocean OR Ed Sheeran official music video',
+      'Lana Del Rey OR Cigarettes After Sex OR Bruno Mars OR Lauv official video',
+      'Charlie Puth OR Shawn Mendes OR John Mayer OR Coldplay official video',
     ],
   },
 };
+
+const ZERO_SEARCH_CHANNELS_BY_CAT: Record<
+  Exclude<CategoryId, 'trending'>,
+  Record<IndiaLanguageFilter, string[]>
+> = {
+  energetic: {
+    all: ['SpeedRecords', 'TalhaAnjum', 'DiljitDosanjh', 'Badshah', 'DesiMelodies', 'RehaanRecords'],
+    hindi: ['Badshah', 'tseries', 'zeemusiccompany', 'SonyMusicIndia', 'DIVINE', 'YoYoHoneySingh'],
+    punjabi: ['SpeedRecords', 'DesiMelodies', 'DiljitDosanjh', 'APDHILLON', 'SidhuMooseWalaOfficial', 'RehaanRecords'],
+    mix: ['TalhaAnjum', 'APDHILLON', 'HasanRaheem', 'cokestudio', 'SpeedRecords', 'DesiMelodies'],
+    english: ['TravisScottXX', 'KendrickLamar', 'TheWeeknd', 'DuaLipa', 'BrunoMars', 'SabrinaCarpenter'],
+  },
+  sad: {
+    all: ['AnuvJain', 'cokestudio', 'KaifiKhalil', 'AtifAslam', 'zeemusiccompany', 'DesiMelodies'],
+    hindi: ['zeemusiccompany', 'tseries', 'SonyMusicIndia', 'yrf', 'AnuvJain', 'AtifAslam'],
+    punjabi: ['DesiMelodies', 'SpeedRecords', 'APDHILLON', 'SidhuMooseWalaOfficial', 'DiljitDosanjh'],
+    mix: ['cokestudio', 'KaifiKhalil', 'TalhaAnjum', 'HasanRaheem', 'AtifAslam', 'AnuvJain'],
+    english: ['BillieEilish', 'TheWeeknd', 'Coldplay', 'Adele', 'EdSheeran'],
+  },
+  discover: {
+    all: ['cokestudio', 'AnuvJain', 'SonyMusicIndia', 'yrf', 'DesiMelodies', 'AtifAslam'],
+    hindi: ['SonyMusicIndia', 'yrf', 'tseries', 'zeemusiccompany', 'saregama', 'AnuvJain'],
+    punjabi: ['DiljitDosanjh', 'APDHILLON', 'SpeedRecords', 'DesiMelodies', 'RehaanRecords'],
+    mix: ['cokestudio', 'HasanRaheem', 'KaifiKhalil', 'TalhaAnjum', 'AtifAslam', 'AnuvJain'],
+    english: ['Coldplay', 'SabrinaCarpenter', 'EdSheeran', 'DuaLipa', 'BrunoMars', 'TheWeeknd'],
+  },
+};
+
+const ARTIST_HANDLE_INDEX: Array<{ keywords: RegExp; handle: string }> = [
+  { keywords: /\b(karan\s*aujla|aujla)\b/i, handle: 'RehaanRecords' },
+  { keywords: /\b(talha\s*anjum|young\s*stunners|kaun\s*talha)\b/i, handle: 'TalhaAnjum' },
+  { keywords: /\b(coke\s*studio|pasoori|jhol)\b/i, handle: 'cokestudio' },
+  { keywords: /\b(kaifi\s*khalil|kahani\s*suno)\b/i, handle: 'KaifiKhalil' },
+  { keywords: /\b(hasan\s*raheem)\b/i, handle: 'HasanRaheem' },
+  { keywords: /\b(anuv\s*jain|husn|jo\s*tum\s*mere)\b/i, handle: 'AnuvJain' },
+  { keywords: /\b(arijit\s*singh|sajni|kesariya|pehle\s*bhi)\b/i, handle: 'tseries' },
+  { keywords: /\b(atif\s*aslam)\b/i, handle: 'AtifAslam' },
+  { keywords: /\b(diljit\s*dosanjh|lover|hass\s*hass)\b/i, handle: 'DiljitDosanjh' },
+  { keywords: /\b(ap\s*dhillon|brown\s*munde)\b/i, handle: 'APDHILLON' },
+  { keywords: /\b(sidhu\s*moose|moosewala|295)\b/i, handle: 'SidhuMooseWalaOfficial' },
+  { keywords: /\b(badshah)\b/i, handle: 'Badshah' },
+  { keywords: /\b(honey\s*singh|yo\s*yo)\b/i, handle: 'YoYoHoneySingh' },
+  { keywords: /\b(divine)\b/i, handle: 'DIVINE' },
+  { keywords: /\b(speed\s*records|punjabi)\b/i, handle: 'SpeedRecords' },
+  { keywords: /\b(desi\s*melodies|b\s*praak|jaani)\b/i, handle: 'DesiMelodies' },
+  { keywords: /\b(t-?series|bollywood|hindi)\b/i, handle: 'tseries' },
+  { keywords: /\b(zee\s*music)\b/i, handle: 'zeemusiccompany' },
+  { keywords: /\b(sony\s*music)\b/i, handle: 'SonyMusicIndia' },
+  { keywords: /\b(yrf|yash\s*raj)\b/i, handle: 'yrf' },
+  { keywords: /\b(weeknd)\b/i, handle: 'TheWeeknd' },
+  { keywords: /\b(billie\s*eilish)\b/i, handle: 'BillieEilish' },
+  { keywords: /\b(kendrick)\b/i, handle: 'KendrickLamar' },
+  { keywords: /\b(sabrina\s*carpenter)\b/i, handle: 'SabrinaCarpenter' },
+  { keywords: /\b(dua\s*lipa)\b/i, handle: 'DuaLipa' },
+  { keywords: /\b(coldplay)\b/i, handle: 'Coldplay' },
+  { keywords: /\b(bruno\s*mars)\b/i, handle: 'BrunoMars' },
+  { keywords: /\b(ed\s*sheeran)\b/i, handle: 'EdSheeran' },
+];
+
+const ENERGETIC_POSITIVE_RE =
+  /\b(karan\s*aujla|shubh|sidhu\s*moose|diljit|ap\s*dhillon|talha\s*anjum|young\s*stunners|divine|kr\$na|raftaar|badshah|honey\s*singh|hanumankind|seedhe\s*maut|travis\s*scott|kendrick|dua\s*lipa|party|dance|club|rap|hip\s*hop|bass|banger|drill|gang|tauba|cheques|millionaire|aaj\s*ki\s*raat|jhoome|winning\s*speech|softly|295|g\.o\.a\.t|workout|vibe|fire|remix)\b/i;
+const ENERGETIC_NEGATIVE_RE =
+  /\b(sad|heartbreak|broken|tears|judai|bewafa|dard|rona|tanhai|unplugged|acoustic|lofi|tribute)\b/i;
+const SAD_POSITIVE_RE =
+  /\b(b\s*praak|jaani|arijit|vishal\s*mishra|anuv\s*jain|faheem\s*abdullah|kaifi\s*khalil|aur|talwiinder|atif\s*aslam|aditya\s*rikhari|billie\s*eilish|joji|lewis\s*capaldi|adele|sad|heartbreak|dard|bewafa|judai|tanhai|khoya|rona|tears|broken|acoustic|unplugged|ishq|kahani\s*suno|tu\s*hai\s*kahan|jo\s*tum\s*mere\s*ho|husn|pehle\s*bhi\s*main|channa\s*mereya|filhall|qismat|pachtaoge|kya\s*loge\s*tum|pal\s*pal|afusic|jhol|wishes|raanjhan|agar\s*tum\s*saath|ghazal)\b/i;
+const SAD_NEGATIVE_RE = /\b(party|club|dance\s*number|dj|cypher|drill|workout)\b/i;
+const DISCOVER_POSITIVE_RE =
+  /\b(coke\s*studio|abdul\s*hannan|hasan\s*raheem|maanu|ali\s*sethi|shae\s*gill|jasleen\s*royal|mitraz|prateek\s*kuhad|zaeden|armaan\s*malik|shreya\s*ghoshal|mohit\s*chauhan|pritam|satinder\s*sartaaj|harnoor|sza|lana\s*del\s*rey|ed\s*sheeran|coldplay|bruno\s*mars|acoustic|sufi|indie|love|romantic|pasoori|jhol|iraaday|bikhra|sajni|heeriye|sahiba|kesariya|apna\s*bana\s*le|lover|hass\s*hass|waalian|moonlight|o\s*maahi|akhiyaan|ve\s*kamleya)\b/i;
+const PUNJABI_SIGNAL_RE =
+  /\b(punjabi|speed\s*records|apna\s*punjab|karan\s*aujla|shubh|diljit|ap\s*dhillon|sidhu\s*moose|b\s*praak|ammy\s*virk|harnoor|navaan|arjan|sartaaj|talwiinder|desi\s*melodies)\b/i;
+const MIX_SIGNAL_RE =
+  /\b(coke\s*studio|talha\s*anjum|kaifi\s*khalil|aur|hasan\s*raheem|abdul\s*hannan|maanu|afusic|atif\s*aslam|ali\s*sethi|anuv\s*jain|faheem\s*abdullah|urdu)\b/i;
+const HINDI_SIGNAL_RE =
+  /\b(t-?series|zee\s*music|sony\s*music\s*india|yrf|saregama|arijit|vishal\s*mishra|anuv\s*jain|badshah|divine|honey\s*singh|darshan\s*raval|mitraz|jasleen|hindi|bollywood)\b/i;
+const ENGLISH_SIGNAL_RE =
+  /\b(weeknd|billie\s*eilish|kendrick|travis\s*scott|sabrina\s*carpenter|dua\s*lipa|coldplay|bruno\s*mars|sza|ed\s*sheeran|adele|ariana\s*grande|post\s*malone|drake)\b/i;
+
+function scoreCategoryMoodAndLang(
+  track: Track,
+  category: Exclude<CategoryId, 'trending'>,
+  lang: IndiaLanguageFilter,
+  subFilter?: string
+): number {
+  const meta = videoMetaCache.get(track.id) ?? '';
+  const haystack = `${track.title} ${track.artist} ${track.channelTitle} ${meta}`;
+  let score = scoreTrackQuality(track);
+
+  if (category === 'energetic') {
+    if (ENERGETIC_POSITIVE_RE.test(haystack)) score += 40;
+    if (ENERGETIC_NEGATIVE_RE.test(track.title)) score -= 45;
+  } else if (category === 'sad') {
+    if (SAD_POSITIVE_RE.test(haystack)) score += 45;
+    if (SAD_NEGATIVE_RE.test(track.title)) score -= 40;
+  } else if (category === 'discover') {
+    if (DISCOVER_POSITIVE_RE.test(haystack)) score += 40;
+  }
+
+  if (lang === 'punjabi') {
+    if (PUNJABI_SIGNAL_RE.test(haystack)) score += 35;
+    if (ENGLISH_SIGNAL_RE.test(haystack)) score -= 40;
+  } else if (lang === 'mix') {
+    if (MIX_SIGNAL_RE.test(haystack)) score += 35;
+    if (ENGLISH_SIGNAL_RE.test(haystack)) score -= 40;
+  } else if (lang === 'hindi') {
+    if (HINDI_SIGNAL_RE.test(haystack)) score += 30;
+    if (ENGLISH_SIGNAL_RE.test(haystack)) score -= 45;
+  } else if (lang === 'english') {
+    if (ENGLISH_SIGNAL_RE.test(haystack)) score += 45;
+    if (HINDI_SIGNAL_RE.test(haystack) || PUNJABI_SIGNAL_RE.test(haystack)) score -= 60;
+  }
+
+  if (subFilter) {
+    const tokens = subFilter
+      .toLowerCase()
+      .split(/[\s\-&/]+/)
+      .filter((w) => w.length >= 3);
+    for (const tok of tokens) {
+      if (haystack.toLowerCase().includes(tok)) score += 28;
+    }
+  }
+
+  return score;
+}
+
+async function fetchZeroSearchCategoryTracks(
+  category: Exclude<CategoryId, 'trending'>,
+  lang: IndiaLanguageFilter,
+  rotationIdx: number,
+  subFilter?: string
+): Promise<Track[]> {
+  const allowDevotional = subFilter?.toLowerCase() === 'devotional';
+  const handles = ZERO_SEARCH_CHANNELS_BY_CAT[category][lang] ?? ZERO_SEARCH_CHANNELS_BY_CAT[category].all;
+
+  // Pick 3 official channels in rotation (3 x 1u playlistItems + batched 1u videos = ~6 units vs 100 search units!)
+  const chosenHandles: string[] = [];
+  for (let i = 0; i < Math.min(3, handles.length); i++) {
+    chosenHandles.push(handles[(rotationIdx + i) % handles.length]);
+  }
+
+  const chartRegions =
+    lang === 'english' ? ['US', 'GB'] : lang === 'mix' ? ['PK', 'IN'] : ['IN', 'PK'];
+
+  const [playlistBatches, chartBatches] = await Promise.all([
+    Promise.all(chosenHandles.map((h) => fetchPlaylistTracks(h, category, 20))),
+    Promise.all(chartRegions.map((reg) => fetchChartRegion(reg, lang, 30).catch(() => [] as Track[]))),
+  ]);
+
+  const rawPool: Track[] = [];
+  const maxBatchLen = Math.max(...playlistBatches.map((b) => b.length), 0);
+  for (let i = 0; i < maxBatchLen; i++) {
+    for (const batch of playlistBatches) {
+      if (batch[i]) rawPool.push({ ...batch[i], category });
+    }
+  }
+  for (const chart of chartBatches) {
+    for (const t of chart) {
+      rawPool.push({ ...t, category });
+    }
+  }
+
+  // Only sweep warm videoCache items matching the target language if playlist/chart pool is thin
+  if (rawPool.length < 24) {
+    for (const [, entry] of videoCache.exportValidEntries()) {
+      if (rawPool.length >= 60) break;
+      const hay = `${entry.data.title} ${entry.data.artist} ${entry.data.channelTitle}`;
+      if (lang === 'english' && (HINDI_SIGNAL_RE.test(hay) || PUNJABI_SIGNAL_RE.test(hay) || MIX_SIGNAL_RE.test(hay))) {
+        continue;
+      }
+      rawPool.push({ ...entry.data, category });
+    }
+  }
+
+  const languageScopedPool =
+    lang === 'english'
+      ? rawPool.filter((t) => {
+          const hay = `${t.title} ${t.artist} ${t.channelTitle}`;
+          return !HINDI_SIGNAL_RE.test(hay) && !PUNJABI_SIGNAL_RE.test(hay) && !MIX_SIGNAL_RE.test(hay);
+        })
+      : rawPool;
+
+  const candidatePool = languageScopedPool.length >= 6 ? languageScopedPool : rawPool;
+
+  const strictTracks = candidatePool.filter((t) => isValidMusicTrack(t, lang, { allowDevotional }));
+  const relaxedTracks = candidatePool.filter((t) =>
+    isValidMusicTrack(t, lang, { allowDevotional, minViews: 10_000 })
+  );
+  const scoredPool = (strictTracks.length >= 6 ? strictTracks : relaxedTracks).sort(
+    (a, b) =>
+      scoreCategoryMoodAndLang(b, category, lang, subFilter) -
+      scoreCategoryMoodAndLang(a, category, lang, subFilter)
+  );
+
+  const merged: Track[] = [];
+  const seenIds = new Set<string>();
+  const seenKeys = new Set<string>();
+  for (const t of scoredPool) {
+    if (seenIds.has(t.id)) continue;
+    const key = normalizeSongKey(t.title);
+    if (key && seenKeys.has(key)) continue;
+    seenIds.add(t.id);
+    if (key) seenKeys.add(key);
+    merged.push({ ...t, category });
+    if (merged.length >= 16) break;
+  }
+
+  if (merged.length > 4 && rotationIdx > 0) {
+    const offset = (rotationIdx * 3) % merged.length;
+    return [...merged.slice(offset), ...merged.slice(0, offset)].slice(0, 12);
+  }
+  return merged.slice(0, 12);
+}
 
 const categoryRotation = new Map<string, number>();
 
@@ -855,6 +1339,84 @@ export interface SearchTracksOptions {
   publishedAfter?: string;
   pageToken?: string;
   skipLanguageBias?: boolean;
+}
+
+const SHORT_CLIP_TITLE_RE =
+  /(#shorts\b|#ytshorts\b|\byoutube\s*shorts\b|\bwhatsapp\s*status\b|\bringtone\b|\bstatus\s*video\b|\bsong\s*status\b)/i;
+
+function isShortOrSnippetClip(track: Track): boolean {
+  const dur = track.durationSeconds ?? 0;
+  if (dur > 0 && dur < 70) return true;
+  if (SHORT_CLIP_TITLE_RE.test(track.title) && dur < 120) return true;
+  return false;
+}
+
+async function fallbackSearchWithoutQuota(
+  query: string,
+  category: CategoryId | undefined,
+  maxResults: number,
+  lang: IndiaLanguageFilter = 'all'
+): Promise<Track[]> {
+  const qLower = query.toLowerCase();
+  const queryWords = qLower
+    .replace(/\b(official|music|video|song|songs|full|audio|lyrics|or)\b/gi, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 3);
+
+  const matchedHandles: string[] = [];
+  for (const entry of ARTIST_HANDLE_INDEX) {
+    if (entry.keywords.test(query)) {
+      matchedHandles.push(entry.handle);
+      if (matchedHandles.length >= 2) break;
+    }
+  }
+
+  const candidatePool: Track[] = [];
+  if (matchedHandles.length > 0) {
+    const lists = await Promise.all(
+      matchedHandles.map((h) => fetchPlaylistTracks(h, category, 25))
+    );
+    for (const list of lists) candidatePool.push(...list);
+  }
+
+  for (const [, entry] of videoCache.exportValidEntries()) {
+    candidatePool.push(entry.data);
+  }
+
+  if (candidatePool.length < 15) {
+    const [inChart, pkChart] = await Promise.all([
+      fetchChartRegion('IN', lang, 35).catch(() => [] as Track[]),
+      fetchChartRegion('PK', lang, 20).catch(() => [] as Track[]),
+    ]);
+    candidatePool.push(...inChart, ...pkChart);
+  }
+
+  const seen = new Set<string>();
+  const scored: Array<{ track: Track; score: number }> = [];
+
+  for (const raw of candidatePool) {
+    if (seen.has(raw.id)) continue;
+    seen.add(raw.id);
+    if (isPhonkTrack(raw.title, raw.channelTitle) || isShortOrSnippetClip(raw)) continue;
+
+    const hay = `${raw.title} ${raw.artist} ${raw.channelTitle}`.toLowerCase();
+    let tokenMatches = 0;
+    for (const w of queryWords) {
+      if (hay.includes(w)) tokenMatches++;
+    }
+    if (queryWords.length > 0 && tokenMatches === 0) continue;
+
+    const score = scoreTrackQuality(raw, query) + tokenMatches * 35;
+    scored.push({
+      track: category ? { ...raw, category } : raw,
+      score,
+    });
+  }
+
+  return scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxResults)
+    .map((x) => x.track);
 }
 
 export async function searchYouTubeTracksPaginated(
@@ -877,24 +1439,20 @@ export async function searchYouTubeTracksPaginated(
   const trimmed = query.trim().slice(0, 120);
   if (!trimmed) return { tracks: [] };
 
-  const hasGenreOrLangHint =
-    /\b(hindi|bollywood|punjabi|urdu|reels|shorts|english|pop|rap|rock|edm|indie|acoustic|lofi|sufi|ghazal|bhajan|mashup|remix|song|music|video)\b/i.test(
-      trimmed
-    );
+  const isDirectUserSearch = !category && !skipLanguageBias && !lang;
 
   const refinedQuery =
     type === 'videos'
       ? trimmed.toLowerCase().includes('video')
         ? trimmed
         : `${trimmed} official music video`
-      : skipLanguageBias || lang || hasGenreOrLangHint
-        ? trimmed
-        : `${trimmed} hindi song`;
+      : trimmed;
 
   const safeRegion = regionCode && /^[A-Z]{2}$/.test(regionCode.toUpperCase()) ? regionCode.toUpperCase() : 'IN';
   const clampedMax = Math.min(Math.max(maxResults, 1), 25);
+  const fetchMax = !category && clampedMax >= 8 ? 25 : clampedMax;
 
-  const cacheKey = `search:${refinedQuery}:${type}:${clampedMax}:${safeRegion}:${order}:${publishedAfter || ''}:${pageToken || ''}:${lang || ''}:${skipLanguageBias}`;
+  const cacheKey = `search:v4:${refinedQuery}:${type}:${clampedMax}:${safeRegion}:${order}:${publishedAfter || ''}:${pageToken || ''}:${lang || ''}:${skipLanguageBias}`;
   const cached = searchCache.get(cacheKey);
   if (cached) {
     return {
@@ -909,14 +1467,14 @@ export async function searchYouTubeTracksPaginated(
         part: 'snippet',
         type: 'video',
         videoEmbeddable: 'true',
-        maxResults: String(clampedMax),
+        maxResults: String(fetchMax),
         q: `${refinedQuery} -phonk`,
         regionCode: safeRegion,
         order,
         key: apiKey,
       });
 
-      if (!skipLanguageBias && lang !== 'english') {
+      if (!skipLanguageBias && lang && lang !== 'english') {
         params.set('relevanceLanguage', 'hi');
       }
 
@@ -935,29 +1493,56 @@ export async function searchYouTubeTracksPaginated(
       return `${YT_API_BASE}/search?${params.toString()}`;
     };
 
-    const searchData = await fetchYouTubeJson<{ items?: YouTubeSearchItem[]; nextPageToken?: string }>(
-      buildSearchUrl,
-      'search'
-    );
+    try {
+      const searchData = await fetchYouTubeJson<{ items?: YouTubeSearchItem[]; nextPageToken?: string }>(
+        buildSearchUrl,
+        'search'
+      );
 
-    const videoIds = (searchData.items ?? [])
-      .map((item) => item.id?.videoId)
-      .filter((id): id is string => Boolean(id));
+      const videoIds = (searchData.items ?? [])
+        .map((item) => item.id?.videoId)
+        .filter((id): id is string => Boolean(id));
 
-    if (videoIds.length === 0) {
-      const empty = { tracks: [], nextPageToken: searchData.nextPageToken };
-      searchCache.set(cacheKey, empty);
-      return empty;
+      if (videoIds.length === 0) {
+        const empty = { tracks: [], nextPageToken: searchData.nextPageToken };
+        searchCache.set(cacheKey, empty);
+        return empty;
+      }
+
+      const tracks = await enrichVideoIds(videoIds, category, type === 'videos');
+      const nonPhonk = tracks.filter((t) => !isPhonkTrack(t.title, t.channelTitle));
+
+      const fullLengthOnly = nonPhonk.filter((t) => !isShortOrSnippetClip(t));
+      let filtered = fullLengthOnly.length > 0 ? fullLengthOnly : nonPhonk;
+
+      if (isDirectUserSearch || !category) {
+        filtered = [...filtered].sort((a, b) => scoreTrackQuality(b, trimmed) - scoreTrackQuality(a, trimmed));
+      }
+
+      const result = {
+        tracks: filtered.slice(0, clampedMax),
+        nextPageToken: searchData.nextPageToken,
+      };
+      searchCache.set(cacheKey, result);
+      return result;
+    } catch (err) {
+      if (
+        err instanceof YouTubeApiError &&
+        (err.code === 'YOUTUBE_QUOTA_EXCEEDED' || err.code === 'YOUTUBE_API_KEY_INVALID') &&
+        !pageToken
+      ) {
+        const fallbackTracks = await fallbackSearchWithoutQuota(
+          trimmed,
+          category,
+          clampedMax,
+          lang ?? 'all'
+        );
+        if (fallbackTracks.length > 0) {
+          return { tracks: fallbackTracks };
+        }
+      }
+      throw err;
     }
-
-    const tracks = await enrichVideoIds(videoIds, category, type === 'videos');
-    const filtered = tracks.filter((t) => !isPhonkTrack(t.title, t.channelTitle));
-    const result = {
-      tracks: filtered,
-      nextPageToken: searchData.nextPageToken,
-    };
-    searchCache.set(cacheKey, result);
-    return result;
   });
 }
 
@@ -983,17 +1568,15 @@ export async function getCategoryTracks(options: {
   ensureYoutubeConfigured();
 
   const langPool = CATEGORY_QUERY_POOLS[category][lang] ?? CATEGORY_QUERY_POOLS[category].all;
-  const pool = customQueries && customQueries.length > 0 ? customQueries : langPool;
   const rotKey = `${category}:${lang}`;
   const currentIdx = categoryRotation.get(rotKey) ?? 0;
-  const nextIdx = forceRefresh ? (currentIdx + 1) % pool.length : currentIdx;
+  const nextIdx = forceRefresh ? (currentIdx + 1) % langPool.length : currentIdx;
   if (forceRefresh) {
     categoryRotation.set(rotKey, nextIdx);
   }
 
-  const langPrefix = lang === 'all' ? 'hindi' : lang === 'mix' ? 'hindi urdu mix' : lang;
-  const query = subFilter ? `${langPrefix} ${subFilter} songs` : pool[nextIdx];
-  const cacheKey = `cat:${category}:${region}:${lang}:${subFilter || nextIdx}`;
+  const normalizedSub = subFilter && subFilter !== 'All' ? subFilter.trim() : undefined;
+  const cacheKey = `cat:${category}:${region}:${lang}:${normalizedSub || nextIdx}`;
 
   if (!forceRefresh && !customQueries) {
     const cached = categoryCache.get(cacheKey);
@@ -1001,19 +1584,85 @@ export async function getCategoryTracks(options: {
   }
 
   return coalesce(`${cacheKey}:${customQueries ? 'ai' : 'std'}`, async () => {
-    const tracks = await searchYouTubeTracks({
-      query,
-      type: 'songs',
-      maxResults: 12,
-      category,
-      regionCode: region,
-      lang,
-    });
+    const allowDevotional = normalizedSub?.toLowerCase() === 'devotional';
+
+    // Default category loads use the 1-unit playlistItems + videos engine (saves ~95 quota units per load and never breaks when /search quota is exhausted!)
+    const shouldTrySearchFirst = Boolean(normalizedSub || (customQueries && customQueries.length > 0)) && hasAvailableSearchKey();
+
+    if (shouldTrySearchFirst) {
+      try {
+        const aiSongList = customQueries && customQueries.length > 0 ? customQueries : [];
+        const langPrefix =
+          lang === 'all' ? 'hindi urdu punjabi' : lang === 'mix' ? 'hindi urdu' : lang;
+        const singleQuery = normalizedSub
+          ? `${langPrefix} ${normalizedSub} official song`
+          : aiSongList
+              .slice(0, 4)
+              .map((q) => q.replace(/\s*[-–—]\s*/g, ' ').trim())
+              .filter(Boolean)
+              .join(' OR ');
+
+        const rawTracks = await searchYouTubeTracks({
+          query: singleQuery,
+          type: 'songs',
+          maxResults: 25,
+          category,
+          regionCode: region,
+          lang,
+          skipLanguageBias: true,
+        });
+
+        const strictTracks = rawTracks
+          .filter((t) => isValidMusicTrack(t, lang, { allowDevotional }))
+          .map((t) => ({ ...t, category }));
+
+        const relaxedTracks = rawTracks
+          .filter((t) => isValidMusicTrack(t, lang, { allowDevotional, minViews: 10_000 }))
+          .map((t) => ({ ...t, category }));
+
+        const merged: Track[] = [];
+        const seenIds = new Set<string>();
+        const seenKeys = new Set<string>();
+
+        const pushUnique = (t: Track) => {
+          if (seenIds.has(t.id)) return;
+          const key = normalizeSongKey(t.title);
+          if (key && seenKeys.has(key)) return;
+          seenIds.add(t.id);
+          if (key) seenKeys.add(key);
+          merged.push(t);
+        };
+
+        for (const t of strictTracks) pushUnique(t);
+        if (merged.length < 6) {
+          for (const t of relaxedTracks) pushUnique(t);
+        }
+
+        const finalTracks = merged.slice(0, 12);
+        if (finalTracks.length > 0) {
+          if (!customQueries) categoryCache.set(cacheKey, finalTracks);
+          return finalTracks;
+        }
+      } catch (err) {
+        if (!(err instanceof YouTubeApiError && err.code === 'YOUTUBE_QUOTA_EXCEEDED')) {
+          throw err;
+        }
+      }
+    }
+
+    const zeroSearchTracks = await fetchZeroSearchCategoryTracks(category, lang, nextIdx, normalizedSub);
+    if (zeroSearchTracks.length === 0) {
+      throw new YouTubeApiError(
+        'Unable to load category tracks right now. Please check your YouTube API quota or try refreshing.',
+        429,
+        'YOUTUBE_QUOTA_EXCEEDED'
+      );
+    }
 
     if (!customQueries) {
-      categoryCache.set(cacheKey, tracks);
+      categoryCache.set(cacheKey, zeroSearchTracks);
     }
-    return tracks;
+    return zeroSearchTracks;
   });
 }
 
@@ -1028,20 +1677,75 @@ export async function getRelatedTracks(
 
   const cached = relatedCache.get(videoId);
   if (cached) {
-    return cached.filter((t) => !excludeSet.has(t.id) && !isPhonkTrack(t.title, t.channelTitle));
+    return cached.filter(
+      (t) =>
+        !excludeSet.has(t.id) &&
+        !isPhonkTrack(t.title, t.channelTitle) &&
+        !COMPILATION_TITLE_RE.test(t.title) &&
+        !CLUTTER_TITLE_RE.test(t.title) &&
+        !CLUTTER_TITLE_RE.test(t.channelTitle)
+    );
   }
 
   const tracks = await coalesce(`related:${videoId}`, async () => {
-    const baseQuery = [artist, title].filter(Boolean).join(' ').trim() || 'popular hindi mix';
-    const cleanQuery = baseQuery.replace(/\(.*?\)|\[.*?\]/g, '').trim().slice(0, 90);
-    const result = await searchYouTubeTracks({
-      query: `${cleanQuery} similar songs`,
-      type: 'songs',
-      maxResults: 15,
-      regionCode: 'IN',
-      lang: 'mix',
-    });
-    const cleaned = result.filter((t) => t.id !== videoId && !isPhonkTrack(t.title, t.channelTitle));
+    const channelId = videoChannelIdCache.get(videoId);
+    let candidateTracks: Track[] = [];
+
+    // 1. Prefer artist's own official uploads playlist (only 2 units, 0 search units!)
+    if (channelId && channelId.startsWith('UC')) {
+      candidateTracks = await fetchPlaylistTracks(`UU${channelId.slice(2)}`, undefined, 16);
+    }
+
+    // 2. Only call /search if playlist had < 4 usable tracks AND search quota is healthy
+    const cleanRelatedFilter = (list: Track[]) =>
+      list.filter(
+        (t) =>
+          t.id !== videoId &&
+          !isPhonkTrack(t.title, t.channelTitle) &&
+          !isShortOrSnippetClip(t) &&
+          !COMPILATION_TITLE_RE.test(t.title) &&
+          !CLUTTER_TITLE_RE.test(t.title) &&
+          !CLUTTER_TITLE_RE.test(t.channelTitle) &&
+          (t.durationSeconds ?? 0) <= 480
+      );
+
+    let cleaned = cleanRelatedFilter(candidateTracks);
+
+    if (cleaned.length < 5 && hasAvailableSearchKey()) {
+      try {
+        const baseQuery = [artist, title].filter(Boolean).join(' ').trim() || 'popular hindi mix';
+        const cleanQuery = baseQuery.replace(/\(.*?\)|\[.*?\]/g, '').trim().slice(0, 90);
+        const result = await searchYouTubeTracks({
+          query: `${cleanQuery} official song`,
+          type: 'songs',
+          maxResults: 20,
+          regionCode: 'IN',
+          lang: 'mix',
+          skipLanguageBias: true,
+        });
+        cleaned = cleanRelatedFilter([...cleaned, ...result]);
+      } catch (err) {
+        if (!(err instanceof YouTubeApiError && err.code === 'YOUTUBE_QUOTA_EXCEEDED')) {
+          throw err;
+        }
+      }
+    }
+
+    // 3. Final zero-search fallback from curated playlists + warm cache
+    if (cleaned.length < 5) {
+      const hint = `${artist ?? ''} ${title ?? ''}`;
+      const matched = ARTIST_HANDLE_INDEX.find((e) => e.keywords.test(hint));
+      const extraList = matched ? await fetchPlaylistTracks(matched.handle, undefined, 16) : [];
+      const cachedPool = videoCache.exportValidEntries().map(([, entry]) => entry.data);
+      const fallbackCleaned = cleanRelatedFilter([...cleaned, ...extraList, ...cachedPool]);
+      const seen = new Set<string>();
+      cleaned = fallbackCleaned.filter((t) => {
+        if (seen.has(t.id)) return false;
+        seen.add(t.id);
+        return true;
+      });
+    }
+
     relatedCache.set(videoId, cleaned);
     return cleaned;
   });

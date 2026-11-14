@@ -213,9 +213,9 @@ export function LibraryPage({
               </p>
             </div>
           ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-5 lg:gap-6">
               {/* Playlist List */}
-              <div className="lg:col-span-4 space-y-2.5">
+              <div className="md:col-span-5 lg:col-span-4 space-y-2.5">
                 {playlists.map((pl) => {
                   const active = selectedPlaylist?.id === pl.id;
                   return (
@@ -285,7 +285,7 @@ export function LibraryPage({
                                 setEditName(pl.name);
                               }}
                               aria-label={`Rename ${pl.name}`}
-                              className="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-white/5"
+                              className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-white/5"
                             >
                               <Edit3 className="w-3.5 h-3.5" />
                             </button>
@@ -296,7 +296,7 @@ export function LibraryPage({
                                 if (selectedPlaylistId === pl.id) setSelectedPlaylistId(null);
                               }}
                               aria-label={`Delete ${pl.name}`}
-                              className="p-2 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-white/5"
+                              className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-lg text-slate-400 hover:text-rose-400 hover:bg-white/5"
                             >
                               <Trash2 className="w-3.5 h-3.5" />
                             </button>
@@ -309,7 +309,7 @@ export function LibraryPage({
               </div>
 
               {/* Selected Playlist Detail */}
-              <div className="lg:col-span-8">
+              <div className="md:col-span-7 lg:col-span-8">
                 {selectedPlaylist ? (
                   <div className="rounded-2xl bg-[#11131A] border border-white/[0.08] p-5 space-y-5">
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-white/[0.07]">

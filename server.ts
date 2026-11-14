@@ -9,16 +9,20 @@ import {
   getTrendingMusic,
   getYoutubeKeyStatus,
   hasConfiguredYoutubeKeys,
-  pickBestOfficialTrack,
   searchYouTubeTracks,
   searchYouTubeTracksPaginated,
   YouTubeApiError,
 } from './server/youtube.ts';
 import {
   GeminiApiError,
-  generateCategoryQueries,
   generateMoodDiscoveryPlan,
+  getGeminiKeyStatus,
+  hasConfiguredGeminiKeys,
 } from './server/gemini.ts';
+import {
+  proxyAudioStream,
+  resolveBackgroundAudioStream,
+} from './server/audioResolver.ts';
 import type {
   AiDiscoveryResponse,
   CategoryId,
@@ -39,8 +43,7 @@ function isYoutubeConfigured(): boolean {
 }
 
 function isGeminiConfigured(): boolean {
-  const key = process.env.GEMINI_API_KEY?.trim();
-  return Boolean(key && key !== 'MY_GEMINI_API_KEY');
+  return hasConfiguredGeminiKeys();
 }
 
 function parseLang(raw: unknown): IndiaLanguageFilter {
@@ -98,9 +101,44 @@ async function startServer() {
 
   app.use(express.json({ limit: '16kb' }));
 
-  const generalApiLimiter = createRateLimiter(60_000, 100);
+  // Range-capable audio stream proxy (mounted before generalApiLimiter so seeking never hits 429)
+  app.get('/api/audio/stream', async (req, res) => {
+    const videoId = typeof req.query.videoId === 'string' ? req.query.videoId.trim() : '';
+    if (!YOUTUBE_VIDEO_ID_RE.test(videoId)) {
+      res.status(400).json({ error: 'INVALID_VIDEO_ID', message: 'Invalid YouTube video ID.' });
+      return;
+    }
+    await proxyAudioStream(req, res, videoId);
+  });
+
+  const generalApiLimiter = createRateLimiter(60_000, 120);
   const aiApiLimiter = createRateLimiter(60_000, 20);
   app.use('/api', generalApiLimiter);
+
+  // Resolve verified native audio stream for background/screen-off mobile playback
+  app.get('/api/audio/resolve', async (req, res) => {
+    try {
+      const videoId = typeof req.query.videoId === 'string' ? req.query.videoId.trim() : '';
+      if (!YOUTUBE_VIDEO_ID_RE.test(videoId)) {
+        res.status(400).json({ error: 'INVALID_VIDEO_ID', message: 'Invalid YouTube video ID.' });
+        return;
+      }
+      const title = typeof req.query.title === 'string' ? req.query.title.slice(0, 180) : '';
+      const artist = typeof req.query.artist === 'string' ? req.query.artist.slice(0, 120) : '';
+      const durationRaw = Number(req.query.duration);
+      const durationSeconds = Number.isFinite(durationRaw) && durationRaw > 0 ? durationRaw : 0;
+
+      if (!title) {
+        res.json({ mode: 'youtube' });
+        return;
+      }
+
+      const resolved = await resolveBackgroundAudioStream(videoId, title, artist, durationSeconds);
+      res.json(resolved);
+    } catch {
+      res.json({ mode: 'youtube' });
+    }
+  });
 
   // Configuration status check (booleans & counts only, never exposes secrets)
   app.get('/api/config-status', (_req, res) => {
@@ -108,6 +146,7 @@ async function startServer() {
       youtubeConfigured: isYoutubeConfigured(),
       geminiConfigured: isGeminiConfigured(),
       youtubeKeyStatus: getYoutubeKeyStatus(),
+      geminiKeyStatus: getGeminiKeyStatus(),
     });
   });
 
@@ -141,18 +180,8 @@ async function startServer() {
       const region = typeof req.query.region === 'string' ? req.query.region : 'IN';
       const lang = parseLang(req.query.lang);
       const refresh = req.query.refresh === '1';
-      const useAi = req.query.ai === '1';
       const subFilter =
         typeof req.query.sub === 'string' ? req.query.sub.trim().slice(0, 40) : undefined;
-
-      let customQueries: string[] | undefined;
-      if (useAi && category !== 'trending' && isGeminiConfigured()) {
-        try {
-          customQueries = await generateCategoryQueries(category, lang);
-        } catch {
-          // Fallback cleanly to curated mood queries if AI call fails
-        }
-      }
 
       const tracks = await getCategoryTracks({
         category,
@@ -160,7 +189,6 @@ async function startServer() {
         lang,
         forceRefresh: refresh,
         subFilter,
-        customQueries,
       });
       res.json({ tracks });
     } catch (err) {
@@ -285,12 +313,24 @@ async function startServer() {
             };
           }
 
+          const groupedQueries: string[] = [];
+          for (let i = 0; i < plan.searchQueries.length; i += 3) {
+            const batch = plan.searchQueries
+              .slice(i, i + 3)
+              .map((q) => q.replace(/\s*[-–—]\s*/g, ' ').trim())
+              .filter(Boolean);
+            if (batch.length > 0) {
+              groupedQueries.push(batch.join(' OR '));
+            }
+            if (groupedQueries.length >= 2) break;
+          }
+
           const queryResults = await Promise.allSettled(
-            plan.searchQueries.map((query) =>
+            groupedQueries.map((query) =>
               searchYouTubeTracks({
                 query,
                 type: 'songs',
-                maxResults: 4,
+                maxResults: 15,
                 category: plan.categoryMatch,
               })
             )
@@ -300,25 +340,31 @@ async function startServer() {
           const tracks: Track[] = [];
 
           for (const result of queryResults) {
-            if (result.status === 'fulfilled' && result.value.length > 0) {
-              const topTrack = pickBestOfficialTrack(result.value, 'all') ?? result.value[0];
-              if (topTrack && !seen.has(topTrack.id)) {
-                seen.add(topTrack.id);
-                tracks.push(topTrack);
+            if (result.status === 'fulfilled') {
+              for (const track of result.value) {
+                if (!seen.has(track.id)) {
+                  seen.add(track.id);
+                  tracks.push(track);
+                }
               }
             }
           }
 
-          if (tracks.length < 8) {
-            for (const result of queryResults) {
-              if (result.status === 'fulfilled') {
-                for (const track of result.value) {
-                  if (!seen.has(track.id)) {
-                    seen.add(track.id);
-                    tracks.push(track);
-                  }
+          if (tracks.length < 4) {
+            try {
+              const moodFallback = await getCategoryTracks({
+                category: plan.categoryMatch,
+                region: 'IN',
+                lang: 'all',
+              });
+              for (const track of moodFallback) {
+                if (!seen.has(track.id)) {
+                  seen.add(track.id);
+                  tracks.push(track);
                 }
               }
+            } catch {
+              // ignore fallback error
             }
           }
 
@@ -328,11 +374,11 @@ async function startServer() {
             youtubeConfigured: true,
           };
 
-          if (aiDiscoveryCache.size >= 40) {
+          if (aiDiscoveryCache.size >= 60) {
             const oldestKey = aiDiscoveryCache.keys().next().value;
             if (oldestKey !== undefined) aiDiscoveryCache.delete(oldestKey);
           }
-          aiDiscoveryCache.set(cacheKey, { payload, expiresAt: Date.now() + 15 * 60 * 1000 });
+          aiDiscoveryCache.set(cacheKey, { payload, expiresAt: Date.now() + 2 * 60 * 60 * 1000 });
           return payload;
         })().finally(() => {
           aiInFlight.delete(cacheKey);

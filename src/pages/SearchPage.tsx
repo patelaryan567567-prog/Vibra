@@ -278,7 +278,7 @@ export function SearchPage({
 
       {/* Idle State: Search History & Trending Searches */}
       {!hasSearched && !loading && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 lg:gap-8">
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <h2 className="text-sm font-semibold text-white flex items-center gap-2">
@@ -353,7 +353,7 @@ export function SearchPage({
 
       {/* Loading Skeletons */}
       {loading && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
           {Array.from({ length: 8 }).map((_, i) => (
             <TrackCardSkeleton key={i} />
           ))}
@@ -382,7 +382,7 @@ export function SearchPage({
       {!loading && !error && results.length > 0 && (
         <div className="space-y-6">
           {activeTab === 'videos' ? (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
               {results.map((track) => (
                 <TrackCard
                   key={track.id}

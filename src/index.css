@@ -8,21 +8,62 @@
     --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
   }
 
-  html {
+  html,
+  body {
     font-family: var(--font-sans);
     background-color: #090A0F;
     color: #F4F5F8;
     color-scheme: dark;
+    overflow-x: hidden;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-font-smoothing: antialiased;
   }
 
   h1, h2, h3, h4, .font-display {
     font-family: var(--font-display);
   }
 
+  button,
+  a,
+  input,
+  select {
+    touch-action: manipulation;
+  }
+
   .font-mono-tabular {
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
+}
+
+/* Safe-area utilities for notched phones & gesture bars */
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Ergonomic range sliders for touch (mobile/tablet) and mouse (PC) */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 9999px;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+
+input[type="range"]::-webkit-slider-thumb:hover,
+input[type="range"]::-webkit-slider-thumb:active {
+  transform: scale(1.2);
 }
 
 /* Custom sleek dark scrollbar */
@@ -51,6 +92,40 @@
 .no-scrollbar {
   -ms-overflow-style: none;
   scrollbar-width: none;
+}
+
+/* Animated SVG stroke draw for VIBRA opening splash logo */
+@keyframes vibraStrokeDraw {
+  0% {
+    stroke-dashoffset: 120;
+    opacity: 0.2;
+  }
+  60% {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+  100% {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+}
+
+.vibra-logo-path-1 {
+  stroke-dasharray: 120;
+  stroke-dashoffset: 120;
+  animation: vibraStrokeDraw 1.15s cubic-bezier(0.16, 1, 0.3, 1) 0.05s forwards;
+}
+
+.vibra-logo-path-2 {
+  stroke-dasharray: 120;
+  stroke-dashoffset: 120;
+  animation: vibraStrokeDraw 1.15s cubic-bezier(0.16, 1, 0.3, 1) 0.2s forwards;
+}
+
+.vibra-logo-path-3 {
+  stroke-dasharray: 120;
+  stroke-dashoffset: 120;
+  animation: vibraStrokeDraw 1.15s cubic-bezier(0.16, 1, 0.3, 1) 0.34s forwards;
 }
 
 @media (prefers-reduced-motion: reduce) {

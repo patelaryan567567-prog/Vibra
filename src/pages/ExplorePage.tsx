@@ -61,7 +61,7 @@ export function ExplorePage({ onAddToPlaylist, onRunSearchQuery }: ExplorePagePr
       {/* Four Mood Worlds */}
       <section className="space-y-4">
         <h2 className="text-lg sm:text-xl font-bold text-white">Curated Mood Worlds</h2>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="flex lg:grid lg:grid-cols-4 gap-3.5 sm:gap-4 overflow-x-auto lg:overflow-visible pb-2 lg:pb-0 snap-x snap-mandatory no-scrollbar -mx-3.5 px-3.5 sm:mx-0 sm:px-0">
           {DISCOVERY_CATEGORIES.map((cat) => {
             const isSelected = selectedCategory === cat.id;
             return (
@@ -69,7 +69,7 @@ export function ExplorePage({ onAddToPlaylist, onRunSearchQuery }: ExplorePagePr
                 key={cat.id}
                 type="button"
                 onClick={() => openMoodWorld(cat.id, isSelected)}
-                className={`group relative overflow-hidden rounded-2xl border text-left transition-all ${
+                className={`w-[210px] sm:w-[235px] lg:w-auto shrink-0 snap-start group relative overflow-hidden rounded-2xl border text-left transition-all ${
                   isSelected
                     ? 'border-[#4F6BFF] ring-1 ring-[#4F6BFF]/40'
                     : 'border-white/[0.08] hover:border-white/20'
@@ -93,7 +93,7 @@ export function ExplorePage({ onAddToPlaylist, onRunSearchQuery }: ExplorePagePr
         </div>
       </section>
 
-      {/* Selected Mood Results */}
+      {/* Selected Mood Results — Horizontal Scroll Carousel */}
       {selectedCategory && activeMeta && (
         <section className="space-y-4 pt-2">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -125,9 +125,14 @@ export function ExplorePage({ onAddToPlaylist, onRunSearchQuery }: ExplorePagePr
           </div>
 
           {loadingCat ? (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <TrackCardSkeleton key={i} />
+            <div className="flex gap-3.5 sm:gap-4 overflow-x-auto pb-2 no-scrollbar -mx-3.5 px-3.5 sm:mx-0 sm:px-0">
+              {Array.from({ length: 5 }).map((_, i) => (
+                <div
+                  key={i}
+                  className="w-[235px] sm:w-[255px] md:w-[265px] lg:w-[275px] shrink-0"
+                >
+                  <TrackCardSkeleton />
+                </div>
               ))}
             </div>
           ) : catError ? (
@@ -136,14 +141,18 @@ export function ExplorePage({ onAddToPlaylist, onRunSearchQuery }: ExplorePagePr
               onRetry={() => openMoodWorld(selectedCategory, true)}
             />
           ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="flex gap-3.5 sm:gap-4 overflow-x-auto pb-2 snap-x snap-mandatory no-scrollbar -mx-3.5 px-3.5 sm:mx-0 sm:px-0">
               {catTracks.map((track) => (
-                <TrackCard
+                <div
                   key={track.id}
-                  track={track}
-                  queueContext={catTracks}
-                  onAddToPlaylist={onAddToPlaylist}
-                />
+                  className="w-[235px] sm:w-[255px] md:w-[265px] lg:w-[275px] shrink-0 snap-start"
+                >
+                  <TrackCard
+                    track={track}
+                    queueContext={catTracks}
+                    onAddToPlaylist={onAddToPlaylist}
+                  />
+                </div>
               ))}
             </div>
           )}
