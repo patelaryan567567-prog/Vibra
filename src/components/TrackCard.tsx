@@ -1,4 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Check,
   Download,
@@ -18,6 +19,254 @@ import { useOfflineMusic } from '../context/OfflineMusicContext';
 import { usePlayer } from '../context/PlayerContext';
 import type { Track } from '../types/music';
 
+interface TrackActionMenuProps {
+  track: Track;
+  queueContext?: Track[];
+  onAddToPlaylist: (track: Track) => void;
+  anchorEl: HTMLButtonElement | null;
+  isOpen: boolean;
+  onClose: () => void;
+}
+
+function TrackActionMenu({
+  track,
+  queueContext,
+  onAddToPlaylist,
+  anchorEl,
+  isOpen,
+  onClose,
+}: TrackActionMenuProps) {
+  const { playTrack, startTrackRadio, addToQueue, playNextInQueue } = usePlayer();
+  const { saveOnlineTrack, isTrackSavedOffline, downloadingIds, downloadProgressMap } =
+    useOfflineMusic();
+
+  const menuPanelRef = useRef<HTMLDivElement>(null);
+  const [coords, setCoords] = useState<{ top: number; left: number; maxHeight: number }>({
+    top: -9999,
+    left: -9999,
+    maxHeight: 360,
+  });
+
+  const savedOffline = isTrackSavedOffline(track.id);
+  const isDownloading = Boolean(downloadingIds[track.id]);
+  const dlProgress = downloadProgressMap[track.id];
+
+  const updatePosition = useCallback(() => {
+    if (!anchorEl) return;
+    const rect = anchorEl.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return;
+
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const margin = 10;
+    const gap = 6;
+    const menuWidth = Math.min(248, vw - margin * 2);
+    const measuredHeight = menuPanelRef.current?.offsetHeight || 296;
+
+    const left = Math.max(margin, Math.min(vw - menuWidth - margin, rect.right - menuWidth));
+    const spaceBelow = vh - rect.bottom - margin - gap;
+    const spaceAbove = rect.top - margin - gap;
+
+    let top: number;
+    let maxHeight: number;
+
+    if (spaceBelow >= measuredHeight || spaceBelow >= spaceAbove) {
+      maxHeight = Math.max(160, spaceBelow);
+      const effectiveHeight = Math.min(measuredHeight, maxHeight);
+      top = Math.min(vh - margin - effectiveHeight, rect.bottom + gap);
+    } else {
+      maxHeight = Math.max(160, spaceAbove);
+      const effectiveHeight = Math.min(measuredHeight, maxHeight);
+      top = Math.max(margin, rect.top - gap - effectiveHeight);
+    }
+
+    setCoords({ top, left, maxHeight });
+  }, [anchorEl]);
+
+  useLayoutEffect(() => {
+    if (!isOpen) return;
+    updatePosition();
+  }, [isOpen, updatePosition, savedOffline, isDownloading]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const handlePointerDown = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (anchorEl && anchorEl.contains(target)) return;
+      if (menuPanelRef.current && menuPanelRef.current.contains(target)) return;
+      onClose();
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+
+    const handleScrollOrResize = (e: Event) => {
+      if (menuPanelRef.current && e.target instanceof Node && menuPanelRef.current.contains(e.target)) {
+        return;
+      }
+      if (!anchorEl) {
+        onClose();
+        return;
+      }
+      const rect = anchorEl.getBoundingClientRect();
+      if (
+        rect.bottom < 0 ||
+        rect.top > window.innerHeight ||
+        rect.right < 0 ||
+        rect.left > window.innerWidth
+      ) {
+        onClose();
+        return;
+      }
+      updatePosition();
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('touchstart', handlePointerDown, { passive: true });
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('resize', handleScrollOrResize);
+    window.addEventListener('scroll', handleScrollOrResize, true);
+
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('touchstart', handlePointerDown);
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('resize', handleScrollOrResize);
+      window.removeEventListener('scroll', handleScrollOrResize, true);
+    };
+  }, [isOpen, anchorEl, onClose, updatePosition]);
+
+  if (!isOpen || typeof document === 'undefined') return null;
+
+  return createPortal(
+    <div
+      ref={menuPanelRef}
+      role="menu"
+      aria-label={`Actions for ${track.title}`}
+      style={{
+        position: 'fixed',
+        top: `${coords.top}px`,
+        left: `${coords.left}px`,
+        maxHeight: `${coords.maxHeight}px`,
+      }}
+      className="z-[80] w-[248px] max-w-[calc(100vw-20px)] overflow-y-auto rounded-xl bg-[#181B26]/98 backdrop-blur-xl border border-white/15 shadow-[0_18px_45px_rgba(0,0,0,0.75)] py-1.5 text-xs"
+    >
+      <button
+        type="button"
+        role="menuitem"
+        onClick={() => {
+          startTrackRadio(track);
+          onClose();
+        }}
+        className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] text-left transition-colors"
+      >
+        <Radio className="w-4 h-4 text-[#7A90FF] shrink-0" />
+        <span>Start Song Radio</span>
+      </button>
+
+      <button
+        type="button"
+        role="menuitem"
+        onClick={() => {
+          playTrack(track, queueContext, true);
+          onClose();
+        }}
+        className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] text-left transition-colors"
+      >
+        <Tv className="w-4 h-4 text-[#7A90FF] shrink-0" />
+        <span>Watch Music Video</span>
+      </button>
+
+      <button
+        type="button"
+        role="menuitem"
+        onClick={() => {
+          playNextInQueue(track);
+          onClose();
+        }}
+        className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] text-left transition-colors"
+      >
+        <Play className="w-4 h-4 text-slate-300 shrink-0" />
+        <span>Play Next</span>
+      </button>
+
+      <button
+        type="button"
+        role="menuitem"
+        onClick={() => {
+          addToQueue(track);
+          onClose();
+        }}
+        className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] text-left transition-colors"
+      >
+        <ListPlus className="w-4 h-4 text-slate-300 shrink-0" />
+        <span>Add to Queue</span>
+      </button>
+
+      <button
+        type="button"
+        role="menuitem"
+        onClick={() => {
+          onAddToPlaylist(track);
+          onClose();
+        }}
+        className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] text-left transition-colors"
+      >
+        <PlusSquare className="w-4 h-4 text-slate-300 shrink-0" />
+        <span>Add to Playlist</span>
+      </button>
+
+      <div className="my-1 border-t border-white/[0.07]" />
+
+      <button
+        type="button"
+        role="menuitem"
+        disabled={isDownloading}
+        onClick={() => {
+          void saveOnlineTrack(track, true);
+          onClose();
+        }}
+        className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] disabled:opacity-65 text-left transition-colors"
+      >
+        {isDownloading ? (
+          <Loader2 className="w-4 h-4 text-emerald-400 animate-spin shrink-0" />
+        ) : savedOffline ? (
+          <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+        ) : (
+          <Download className="w-4 h-4 text-emerald-400 shrink-0" />
+        )}
+        <span>
+          {isDownloading
+            ? `Downloading ${dlProgress?.percent ?? 0}%`
+            : savedOffline
+              ? 'Download File to Device'
+              : 'Download (Device + My Music)'}
+        </span>
+      </button>
+
+      {!savedOffline && (
+        <button
+          type="button"
+          role="menuitem"
+          disabled={isDownloading}
+          onClick={() => {
+            void saveOnlineTrack(track, false);
+            onClose();
+          }}
+          className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-300 hover:bg-white/[0.07] disabled:opacity-65 text-left transition-colors"
+        >
+          <Download className="w-4 h-4 text-[#7A90FF] shrink-0" />
+          <span>Save Only to My Music</span>
+        </button>
+      )}
+    </div>,
+    document.body
+  );
+}
+
 interface TrackCardProps {
   track: Track;
   queueContext?: Track[];
@@ -26,38 +275,17 @@ interface TrackCardProps {
 }
 
 export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel }: TrackCardProps) {
-  const {
-    currentTrack,
-    isPlaying,
-    playTrack,
-    startTrackRadio,
-    togglePlay,
-    addToQueue,
-    playNextInQueue,
-  } = usePlayer();
+  const { currentTrack, isPlaying, playTrack, togglePlay } = usePlayer();
   const { isFavourite, toggleFavourite } = useLibrary();
-  const { saveOnlineTrack, isTrackSavedOffline, downloadingIds, downloadProgressMap } = useOfflineMusic();
+  const { downloadProgressMap } = useOfflineMusic();
   const [menuOpen, setMenuOpen] = useState(false);
   const [imgError, setImgError] = useState(false);
-  const menuRef = useRef<HTMLDivElement>(null);
+  const menuTriggerRef = useRef<HTMLButtonElement>(null);
 
   const isCurrent = currentTrack?.id === track.id;
   const isCurrentPlaying = isCurrent && isPlaying;
   const fav = isFavourite(track.id);
-  const savedOffline = isTrackSavedOffline(track.id);
-  const isDownloading = Boolean(downloadingIds[track.id]);
   const dlProgress = downloadProgressMap[track.id];
-
-  useEffect(() => {
-    if (!menuOpen) return;
-    const handler = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        setMenuOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, [menuOpen]);
 
   const handlePrimaryPlay = () => {
     if (isCurrent) {
@@ -156,7 +384,7 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
         </button>
 
         {/* Quick actions */}
-        <div className="flex items-center shrink-0 -mr-1.5" ref={menuRef}>
+        <div className="flex items-center shrink-0 -mr-1.5">
           <button
             type="button"
             onClick={() => toggleFavourite(track)}
@@ -179,114 +407,28 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
             <PlusSquare className="w-4 h-4" />
           </button>
 
-          <div className="relative">
-            <button
-              type="button"
-              onClick={() => setMenuOpen((v) => !v)}
-              aria-label={`More actions for ${track.title}`}
-              className="min-h-[40px] min-w-[38px] sm:min-w-[40px] flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-white/5 transition-colors"
-            >
-              <MoreHorizontal className="w-4 h-4" />
-            </button>
+          <button
+            ref={menuTriggerRef}
+            type="button"
+            onClick={() => setMenuOpen((v) => !v)}
+            aria-label={`More actions for ${track.title}`}
+            aria-expanded={menuOpen}
+            aria-haspopup="menu"
+            className={`min-h-[40px] min-w-[38px] sm:min-w-[40px] flex items-center justify-center rounded-lg transition-colors ${
+              menuOpen ? 'text-white bg-white/10' : 'text-slate-400 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            <MoreHorizontal className="w-4 h-4" />
+          </button>
 
-            {menuOpen && (
-              <div className="absolute right-0 bottom-10 z-30 w-48 rounded-xl bg-[#181B26] border border-white/10 shadow-2xl py-1.5 text-xs">
-                <button
-                  type="button"
-                  onClick={() => {
-                    startTrackRadio(track);
-                    setMenuOpen(false);
-                  }}
-                  className="w-full px-3.5 py-2.5 flex items-center gap-2.5 text-slate-200 hover:bg-white/5 text-left"
-                >
-                  <Radio className="w-3.5 h-3.5 text-[#7A90FF]" />
-                  <span>Start Song Radio</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    playTrack(track, queueContext, true);
-                    setMenuOpen(false);
-                  }}
-                  className="w-full px-3.5 py-2.5 flex items-center gap-2.5 text-slate-200 hover:bg-white/5 text-left"
-                >
-                  <Tv className="w-3.5 h-3.5 text-[#7A90FF]" />
-                  <span>Watch Music Video</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    playNextInQueue(track);
-                    setMenuOpen(false);
-                  }}
-                  className="w-full px-3.5 py-2.5 flex items-center gap-2.5 text-slate-200 hover:bg-white/5 text-left"
-                >
-                  <Play className="w-3.5 h-3.5 text-slate-400" />
-                  <span>Play Next</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    addToQueue(track);
-                    setMenuOpen(false);
-                  }}
-                  className="w-full px-3.5 py-2.5 flex items-center gap-2.5 text-slate-200 hover:bg-white/5 text-left"
-                >
-                  <ListPlus className="w-3.5 h-3.5 text-slate-400" />
-                  <span>Add to Queue</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    onAddToPlaylist(track);
-                    setMenuOpen(false);
-                  }}
-                  className="w-full px-3.5 py-2.5 flex items-center gap-2.5 text-slate-200 hover:bg-white/5 text-left"
-                >
-                  <PlusSquare className="w-3.5 h-3.5 text-slate-400" />
-                  <span>Add to Playlist</span>
-                </button>
-                <button
-                  type="button"
-                  disabled={isDownloading}
-                  onClick={() => {
-                    void saveOnlineTrack(track, true);
-                    setMenuOpen(false);
-                  }}
-                  className="w-full px-3.5 py-2.5 flex items-center gap-2.5 text-slate-200 hover:bg-white/5 disabled:opacity-65 text-left"
-                >
-                  {isDownloading ? (
-                    <Loader2 className="w-3.5 h-3.5 text-emerald-400 animate-spin shrink-0" />
-                  ) : savedOffline ? (
-                    <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                  ) : (
-                    <Download className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                  )}
-                  <span className="truncate">
-                    {isDownloading
-                      ? `Downloading ${dlProgress?.percent ?? 0}%`
-                      : savedOffline
-                        ? 'Download File to Device'
-                        : 'Download (Device + My Music)'}
-                  </span>
-                </button>
-                {!savedOffline && (
-                  <button
-                    type="button"
-                    disabled={isDownloading}
-                    onClick={() => {
-                      void saveOnlineTrack(track, false);
-                      setMenuOpen(false);
-                    }}
-                    className="w-full px-3.5 py-2.5 flex items-center gap-2.5 text-slate-300 hover:bg-white/5 disabled:opacity-65 text-left"
-                  >
-                    <Download className="w-3.5 h-3.5 text-[#7A90FF] shrink-0" />
-                    <span>Save Only to My Music</span>
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
+          <TrackActionMenu
+            track={track}
+            queueContext={queueContext}
+            onAddToPlaylist={onAddToPlaylist}
+            anchorEl={menuTriggerRef.current}
+            isOpen={menuOpen}
+            onClose={() => setMenuOpen(false)}
+          />
         </div>
       </div>
     </article>
@@ -314,6 +456,8 @@ export function TrackRow({
   const { isFavourite, toggleFavourite } = useLibrary();
   const { saveOnlineTrack, isTrackSavedOffline, downloadingIds, downloadProgressMap } = useOfflineMusic();
   const [imgError, setImgError] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuTriggerRef = useRef<HTMLButtonElement>(null);
 
   const isCurrent = currentTrack?.id === track.id;
   const isCurrentPlaying = isCurrent && isPlaying;
@@ -329,7 +473,7 @@ export function TrackRow({
 
   return (
     <div
-      className={`group flex items-center gap-3 px-3 py-2.5 rounded-xl border transition-colors ${
+      className={`group flex items-center gap-2.5 sm:gap-3 px-3 py-2.5 rounded-xl border transition-colors ${
         isCurrent
           ? 'bg-[#4F6BFF]/10 border-[#4F6BFF]/30'
           : 'bg-[#11131A]/70 border-white/[0.05] hover:bg-[#181B26] hover:border-white/[0.12]'
@@ -344,7 +488,7 @@ export function TrackRow({
       <button
         type="button"
         onClick={handlePlay}
-        className="relative w-14 h-10 sm:w-16 sm:h-11 rounded-lg overflow-hidden bg-[#181B26] shrink-0"
+        className="relative w-12 h-10 sm:w-16 sm:h-11 rounded-lg overflow-hidden bg-[#181B26] shrink-0"
         aria-label={isCurrentPlaying ? `Pause ${track.title}` : `Play ${track.title}`}
       >
         {!imgError ? (
@@ -403,7 +547,7 @@ export function TrackRow({
         <button
           type="button"
           onClick={() => toggleFavourite(track)}
-          className={`min-h-[40px] min-w-[40px] flex items-center justify-center rounded-lg transition-colors ${
+          className={`min-h-[40px] min-w-[38px] sm:min-w-[40px] flex items-center justify-center rounded-lg transition-colors ${
             fav ? 'text-rose-400 hover:bg-rose-500/10' : 'text-slate-400 hover:text-white hover:bg-white/5'
           }`}
           aria-label={fav ? 'Remove from favourites' : 'Save to favourites'}
@@ -423,7 +567,7 @@ export function TrackRow({
           type="button"
           disabled={isDownloading}
           onClick={() => void saveOnlineTrack(track, true)}
-          className={`min-h-[40px] min-w-[40px] px-1.5 flex items-center justify-center gap-1 rounded-lg transition-colors ${
+          className={`min-h-[40px] min-w-[38px] sm:min-w-[40px] px-1.5 flex items-center justify-center gap-1 rounded-lg transition-colors ${
             isDownloading
               ? 'bg-emerald-500/15 text-emerald-300'
               : savedOffline
@@ -461,13 +605,34 @@ export function TrackRow({
         <button
           type="button"
           onClick={() => onAddToPlaylist(track)}
-          className="min-h-[40px] min-w-[40px] px-2.5 flex items-center justify-center gap-1.5 rounded-lg bg-white/[0.05] hover:bg-[#4F6BFF]/20 border border-white/[0.08] hover:border-[#4F6BFF]/40 text-xs font-medium text-slate-200 hover:text-white transition-colors"
+          className="hidden sm:flex min-h-[40px] min-w-[40px] px-2.5 items-center justify-center gap-1.5 rounded-lg bg-white/[0.05] hover:bg-[#4F6BFF]/20 border border-white/[0.08] hover:border-[#4F6BFF]/40 text-xs font-medium text-slate-200 hover:text-white transition-colors"
           aria-label={`Add ${track.title} to playlist`}
           title="Add to playlist"
         >
           <PlusSquare className="w-3.5 h-3.5 text-[#7A90FF]" />
           <span className="hidden md:inline">Playlist</span>
         </button>
+        <button
+          ref={menuTriggerRef}
+          type="button"
+          onClick={() => setMenuOpen((v) => !v)}
+          aria-label={`More actions for ${track.title}`}
+          aria-expanded={menuOpen}
+          aria-haspopup="menu"
+          className={`min-h-[40px] min-w-[38px] sm:min-w-[40px] flex items-center justify-center rounded-lg transition-colors ${
+            menuOpen ? 'text-white bg-white/10' : 'text-slate-400 hover:text-white hover:bg-white/5'
+          }`}
+        >
+          <MoreHorizontal className="w-4 h-4" />
+        </button>
+        <TrackActionMenu
+          track={track}
+          queueContext={queueContext}
+          onAddToPlaylist={onAddToPlaylist}
+          anchorEl={menuTriggerRef.current}
+          isOpen={menuOpen}
+          onClose={() => setMenuOpen(false)}
+        />
         {rightAction}
       </div>
     </div>
