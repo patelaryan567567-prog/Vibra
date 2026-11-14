@@ -1,7 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  Check,
+  Download,
   Heart,
   ListPlus,
+  Loader2,
   MoreHorizontal,
   Music2,
   Pause,
@@ -11,6 +14,7 @@ import {
   Tv,
 } from 'lucide-react';
 import { useLibrary } from '../context/LibraryContext';
+import { useOfflineMusic } from '../context/OfflineMusicContext';
 import { usePlayer } from '../context/PlayerContext';
 import type { Track } from '../types/music';
 
@@ -32,6 +36,7 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
     playNextInQueue,
   } = usePlayer();
   const { isFavourite, toggleFavourite } = useLibrary();
+  const { saveOnlineTrack, isTrackSavedOffline, downloadingIds, downloadProgressMap } = useOfflineMusic();
   const [menuOpen, setMenuOpen] = useState(false);
   const [imgError, setImgError] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -39,6 +44,9 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
   const isCurrent = currentTrack?.id === track.id;
   const isCurrentPlaying = isCurrent && isPlaying;
   const fav = isFavourite(track.id);
+  const savedOffline = isTrackSavedOffline(track.id);
+  const isDownloading = Boolean(downloadingIds[track.id]);
+  const dlProgress = downloadProgressMap[track.id];
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -104,6 +112,14 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
         {isCurrent && (
           <div className="absolute top-2 left-2 px-2 py-0.5 rounded-md bg-[#4F6BFF] text-[11px] font-medium text-white shadow">
             {isCurrentPlaying ? 'Playing' : 'Paused'}
+          </div>
+        )}
+
+        {/* Live Download Percentage Badge */}
+        {dlProgress && (
+          <div className="absolute top-2 right-2 px-2 py-0.5 rounded-md bg-emerald-600/95 text-[11px] font-mono-tabular font-bold text-white shadow flex items-center gap-1">
+            {dlProgress.phase !== 'done' && <Loader2 className="w-3 h-3 animate-spin" />}
+            <span>{dlProgress.percent}%</span>
           </div>
         )}
       </div>
@@ -230,6 +246,44 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
                   <PlusSquare className="w-3.5 h-3.5 text-slate-400" />
                   <span>Add to Playlist</span>
                 </button>
+                <button
+                  type="button"
+                  disabled={isDownloading}
+                  onClick={() => {
+                    void saveOnlineTrack(track, true);
+                    setMenuOpen(false);
+                  }}
+                  className="w-full px-3.5 py-2.5 flex items-center gap-2.5 text-slate-200 hover:bg-white/5 disabled:opacity-65 text-left"
+                >
+                  {isDownloading ? (
+                    <Loader2 className="w-3.5 h-3.5 text-emerald-400 animate-spin shrink-0" />
+                  ) : savedOffline ? (
+                    <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  ) : (
+                    <Download className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  )}
+                  <span className="truncate">
+                    {isDownloading
+                      ? `Downloading ${dlProgress?.percent ?? 0}%`
+                      : savedOffline
+                        ? 'Download File to Device'
+                        : 'Download (Device + My Music)'}
+                  </span>
+                </button>
+                {!savedOffline && (
+                  <button
+                    type="button"
+                    disabled={isDownloading}
+                    onClick={() => {
+                      void saveOnlineTrack(track, false);
+                      setMenuOpen(false);
+                    }}
+                    className="w-full px-3.5 py-2.5 flex items-center gap-2.5 text-slate-300 hover:bg-white/5 disabled:opacity-65 text-left"
+                  >
+                    <Download className="w-3.5 h-3.5 text-[#7A90FF] shrink-0" />
+                    <span>Save Only to My Music</span>
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -258,11 +312,15 @@ export function TrackRow({
 }: TrackRowProps) {
   const { currentTrack, isPlaying, playTrack, togglePlay, addToQueue } = usePlayer();
   const { isFavourite, toggleFavourite } = useLibrary();
+  const { saveOnlineTrack, isTrackSavedOffline, downloadingIds, downloadProgressMap } = useOfflineMusic();
   const [imgError, setImgError] = useState(false);
 
   const isCurrent = currentTrack?.id === track.id;
   const isCurrentPlaying = isCurrent && isPlaying;
   const fav = isFavourite(track.id);
+  const savedOffline = isTrackSavedOffline(track.id);
+  const isDownloading = Boolean(downloadingIds[track.id]);
+  const dlProgress = downloadProgressMap[track.id];
 
   const handlePlay = () => {
     if (isCurrent) togglePlay();
@@ -360,6 +418,45 @@ export function TrackRow({
           title="Add to queue"
         >
           <ListPlus className="w-4 h-4" />
+        </button>
+        <button
+          type="button"
+          disabled={isDownloading}
+          onClick={() => void saveOnlineTrack(track, true)}
+          className={`min-h-[40px] min-w-[40px] px-1.5 flex items-center justify-center gap-1 rounded-lg transition-colors ${
+            isDownloading
+              ? 'bg-emerald-500/15 text-emerald-300'
+              : savedOffline
+                ? 'text-emerald-400 hover:bg-emerald-500/10'
+                : 'text-slate-400 hover:text-emerald-300 hover:bg-white/5'
+          }`}
+          aria-label={
+            isDownloading
+              ? `Downloading ${track.title} ${dlProgress?.percent ?? 0}%`
+              : savedOffline
+                ? `Saved in My Music — Download ${track.title} to Device`
+                : `Download ${track.title} to Device and My Music`
+          }
+          title={
+            isDownloading
+              ? `Downloading ${dlProgress?.percent ?? 0}%`
+              : savedOffline
+                ? 'Saved in My Music — Click to Download File to Device'
+                : 'Download to Device & My Music'
+          }
+        >
+          {isDownloading ? (
+            <>
+              <Loader2 className="w-3.5 h-3.5 text-emerald-400 animate-spin shrink-0" />
+              <span className="font-mono-tabular text-[11px] font-bold">
+                {dlProgress?.percent ?? 0}%
+              </span>
+            </>
+          ) : savedOffline ? (
+            <Check className="w-4 h-4" />
+          ) : (
+            <Download className="w-4 h-4" />
+          )}
         </button>
         <button
           type="button"

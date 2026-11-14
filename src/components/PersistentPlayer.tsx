@@ -3,10 +3,13 @@ import {
   ArrowDown,
   ArrowUp,
   BookmarkPlus,
+  Check,
   ChevronDown,
+  Download,
   Headphones,
   Heart,
   ListMusic,
+  Loader2,
   Maximize2,
   Music2,
   Pause,
@@ -25,6 +28,7 @@ import {
   X,
 } from 'lucide-react';
 import { useLibrary } from '../context/LibraryContext';
+import { useOfflineMusic } from '../context/OfflineMusicContext';
 import { usePlayer } from '../context/PlayerContext';
 import type { Track } from '../types/music';
 import { formatSeconds } from '../utils/format';
@@ -85,6 +89,7 @@ export function PersistentPlayer({ onAddToPlaylist }: PersistentPlayerProps) {
   } = usePlayer();
 
   const { isFavourite, toggleFavourite } = useLibrary();
+  const { saveOnlineTrack, isTrackSavedOffline, downloadingIds, downloadProgressMap } = useOfflineMusic();
   const [drawerTab, setDrawerTab] = useState<'queue' | 'related'>('queue');
   const isInIframe = (() => {
     try {
@@ -105,6 +110,9 @@ export function PersistentPlayer({ onAddToPlaylist }: PersistentPlayerProps) {
     effectiveDuration > 0 ? Math.min(100, Math.max(0, (currentTime / effectiveDuration) * 100)) : 0;
   const effectiveVolumePct = isMuted ? 0 : Math.min(100, Math.max(0, volume));
   const fav = currentTrack ? isFavourite(currentTrack.id) : false;
+  const savedOffline = currentTrack ? isTrackSavedOffline(currentTrack.id) : false;
+  const isDownloadingOffline = currentTrack ? Boolean(downloadingIds[currentTrack.id]) : false;
+  const dlProgress = currentTrack ? downloadProgressMap[currentTrack.id] : undefined;
 
   const RepeatIcon = repeatMode === 'one' ? Repeat1 : Repeat;
 
@@ -198,6 +206,45 @@ export function PersistentPlayer({ onAddToPlaylist }: PersistentPlayerProps) {
                   <span>Radio</span>
                 </button>
 
+                <button
+                  type="button"
+                  disabled={isDownloadingOffline}
+                  onClick={() => void saveOnlineTrack(currentTrack, true)}
+                  className={`min-h-[40px] min-w-[40px] px-1.5 flex items-center justify-center gap-1 rounded-xl transition-colors ${
+                    isDownloadingOffline
+                      ? 'bg-emerald-500/15 text-emerald-300'
+                      : savedOffline
+                        ? 'text-emerald-400 hover:bg-emerald-500/10'
+                        : 'text-slate-200 hover:text-emerald-300 hover:bg-white/5'
+                  }`}
+                  aria-label={
+                    isDownloadingOffline
+                      ? `Downloading ${dlProgress?.percent ?? 0}%`
+                      : savedOffline
+                        ? 'Saved in My Music — Download File to Device'
+                        : 'Download to Device & My Music'
+                  }
+                  title={
+                    isDownloadingOffline
+                      ? `Downloading ${dlProgress?.percent ?? 0}%`
+                      : savedOffline
+                        ? 'Saved in My Music — Click to Download File to Device'
+                        : 'Download to Device & My Music'
+                  }
+                >
+                  {isDownloadingOffline ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin text-emerald-400 shrink-0" />
+                      <span className="font-mono-tabular text-[11px] font-bold">
+                        {dlProgress?.percent ?? 0}%
+                      </span>
+                    </>
+                  ) : savedOffline ? (
+                    <Check className="w-5 h-5" />
+                  ) : (
+                    <Download className="w-5 h-5" />
+                  )}
+                </button>
                 <button
                   type="button"
                   onClick={() => onAddToPlaylist(currentTrack)}

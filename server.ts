@@ -20,8 +20,11 @@ import {
   hasConfiguredGeminiKeys,
 } from './server/gemini.ts';
 import {
+  type AudioSourceProvider,
   proxyAudioStream,
+  proxyDirectAudioUrl,
   resolveBackgroundAudioStream,
+  searchMultiSourceTracks,
 } from './server/audioResolver.ts';
 import type {
   AiDiscoveryResponse,
@@ -37,6 +40,7 @@ const isProd = process.env.NODE_ENV === 'production';
 const VALID_CATEGORIES: CategoryId[] = ['trending', 'energetic', 'sad', 'discover'];
 const VALID_LANGS: IndiaLanguageFilter[] = ['all', 'hindi', 'punjabi', 'mix', 'english'];
 const YOUTUBE_VIDEO_ID_RE = /^[a-zA-Z0-9_-]{6,20}$/;
+const AUDIO_STREAM_ID_RE = /^[a-zA-Z0-9_-]{4,80}$/;
 
 function isYoutubeConfigured(): boolean {
   return hasConfiguredYoutubeKeys();
@@ -101,26 +105,59 @@ async function startServer() {
 
   app.use(express.json({ limit: '16kb' }));
 
-  // Range-capable audio stream proxy (mounted before generalApiLimiter so seeking never hits 429)
+  // Range-capable audio stream & attachment download proxy
   app.get('/api/audio/stream', async (req, res) => {
     const videoId = typeof req.query.videoId === 'string' ? req.query.videoId.trim() : '';
-    if (!YOUTUBE_VIDEO_ID_RE.test(videoId)) {
-      res.status(400).json({ error: 'INVALID_VIDEO_ID', message: 'Invalid YouTube video ID.' });
+    if (!AUDIO_STREAM_ID_RE.test(videoId)) {
+      res.status(400).json({ error: 'INVALID_VIDEO_ID', message: 'Invalid audio track ID.' });
       return;
     }
     await proxyAudioStream(req, res, videoId);
+  });
+
+  // Safe direct HTTP/HTTPS audio URL downloader proxy (for podcasts, direct MP3/M4A/WAV links)
+  app.get('/api/audio/fetch-url', async (req, res) => {
+    const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+    if (!rawUrl || rawUrl.length > 2000) {
+      res.status(400).json({ error: 'INVALID_URL', message: 'Please provide a valid audio URL.' });
+      return;
+    }
+    await proxyDirectAudioUrl(req, res, rawUrl);
   });
 
   const generalApiLimiter = createRateLimiter(60_000, 120);
   const aiApiLimiter = createRateLimiter(60_000, 20);
   app.use('/api', generalApiLimiter);
 
+  // Search other direct audio sources (JioSaavn, Audius, SoundCloud, Internet Archive)
+  app.get('/api/sources/search', async (req, res) => {
+    try {
+      const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 120) : '';
+      const rawSource = typeof req.query.source === 'string' ? req.query.source : 'all';
+      const validSources = ['all', 'jiosaavn', 'soundcloud', 'audius', 'archive'];
+      const source = (validSources.includes(rawSource) ? rawSource : 'all') as
+        | 'all'
+        | AudioSourceProvider;
+      if (!q) {
+        res.json({ tracks: [] });
+        return;
+      }
+      const tracks = await searchMultiSourceTracks(q, source);
+      res.json({ tracks });
+    } catch (err) {
+      res.status(500).json({
+        error: 'SOURCE_SEARCH_ERROR',
+        message: err instanceof Error ? err.message : 'Failed to search audio sources.',
+      });
+    }
+  });
+
   // Resolve verified native audio stream for background/screen-off mobile playback
   app.get('/api/audio/resolve', async (req, res) => {
     try {
       const videoId = typeof req.query.videoId === 'string' ? req.query.videoId.trim() : '';
-      if (!YOUTUBE_VIDEO_ID_RE.test(videoId)) {
-        res.status(400).json({ error: 'INVALID_VIDEO_ID', message: 'Invalid YouTube video ID.' });
+      if (!AUDIO_STREAM_ID_RE.test(videoId)) {
+        res.status(400).json({ error: 'INVALID_VIDEO_ID', message: 'Invalid audio track ID.' });
         return;
       }
       const title = typeof req.query.title === 'string' ? req.query.title.slice(0, 180) : '';

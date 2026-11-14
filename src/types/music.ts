@@ -80,3 +80,54 @@ export interface ConfigStatus {
   youtubeConfigured: boolean;
   geminiConfigured: boolean;
 }
+
+export interface OfflineTrack {
+  id: string;
+  title: string;
+  artist: string;
+  album?: string;
+  duration: string;
+  durationSeconds: number;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  source: 'device-folder' | 'device-file' | 'saved-online' | 'direct-url';
+  addedAt: number;
+  artworkDataUrl?: string;
+  relativePath?: string;
+  sourceVideoId?: string;
+}
+
+export interface OfflinePlaylist {
+  id: string;
+  name: string;
+  description: string;
+  trackIds: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface DownloadProgressItem {
+  trackId: string;
+  title: string;
+  artist: string;
+  percent: number;
+  loadedBytes: number;
+  totalBytes: number;
+  remainingBytes: number;
+  phase: 'resolving' | 'downloading' | 'saving' | 'done';
+}
+
+export type AudioSourceProvider = 'jiosaavn' | 'soundcloud' | 'audius' | 'archive';
+
+export interface MultiSourceTrack {
+  id: string;
+  title: string;
+  artist: string;
+  duration: string;
+  durationSeconds: number;
+  thumbnail: string;
+  thumbnailHigh: string;
+  provider: AudioSourceProvider;
+  sourceLabel: string;
+}

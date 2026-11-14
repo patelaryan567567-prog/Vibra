@@ -108,15 +108,9 @@ export function stopWebAudioKeepAlive(): void {
 export async function registerVibraServiceWorker(): Promise<ServiceWorkerRegistration | null> {
   if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return null;
   try {
-    // Unregister any old /sw.js service worker so it never conflicts with host proxy service workers
-    const regs = await navigator.serviceWorker.getRegistrations();
-    for (const reg of regs) {
-      if (reg.active?.scriptURL?.endsWith('/sw.js')) {
-        await reg.unregister();
-      }
-    }
+    const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+    return reg;
   } catch {
-    // ignore
+    return null;
   }
-  return null;
 }

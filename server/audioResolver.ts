@@ -1,13 +1,27 @@
 import type { Request, Response } from 'express';
 import { Readable } from 'node:stream';
 
+export type AudioSourceProvider = 'jiosaavn' | 'soundcloud' | 'audius' | 'archive';
+
 export interface ResolvedAudioStream {
   mode: 'proxy' | 'hls' | 'direct' | 'youtube';
-  provider?: 'jiosaavn' | 'soundcloud';
+  provider?: AudioSourceProvider;
   streamUrl?: string;
   matchedTitle?: string;
   matchedArtist?: string;
   durationSeconds?: number;
+}
+
+export interface MultiSourceTrackResult {
+  id: string;
+  title: string;
+  artist: string;
+  duration: string;
+  durationSeconds: number;
+  thumbnail: string;
+  thumbnailHigh: string;
+  provider: AudioSourceProvider;
+  sourceLabel: string;
 }
 
 interface InternalResolvedEntry {
@@ -236,7 +250,14 @@ function scoreAudioCandidate(params: {
     }
   }
 
-  const candTokens = tokenizeMeaningful(candTitle);
+  // Strip "(From \"Movie\")" or "(Original Motion Picture Soundtrack)" suffixes before token scoring
+  const cleanCandTitle = candTitle
+    .replace(/\(\s*(?:from|feat\.?|ft\.?|original\s+motion\s+picture.*?|from\s+the.*?)\s*[^)]*\)/gi, ' ')
+    .replace(/\[\s*(?:from|feat\.?|ft\.?)\s*[^\]]*\]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const candTokens = tokenizeMeaningful(cleanCandTitle || candTitle);
   const candArtistTokens = tokenizeMeaningful(candArtists);
   if (candTokens.length === 0 || params.songCoreTokens.length === 0) return -1000;
 
@@ -355,6 +376,8 @@ async function resolveViaJioSaavn(
   const parsed = parseYouTubeMetadata(title, artist);
   let bestCandidate: { encUrl: string; title: string; artists: string; duration: number; score: number } | null = null;
 
+  const collectedItems: SaavnSearchResultItem[] = [];
+
   for (const query of parsed.searchQueries) {
     try {
       const searchUrl = `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&cc=in&n=8&q=${encodeURIComponent(
@@ -366,67 +389,74 @@ async function resolveViaJioSaavn(
       });
       if (!res.ok) continue;
       const data = (await res.json()) as { results?: SaavnSearchResultItem[] };
-
-      for (const item of data.results ?? []) {
-        let encUrl = item.encrypted_media_url || item.more_info?.encrypted_media_url || '';
-        const candTitle = decodeEntities(item.song || item.title || '');
-        const candArtists = decodeEntities(
-          [item.primary_artists, item.singers, item.music].filter(Boolean).join(', ')
-        );
-        const candDuration = Number(item.duration || item.more_info?.duration || 0);
-        if (candDuration > 0 && candDuration < 65) continue;
-
-        const score = scoreAudioCandidate({
-          candTitle,
-          candArtists,
-          candDuration,
-          ytDuration,
-          rawYtTitle: title,
-          songCoreTokens: parsed.songCoreTokens,
-          artistTokens: parsed.artistTokens,
-          cleanedYtTitle: parsed.cleanedTitle,
-        });
-
-        if (score < 70) continue;
-
-        if (!encUrl && item.id) {
-          try {
-            const detRes = await fetch(
-              `https://www.jiosaavn.com/api.php?__call=song.getDetails&_format=json&_marker=0&cc=in&pids=${encodeURIComponent(
-                item.id
-              )}`,
-              { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(3500) }
-            );
-            if (detRes.ok) {
-              const det = (await detRes.json()) as {
-                songs?: SaavnSearchResultItem[];
-                [k: string]: unknown;
-              };
-              const sObj = (det.songs?.[0] ?? det[item.id]) as SaavnSearchResultItem | undefined;
-              encUrl = sObj?.more_info?.encrypted_media_url || sObj?.encrypted_media_url || '';
-            }
-          } catch {
-            // ignore detail fetch failure
-          }
-        }
-
-        if (!encUrl) continue;
-
-        if (!bestCandidate || score > bestCandidate.score) {
-          bestCandidate = {
-            encUrl,
-            title: candTitle,
-            artists: candArtists,
-            duration: candDuration,
-            score,
-          };
-        }
+      if (data.results?.length) {
+        collectedItems.push(...data.results);
       }
-
-      if (bestCandidate && bestCandidate.score >= 95) break;
+      if (collectedItems.length >= 12) break;
     } catch {
       // ignore timeout/network error on this attempt
     }
+  }
+
+  for (const allowExtendedVariants of [false, true]) {
+    for (const item of collectedItems) {
+      let encUrl = item.encrypted_media_url || item.more_info?.encrypted_media_url || '';
+      const candTitle = decodeEntities(item.song || item.title || '');
+      const candArtists = decodeEntities(
+        [item.primary_artists, item.singers, item.music].filter(Boolean).join(', ')
+      );
+      const candDuration = Number(item.duration || item.more_info?.duration || 0);
+      if (candDuration > 0 && candDuration < 65) continue;
+
+      const score = scoreAudioCandidate({
+        candTitle,
+        candArtists,
+        candDuration,
+        ytDuration,
+        rawYtTitle: title,
+        songCoreTokens: parsed.songCoreTokens,
+        artistTokens: parsed.artistTokens,
+        cleanedYtTitle: parsed.cleanedTitle,
+        allowExtendedVariants,
+      });
+
+      const threshold = allowExtendedVariants ? 60 : 66;
+      if (score < threshold) continue;
+
+      if (!encUrl && item.id) {
+        try {
+          const detRes = await fetch(
+            `https://www.jiosaavn.com/api.php?__call=song.getDetails&_format=json&_marker=0&cc=in&pids=${encodeURIComponent(
+              item.id
+            )}`,
+            { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(3500) }
+          );
+          if (detRes.ok) {
+            const det = (await detRes.json()) as {
+              songs?: SaavnSearchResultItem[];
+              [k: string]: unknown;
+            };
+            const sObj = (det.songs?.[0] ?? det[item.id]) as SaavnSearchResultItem | undefined;
+            encUrl = sObj?.more_info?.encrypted_media_url || sObj?.encrypted_media_url || '';
+          }
+        } catch {
+          // ignore detail fetch failure
+        }
+      }
+
+      if (!encUrl) continue;
+
+      if (!bestCandidate || score > bestCandidate.score) {
+        bestCandidate = {
+          encUrl,
+          title: candTitle,
+          artists: candArtists,
+          duration: candDuration,
+          score,
+        };
+      }
+    }
+    if (bestCandidate) break;
   }
 
   if (!bestCandidate) return null;
@@ -743,6 +773,212 @@ async function assembleSoundCloudFmp4Buffer(entry: InternalResolvedEntry): Promi
   return job;
 }
 
+function formatDurLabel(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '0:00';
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+interface AudiusTrackItem {
+  id?: string;
+  title?: string;
+  duration?: number;
+  is_streamable?: boolean;
+  is_stream_gated?: boolean;
+  artwork?: { '480x480'?: string; '150x150'?: string };
+  user?: { name?: string; handle?: string };
+  stream?: { url?: string };
+}
+
+async function resolveViaAudius(
+  videoId: string,
+  title: string,
+  artist: string,
+  ytDuration: number
+): Promise<InternalResolvedEntry | null> {
+  const parsed = parseYouTubeMetadata(title, artist);
+  const collected: AudiusTrackItem[] = [];
+
+  for (const query of parsed.searchQueries.slice(0, 2)) {
+    try {
+      const searchUrl = `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(
+        query
+      )}&app_name=VIBRA`;
+      const res = await fetch(searchUrl, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(4000),
+      });
+      if (!res.ok) continue;
+      const json = (await res.json()) as { data?: AudiusTrackItem[] };
+      if (Array.isArray(json.data)) {
+        collected.push(...json.data.slice(0, 10));
+      }
+      if (collected.length >= 10) break;
+    } catch {
+      // ignore Audius network failure
+    }
+  }
+
+  let best: { item: AudiusTrackItem; streamUrl: string; score: number } | null = null;
+  for (const item of collected) {
+    if (!item.id || item.is_streamable === false || item.is_stream_gated) continue;
+    const candDuration = Number(item.duration || 0);
+    if (candDuration > 0 && candDuration < 65) continue;
+
+    const candTitle = decodeEntities(item.title || '');
+    const candArtist = decodeEntities(item.user?.name || item.user?.handle || '');
+    const score = scoreAudioCandidate({
+      candTitle,
+      candArtists: candArtist,
+      candDuration,
+      ytDuration,
+      rawYtTitle: title,
+      songCoreTokens: parsed.songCoreTokens,
+      artistTokens: parsed.artistTokens,
+      cleanedYtTitle: parsed.cleanedTitle,
+      allowExtendedVariants: true,
+    });
+
+    if (score < 64) continue;
+    const streamUrl =
+      item.stream?.url || `https://api.audius.co/v1/tracks/${encodeURIComponent(item.id)}/stream?app_name=VIBRA`;
+
+    if (!best || score > best.score) {
+      best = { item, streamUrl, score };
+    }
+  }
+
+  if (!best) return null;
+
+  return {
+    result: {
+      mode: 'proxy',
+      provider: 'audius',
+      streamUrl: `/api/audio/stream?videoId=${encodeURIComponent(videoId)}`,
+      matchedTitle: best.item.title,
+      matchedArtist: best.item.user?.name || best.item.user?.handle,
+      durationSeconds: best.item.duration || undefined,
+    },
+    upstreamKind: 'direct-url',
+    upstreamUrl: best.streamUrl,
+    upstreamHeaders: { 'User-Agent': 'Mozilla/5.0' },
+    expiresAt: Date.now() + RESOLVE_TTL_MS,
+  };
+}
+
+function parseArchiveLengthSec(raw: string | number | undefined): number {
+  if (typeof raw === 'number' && Number.isFinite(raw)) return Math.round(raw);
+  if (typeof raw !== 'string') return 0;
+  if (raw.includes(':')) {
+    const parts = raw.split(':').map((n) => Number(n));
+    if (parts.length === 2 && parts.every(Number.isFinite)) return parts[0] * 60 + Math.round(parts[1]);
+    if (parts.length === 3 && parts.every(Number.isFinite))
+      return parts[0] * 3600 + parts[1] * 60 + Math.round(parts[2]);
+  }
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.round(n) : 0;
+}
+
+interface ArchiveDoc {
+  identifier?: string;
+  title?: string;
+  creator?: string | string[];
+}
+
+interface ArchiveFileEntry {
+  name?: string;
+  format?: string;
+  length?: string | number;
+  size?: string | number;
+}
+
+async function resolveArchiveAudioFile(identifier: string): Promise<{ url: string; duration: number } | null> {
+  try {
+    const metaRes = await fetch(`https://archive.org/metadata/${encodeURIComponent(identifier)}/files`, {
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!metaRes.ok) return null;
+    const meta = (await metaRes.json()) as { result?: ArchiveFileEntry[] };
+    const files = meta.result ?? [];
+    const candidate =
+      files.find((f) => /\.mp3$/i.test(f.name || '') && Number(f.size || 0) > 100_000) ||
+      files.find((f) => /\.(m4a|ogg)$/i.test(f.name || '') && Number(f.size || 0) > 100_000);
+    if (!candidate?.name) return null;
+    const encodedName = candidate.name
+      .split('/')
+      .map((seg) => encodeURIComponent(seg))
+      .join('/');
+    const dur = parseArchiveLengthSec(candidate.length);
+    if (dur > 0 && dur < 65) return null;
+    return {
+      url: `https://archive.org/download/${encodeURIComponent(identifier)}/${encodedName}`,
+      duration: dur,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function resolveViaArchiveOrg(
+  videoId: string,
+  title: string,
+  artist: string,
+  ytDuration: number
+): Promise<InternalResolvedEntry | null> {
+  const parsed = parseYouTubeMetadata(title, artist);
+  const mainQuery = parsed.searchQueries[0];
+  if (!mainQuery) return null;
+
+  try {
+    const searchUrl = `https://archive.org/advancedsearch.php?q=${encodeURIComponent(
+      `mediatype:audio AND (${mainQuery})`
+    )}&fl[]=identifier,title,creator&rows=5&output=json`;
+    const res = await fetch(searchUrl, { signal: AbortSignal.timeout(4000) });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { response?: { docs?: ArchiveDoc[] } };
+    const docs = data.response?.docs ?? [];
+
+    for (const doc of docs.slice(0, 3)) {
+      if (!doc.identifier || !doc.title) continue;
+      const creatorStr = Array.isArray(doc.creator) ? doc.creator.join(', ') : doc.creator || '';
+      const preScore = scoreAudioCandidate({
+        candTitle: doc.title,
+        candArtists: creatorStr,
+        candDuration: 0,
+        ytDuration,
+        rawYtTitle: title,
+        songCoreTokens: parsed.songCoreTokens,
+        artistTokens: parsed.artistTokens,
+        cleanedYtTitle: parsed.cleanedTitle,
+        allowExtendedVariants: true,
+      });
+      if (preScore < 68) continue;
+
+      const fileInfo = await resolveArchiveAudioFile(doc.identifier);
+      if (!fileInfo) continue;
+
+      return {
+        result: {
+          mode: 'proxy',
+          provider: 'archive',
+          streamUrl: `/api/audio/stream?videoId=${encodeURIComponent(videoId)}`,
+          matchedTitle: doc.title,
+          matchedArtist: creatorStr || 'Internet Archive',
+          durationSeconds: fileInfo.duration || undefined,
+        },
+        upstreamKind: 'direct-url',
+        upstreamUrl: fileInfo.url,
+        upstreamHeaders: { 'User-Agent': 'Mozilla/5.0' },
+        expiresAt: Date.now() + RESOLVE_TTL_MS,
+      };
+    }
+  } catch {
+    // ignore Archive.org error
+  }
+  return null;
+}
+
 export async function resolveBackgroundAudioStream(
   videoId: string,
   title: string,
@@ -761,25 +997,38 @@ export async function resolveBackgroundAudioStream(
   }
 
   const job = (async (): Promise<InternalResolvedEntry> => {
-    // 1. Prefer high-bitrate 320kbps MP4/AAC via JioSaavn proxy (native <audio src> + HTTP 206 Range seeking)
+    // 1. JioSaavn 320/160kbps MP4/AAC
     const saavnEntry = await resolveViaJioSaavn(videoId, title, artist, durationSeconds);
     if (saavnEntry) {
       resolvedCache.set(videoId, saavnEntry);
       return saavnEntry;
     }
 
-    // 2. Fallback to SoundCloud verified full-length fMP4/MP3 stream (also proxied as native audio/mp4 for Android background playback)
+    // 2. SoundCloud verified full-length progressive MP3 / fMP4
     const scEntry = await resolveViaSoundCloud(videoId, title, artist, durationSeconds);
     if (scEntry) {
       resolvedCache.set(videoId, scEntry);
-      // Kick off background fMP4 buffer assembly immediately so /api/audio/stream is instant
       if (scEntry.upstreamKind === 'soundcloud-hls-fmp4') {
         void assembleSoundCloudFmp4Buffer(scEntry);
       }
       return scEntry;
     }
 
-    // 3. No verified audio match -> client falls back to official YouTube IFrame
+    // 3. Audius decentralized high-bitrate MP3 catalog
+    const audiusEntry = await resolveViaAudius(videoId, title, artist, durationSeconds);
+    if (audiusEntry) {
+      resolvedCache.set(videoId, audiusEntry);
+      return audiusEntry;
+    }
+
+    // 4. Internet Archive public audio catalog
+    const archiveEntry = await resolveViaArchiveOrg(videoId, title, artist, durationSeconds);
+    if (archiveEntry) {
+      resolvedCache.set(videoId, archiveEntry);
+      return archiveEntry;
+    }
+
+    // 5. No verified audio match -> client falls back to official YouTube IFrame
     const ytFallback: InternalResolvedEntry = {
       result: { mode: 'youtube' },
       expiresAt: Date.now() + NEGATIVE_TTL_MS,
@@ -792,8 +1041,7 @@ export async function resolveBackgroundAudioStream(
 
   inFlightResolves.set(videoId, job);
 
-  // Evict oldest entries & free RAM buffers if cache grows
-  if (resolvedCache.size > 150) {
+  if (resolvedCache.size > 200) {
     const oldest = resolvedCache.keys().next().value;
     if (oldest !== undefined) resolvedCache.delete(oldest);
   }
@@ -819,6 +1067,13 @@ export async function proxyAudioStream(req: Request, res: Response, videoId: str
     return;
   }
 
+  const wantsDownload = req.query.download === '1' || req.query.download === 'true';
+  const rawFileBase =
+    typeof req.query.filename === 'string' && req.query.filename.trim()
+      ? req.query.filename.trim()
+      : `${entry.result.matchedTitle || 'vibra-track'}`;
+  const cleanFileBase = rawFileBase.replace(/[^\w\s.-]/g, '').trim().slice(0, 80) || 'vibra-track';
+
   // Case A: SoundCloud fMP4 assembled into a native byte-range-capable audio/mp4 buffer
   if (entry.upstreamKind === 'soundcloud-hls-fmp4') {
     const buf = await assembleSoundCloudFmp4Buffer(entry);
@@ -831,6 +1086,10 @@ export async function proxyAudioStream(req: Request, res: Response, videoId: str
     res.setHeader('Content-Type', 'audio/mp4');
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'private, max-age=900');
+    if (wantsDownload) {
+      const dlName = cleanFileBase.endsWith('.m4a') ? cleanFileBase : `${cleanFileBase}.m4a`;
+      res.setHeader('Content-Disposition', `attachment; filename="${dlName}"`);
+    }
 
     const rangeHeader = req.headers.range;
     if (typeof rangeHeader === 'string' && rangeHeader.startsWith('bytes=')) {
@@ -855,7 +1114,7 @@ export async function proxyAudioStream(req: Request, res: Response, videoId: str
     return;
   }
 
-  // Case B: Direct upstream byte-range proxy (JioSaavn 320kbps MP4 or SoundCloud progressive MP3)
+  // Case B: Direct upstream byte-range proxy (JioSaavn 320kbps MP4, SoundCloud progressive MP3, Audius MP3, Archive.org MP3)
   const headers: Record<string, string> = {
     ...(entry.upstreamHeaders ?? {}),
   };
@@ -881,10 +1140,19 @@ export async function proxyAudioStream(req: Request, res: Response, videoId: str
       return;
     }
 
+    const ct = upstreamRes.headers.get('content-type') || 'audio/mp4';
     res.status(upstreamRes.status);
-    res.setHeader('Content-Type', upstreamRes.headers.get('content-type') || 'audio/mp4');
+    res.setHeader('Content-Type', ct);
     res.setHeader('Accept-Ranges', upstreamRes.headers.get('accept-ranges') || 'bytes');
     res.setHeader('Cache-Control', 'private, max-age=900');
+
+    if (wantsDownload) {
+      const ext = ct.includes('mpeg') ? '.mp3' : ct.includes('ogg') ? '.ogg' : '.m4a';
+      const dlName = /\.(mp3|m4a|ogg|wav|flac)$/i.test(cleanFileBase)
+        ? cleanFileBase
+        : `${cleanFileBase}${ext}`;
+      res.setHeader('Content-Disposition', `attachment; filename="${dlName}"`);
+    }
 
     const contentLength = upstreamRes.headers.get('content-length');
     if (contentLength) res.setHeader('Content-Length', contentLength);
@@ -908,6 +1176,428 @@ export async function proxyAudioStream(req: Request, res: Response, videoId: str
       res.status(502).json({
         error: 'AUDIO_PROXY_ERROR',
         message: err instanceof Error ? err.message : 'Unable to stream audio.',
+      });
+    }
+  }
+}
+
+export async function searchMultiSourceTracks(
+  query: string,
+  source: 'all' | AudioSourceProvider = 'all'
+): Promise<MultiSourceTrackResult[]> {
+  const cleanQ = query.trim();
+  if (!cleanQ) return [];
+
+  const want = (p: AudioSourceProvider) => source === 'all' || source === p;
+
+  const searchSaavn = async (): Promise<MultiSourceTrackResult[]> => {
+    if (!want('jiosaavn')) return [];
+    try {
+      const res = await fetch(
+        `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&cc=in&n=8&q=${encodeURIComponent(
+          cleanQ
+        )}`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(4500) }
+      );
+      if (!res.ok) return [];
+      const data = (await res.json()) as {
+        results?: Array<SaavnSearchResultItem & { image?: string }>;
+      };
+      const items = data.results ?? [];
+      const mapped: MultiSourceTrackResult[] = [];
+
+      for (const item of items.slice(0, 6)) {
+        const title = decodeEntities(item.song || item.title || '');
+        const artist = decodeEntities(
+          [item.primary_artists, item.singers, item.music].filter(Boolean).join(', ') || 'JioSaavn'
+        );
+        const dur = Number(item.duration || item.more_info?.duration || 0);
+        let encUrl = item.encrypted_media_url || item.more_info?.encrypted_media_url || '';
+        if (!encUrl && item.id) {
+          try {
+            const detRes = await fetch(
+              `https://www.jiosaavn.com/api.php?__call=song.getDetails&_format=json&_marker=0&cc=in&pids=${encodeURIComponent(
+                item.id
+              )}`,
+              { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(3000) }
+            );
+            if (detRes.ok) {
+              const det = (await detRes.json()) as { songs?: SaavnSearchResultItem[]; [k: string]: unknown };
+              const sObj = (det.songs?.[0] ?? det[item.id]) as SaavnSearchResultItem | undefined;
+              encUrl = sObj?.more_info?.encrypted_media_url || sObj?.encrypted_media_url || '';
+            }
+          } catch {
+            // ignore
+          }
+        }
+        if (!encUrl || !title) continue;
+
+        const authRes = await fetch(
+          `https://www.jiosaavn.com/api.php?__call=song.generateAuthToken&url=${encodeURIComponent(
+            encUrl
+          )}&bitrate=160&api_version=4&_format=json&ctx=web6dot0&_marker=0`,
+          { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(3500) }
+        ).catch(() => null);
+        if (!authRes || !authRes.ok) continue;
+        const authJson = (await authRes.json()) as { auth_url?: string };
+        if (!authJson.auth_url) continue;
+
+        const cleanId = (item.id || Math.random().toString(36).slice(2, 10)).replace(/[^a-zA-Z0-9_-]/g, '');
+        const trackId = `src_js_${cleanId}`;
+        const thumb = (item.image || '').replace('150x150', '500x500').replace('http://', 'https://');
+
+        resolvedCache.set(trackId, {
+          result: {
+            mode: 'proxy',
+            provider: 'jiosaavn',
+            streamUrl: `/api/audio/stream?videoId=${encodeURIComponent(trackId)}`,
+            matchedTitle: title,
+            matchedArtist: artist,
+            durationSeconds: dur || undefined,
+          },
+          upstreamKind: 'direct-url',
+          upstreamUrl: authJson.auth_url,
+          upstreamHeaders: {
+            Referer: 'https://www.jiosaavn.com/',
+            Origin: 'https://www.jiosaavn.com',
+            'User-Agent': 'Mozilla/5.0',
+          },
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        });
+
+        mapped.push({
+          id: trackId,
+          title,
+          artist,
+          duration: formatDurLabel(dur),
+          durationSeconds: dur,
+          thumbnail: thumb,
+          thumbnailHigh: thumb,
+          provider: 'jiosaavn',
+          sourceLabel: 'JioSaavn 320kbps',
+        });
+      }
+      return mapped;
+    } catch {
+      return [];
+    }
+  };
+
+  const searchAudius = async (): Promise<MultiSourceTrackResult[]> => {
+    if (!want('audius')) return [];
+    try {
+      const res = await fetch(
+        `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(cleanQ)}&app_name=VIBRA`,
+        { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(4500) }
+      );
+      if (!res.ok) return [];
+      const json = (await res.json()) as { data?: AudiusTrackItem[] };
+      const items = (json.data ?? []).filter(
+        (t) => t.id && t.is_streamable !== false && !t.is_stream_gated
+      );
+
+      return items.slice(0, 8).map((item) => {
+        const cleanId = String(item.id).replace(/[^a-zA-Z0-9_-]/g, '');
+        const trackId = `src_au_${cleanId}`;
+        const title = decodeEntities(item.title || 'Audius Track');
+        const artist = decodeEntities(item.user?.name || item.user?.handle || 'Audius Artist');
+        const dur = Number(item.duration || 0);
+        const streamUrl =
+          item.stream?.url ||
+          `https://api.audius.co/v1/tracks/${encodeURIComponent(String(item.id))}/stream?app_name=VIBRA`;
+        const thumb = item.artwork?.['480x480'] || item.artwork?.['150x150'] || '';
+
+        resolvedCache.set(trackId, {
+          result: {
+            mode: 'proxy',
+            provider: 'audius',
+            streamUrl: `/api/audio/stream?videoId=${encodeURIComponent(trackId)}`,
+            matchedTitle: title,
+            matchedArtist: artist,
+            durationSeconds: dur || undefined,
+          },
+          upstreamKind: 'direct-url',
+          upstreamUrl: streamUrl,
+          upstreamHeaders: { 'User-Agent': 'Mozilla/5.0' },
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        });
+
+        return {
+          id: trackId,
+          title,
+          artist,
+          duration: formatDurLabel(dur),
+          durationSeconds: dur,
+          thumbnail: thumb,
+          thumbnailHigh: thumb,
+          provider: 'audius',
+          sourceLabel: 'Audius MP3',
+        };
+      });
+    } catch {
+      return [];
+    }
+  };
+
+  const searchSoundCloud = async (): Promise<MultiSourceTrackResult[]> => {
+    if (!want('soundcloud')) return [];
+    try {
+      const clientId = await getSoundCloudClientId();
+      if (!clientId) return [];
+      const res = await fetch(
+        `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(cleanQ)}&client_id=${encodeURIComponent(
+          clientId
+        )}&limit=8`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(4500) }
+      );
+      if (!res.ok) return [];
+      const json = (await res.json()) as {
+        collection?: Array<SoundCloudTrackItem & { id?: number; artwork_url?: string }>;
+      };
+      const items = (json.collection ?? []).filter(
+        (t) => t.id && t.streamable && t.policy !== 'SNIP' && t.policy !== 'BLOCK'
+      );
+
+      const mapped: MultiSourceTrackResult[] = [];
+      for (const item of items.slice(0, 6)) {
+        const transcodings = item.media?.transcodings ?? [];
+        const chosen =
+          transcodings.find((t) => t.format?.protocol === 'progressive' && t.url) ||
+          transcodings.find((t) => t.format?.protocol === 'hls' && t.format?.mime_type?.includes('mp4') && t.url) ||
+          transcodings.find((t) => t.format?.protocol === 'hls' && t.url);
+        if (!chosen?.url) continue;
+
+        const signRes = await fetch(`${chosen.url}?client_id=${encodeURIComponent(clientId)}`, {
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+          signal: AbortSignal.timeout(3500),
+        }).catch(() => null);
+        if (!signRes || !signRes.ok) continue;
+        const signJson = (await signRes.json()) as { url?: string };
+        if (!signJson.url) continue;
+
+        const trackId = `src_sc_${item.id}`;
+        const title = decodeEntities(item.title || 'SoundCloud Track');
+        const artist = decodeEntities(item.user?.username || 'SoundCloud');
+        const dur = item.duration ? Math.round(item.duration / 1000) : 0;
+        const thumb = (item.artwork_url || '').replace('-large', '-t500x500');
+
+        resolvedCache.set(trackId, {
+          result: {
+            mode: 'proxy',
+            provider: 'soundcloud',
+            streamUrl: `/api/audio/stream?videoId=${encodeURIComponent(trackId)}`,
+            matchedTitle: title,
+            matchedArtist: artist,
+            durationSeconds: dur || undefined,
+          },
+          upstreamKind: chosen.format?.protocol === 'progressive' ? 'direct-url' : 'soundcloud-hls-fmp4',
+          upstreamUrl: signJson.url,
+          scTranscodingUrl: chosen.url,
+          upstreamHeaders: { 'User-Agent': 'Mozilla/5.0' },
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        });
+
+        mapped.push({
+          id: trackId,
+          title,
+          artist,
+          duration: formatDurLabel(dur),
+          durationSeconds: dur,
+          thumbnail: thumb,
+          thumbnailHigh: thumb,
+          provider: 'soundcloud',
+          sourceLabel: 'SoundCloud',
+        });
+      }
+      return mapped;
+    } catch {
+      return [];
+    }
+  };
+
+  const searchArchive = async (): Promise<MultiSourceTrackResult[]> => {
+    if (!want('archive')) return [];
+    try {
+      const res = await fetch(
+        `https://archive.org/advancedsearch.php?q=${encodeURIComponent(
+          `mediatype:audio AND (${cleanQ})`
+        )}&fl[]=identifier,title,creator&rows=5&output=json`,
+        { signal: AbortSignal.timeout(4500) }
+      );
+      if (!res.ok) return [];
+      const json = (await res.json()) as { response?: { docs?: ArchiveDoc[] } };
+      const docs = json.response?.docs ?? [];
+      const mapped: MultiSourceTrackResult[] = [];
+
+      for (const doc of docs.slice(0, 4)) {
+        if (!doc.identifier || !doc.title) continue;
+        const fileInfo = await resolveArchiveAudioFile(doc.identifier);
+        if (!fileInfo) continue;
+
+        const safeId = doc.identifier.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48);
+        const trackId = `src_ar_${safeId}`;
+        const artist = Array.isArray(doc.creator)
+          ? doc.creator.join(', ')
+          : doc.creator || 'Internet Archive';
+        const thumb = `https://archive.org/services/img/${encodeURIComponent(doc.identifier)}`;
+
+        resolvedCache.set(trackId, {
+          result: {
+            mode: 'proxy',
+            provider: 'archive',
+            streamUrl: `/api/audio/stream?videoId=${encodeURIComponent(trackId)}`,
+            matchedTitle: doc.title,
+            matchedArtist: artist,
+            durationSeconds: fileInfo.duration || undefined,
+          },
+          upstreamKind: 'direct-url',
+          upstreamUrl: fileInfo.url,
+          upstreamHeaders: { 'User-Agent': 'Mozilla/5.0' },
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        });
+
+        mapped.push({
+          id: trackId,
+          title: doc.title,
+          artist,
+          duration: formatDurLabel(fileInfo.duration),
+          durationSeconds: fileInfo.duration,
+          thumbnail: thumb,
+          thumbnailHigh: thumb,
+          provider: 'archive',
+          sourceLabel: 'Internet Archive',
+        });
+      }
+      return mapped;
+    } catch {
+      return [];
+    }
+  };
+
+  const [saavn, audius, sc, archive] = await Promise.all([
+    searchSaavn(),
+    searchAudius(),
+    searchSoundCloud(),
+    searchArchive(),
+  ]);
+
+  // Interleave results across sources so all providers show up clearly in 'all' mode
+  const buckets = [saavn, audius, sc, archive].filter((b) => b.length > 0);
+  const combined: MultiSourceTrackResult[] = [];
+  const maxLen = Math.max(0, ...buckets.map((b) => b.length));
+  for (let i = 0; i < maxLen; i++) {
+    for (const bucket of buckets) {
+      if (bucket[i]) combined.push(bucket[i]);
+    }
+  }
+  return combined.slice(0, 24);
+}
+
+function isDisallowedHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  if (
+    !lower ||
+    lower === 'localhost' ||
+    lower.endsWith('.local') ||
+    lower.endsWith('.internal') ||
+    lower === '::1' ||
+    lower === '[::1]'
+  ) {
+    return true;
+  }
+  if (/^127\./.test(lower) || /^10\./.test(lower) || /^0\./.test(lower) || /^192\.168\./.test(lower)) {
+    return true;
+  }
+  if (/^169\.254\./.test(lower)) return true;
+  const m172 = lower.match(/^172\.(\d+)\./);
+  if (m172 && Number(m172[1]) >= 16 && Number(m172[1]) <= 31) return true;
+  return false;
+}
+
+export async function proxyDirectAudioUrl(req: Request, res: Response, rawUrl: string): Promise<void> {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(rawUrl);
+  } catch {
+    res.status(400).json({ error: 'INVALID_URL', message: 'Please enter a valid HTTP or HTTPS audio link.' });
+    return;
+  }
+
+  if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+    res.status(400).json({ error: 'UNSUPPORTED_PROTOCOL', message: 'Only HTTP/HTTPS audio URLs are supported.' });
+    return;
+  }
+  if (isDisallowedHost(parsedUrl.hostname)) {
+    res.status(403).json({ error: 'BLOCKED_HOST', message: 'Private or local network URLs are not allowed.' });
+    return;
+  }
+
+  const controller = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) controller.abort();
+  });
+
+  try {
+    const upstream = await fetch(parsedUrl.toString(), {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      redirect: 'follow',
+      signal: controller.signal,
+    });
+
+    if (upstream.url) {
+      const finalHost = new URL(upstream.url).hostname;
+      if (isDisallowedHost(finalHost)) {
+        res.status(403).json({ error: 'BLOCKED_HOST', message: 'Redirect to private network blocked.' });
+        return;
+      }
+    }
+
+    if (!upstream.ok) {
+      res.status(upstream.status).json({
+        error: 'UPSTREAM_ERROR',
+        message: `Audio URL returned HTTP ${upstream.status}.`,
+      });
+      return;
+    }
+
+    const ct = (upstream.headers.get('content-type') || '').toLowerCase();
+    const looksLikeAudioUrl = /\.(mp3|m4a|aac|wav|ogg|opus|flac|webm)(\?|$)/i.test(parsedUrl.pathname);
+    if (!ct.startsWith('audio/') && !ct.includes('ogg') && !(looksLikeAudioUrl && ct.includes('octet-stream'))) {
+      res.status(415).json({
+        error: 'NOT_AUDIO_URL',
+        message: 'That link does not point to a playable audio file (.mp3, .m4a, .wav, .ogg, .flac).',
+      });
+      return;
+    }
+
+    const clRaw = upstream.headers.get('content-length');
+    const clNum = clRaw ? Number(clRaw) : 0;
+    if (clNum > 120 * 1024 * 1024) {
+      res.status(413).json({ error: 'FILE_TOO_LARGE', message: 'Audio file exceeds 120 MB limit.' });
+      return;
+    }
+
+    res.status(200);
+    res.setHeader('Content-Type', ct.startsWith('audio/') ? ct : 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-store');
+    if (clRaw) res.setHeader('Content-Length', clRaw);
+
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+
+    const nodeStream = Readable.fromWeb(upstream.body as unknown as import('node:stream/web').ReadableStream);
+    nodeStream.on('error', () => {
+      if (!res.writableEnded) res.end();
+    });
+    nodeStream.pipe(res);
+  } catch (err) {
+    if (controller.signal.aborted) return;
+    if (!res.headersSent) {
+      res.status(502).json({
+        error: 'FETCH_AUDIO_FAILED',
+        message: err instanceof Error ? err.message : 'Unable to download from that URL.',
       });
     }
   }

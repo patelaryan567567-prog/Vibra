@@ -148,7 +148,7 @@ async function fetchTrackAudioBlobUrl(track: Track): Promise<string | null> {
         : new Blob([blob], { type: 'audio/mp4' });
       const blobUrl = URL.createObjectURL(typedBlob);
 
-      if (audioBlobCache.size >= 8) {
+      if (audioBlobCache.size >= 20) {
         const oldestKey = audioBlobCache.keys().next().value;
         if (oldestKey !== undefined && oldestKey !== track.id) {
           const oldUrl = audioBlobCache.get(oldestKey);
@@ -225,6 +225,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const loadedYtVideoIdRef = useRef<string | null>(null);
   const resolveAbortRef = useRef<AbortController | null>(null);
   const consecutiveErrorsRef = useRef(0);
+  const bgSkipStreakRef = useRef(0);
   const radioFetchingRef = useRef(false);
   const shuffleHistoryRef = useRef<Set<string>>(new Set());
   const shouldPlayRef = useRef(false);
@@ -234,6 +235,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const endedHandledForLoadRef = useRef<string | null>(null);
   const relatedFetchedForIdRef = useRef<string | null>(null);
   const lastMediaPosSyncRef = useRef<number>(0);
+  const isYieldedToOfflineRef = useRef(false);
+  const [isYieldedToOffline, setIsYieldedToOffline] = useState(false);
 
   const queueRef = useRef(queue);
   const currentIndexRef = useRef(currentIndex);
@@ -432,7 +435,36 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      // Not yet in RAM: start in-memory silent loop synchronously in 0ms to hold Android AudioTrack & gesture unlock
+      // Not yet in RAM:
+      // If screen is off or app is in background, stream directly via native HTTP 206 <audio src="/api/audio/stream?...">
+      // synchronously inside the ended/transition callback so OS media daemon keeps continuous playback across 10-20+ tracks!
+      if (document.hidden && isBackgroundPlayRef.current) {
+        isSilentWarmupRef.current = false;
+        audio.loop = false;
+        audio.muted = isMutedRef.current;
+        audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
+        const directUrl = buildDirectAudioStreamUrl(track);
+        if (audio.src !== directUrl) {
+          audio.src = directUrl;
+        }
+        setIsBuffering(true);
+        if (shouldPlayRef.current && !userPausedRef.current) {
+          const directPlay = audio.play();
+          if (directPlay) {
+            void directPlay
+              .then(() => {
+                audioUnlockedRef.current = true;
+                if (pendingSeekSecRef.current > 0.5) {
+                  applyPendingAudioSeek(audio);
+                }
+              })
+              .catch(() => {});
+          }
+        }
+        return;
+      }
+
+      // Foreground tap: start in-memory silent loop synchronously in 0ms to hold Android AudioTrack & gesture unlock
       isSilentWarmupRef.current = true;
       const silentUrl = getSilentLoopBlobUrl();
       audio.loop = true;
@@ -464,6 +496,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         if (!blobUrl) {
           isSilentWarmupRef.current = false;
           stopNativeAudio();
+          if (document.hidden && isBackgroundPlayRef.current && queueRef.current.length > 1 && bgSkipStreakRef.current < 8) {
+            bgSkipStreakRef.current += 1;
+            const q = queueRef.current;
+            const nextIdx = (currentIndexRef.current + 1) % q.length;
+            setCurrentIndex(nextIdx);
+            return;
+          }
           startYouTubeTrack(track.id, effectiveResume);
           return;
         }
@@ -547,7 +586,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         }
 
         const existingIds = new Set(queueRef.current.map((t) => t.id));
-        const uniqueAdditions = freshTracks.filter((t) => !existingIds.has(t.id)).slice(0, 8);
+        const uniqueAdditions = freshTracks.filter((t) => !existingIds.has(t.id)).slice(0, 14);
 
         if (uniqueAdditions.length > 0) {
           let insertStartIndex = queueRef.current.length;
@@ -557,6 +596,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             insertStartIndex = prev.length;
             return [...prev, ...cleanNew];
           });
+          // Prewarm the newly added upcoming tracks immediately
+          for (const added of uniqueAdditions.slice(0, 4)) {
+            void fetchTrackAudioBlobUrl(added);
+          }
           if (advanceToNewTrack) {
             const firstNewTrack = uniqueAdditions[0];
             if (firstNewTrack && !isVideoModeRef.current) {
@@ -914,18 +957,22 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       void acquirePlaybackWakeLock();
     }
 
-    // Pre-fetch the current track (even if in video mode) + next 2 upcoming tracks into RAM Blob cache
+    // Pre-fetch the current track (even if in video mode) + next 5 upcoming tracks sequentially into RAM Blob cache
+    // so 10-20+ consecutive songs transition instantaneously even when screen is off
     void fetchTrackAudioBlobUrl(currentTrack);
     const prewarmTimer = window.setTimeout(() => {
-      const q = queueRef.current;
-      const idx = currentIndexRef.current;
-      for (const offset of [1, 2]) {
-        const upcoming = q[idx + offset];
-        if (upcoming && upcoming.id !== currentTrack.id) {
-          void fetchTrackAudioBlobUrl(upcoming);
+      void (async () => {
+        const q = queueRef.current;
+        const idx = currentIndexRef.current;
+        for (const offset of [1, 2, 3, 4, 5]) {
+          if (controller.signal.aborted) break;
+          const upcoming = q[idx + offset];
+          if (upcoming && upcoming.id !== currentTrack.id) {
+            await fetchTrackAudioBlobUrl(upcoming);
+          }
         }
-      }
-    }, 900);
+      })();
+    }, 350);
 
     if (isVideoModeRef.current) {
       stopNativeAudio();
@@ -979,8 +1026,9 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       setRelatedTracks([]);
     }
 
+    const remainingCount = queue.length - 1 - currentIndex;
     const needsRelatedNow =
-      isExpanded || (isRadioMode && currentIndex >= Math.max(0, queue.length - 1));
+      isExpanded || (isRadioMode && remainingCount < 10);
     if (!needsRelatedNow || relatedFetchedForIdRef.current === currentTrack.id) {
       return;
     }
@@ -1008,7 +1056,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             setIsLoadingRelated(false);
           }
         });
-    }, 900);
+    }, 600);
 
     return () => {
       window.clearTimeout(timer);
@@ -1016,12 +1064,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     };
   }, [currentTrack?.id, isExpanded, isRadioMode, currentIndex, queue.length]);
 
-  // Proactively pre-fill Infinite Radio before reaching the very final queued track (keeps background transitions seamless)
+  // Proactively pre-fill Infinite Radio to keep at least 12-15 upcoming songs ready so background playback never runs dry
   useEffect(() => {
     if (!isRadioMode || !currentTrack) return;
-    if (currentIndex >= 0 && currentIndex >= queue.length - 2 && relatedTracks.length > 0 && !radioFetchingRef.current) {
+    const remainingCount = queue.length - 1 - currentIndex;
+    if (currentIndex >= 0 && remainingCount < 10 && relatedTracks.length > 0 && !radioFetchingRef.current) {
       const existing = new Set(queue.map((t) => t.id));
-      const candidates = relatedTracks.filter((t) => !existing.has(t.id)).slice(0, 6);
+      const candidates = relatedTracks.filter((t) => !existing.has(t.id)).slice(0, 12);
       if (candidates.length > 0) {
         setQueue((prev) => {
           const seen = new Set(prev.map((t) => t.id));
@@ -1066,10 +1115,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           shouldPlayRef.current &&
           !userPausedRef.current
         ) {
-          // If the track's audio Blob is cached in RAM (e.g. user was in Video mode), hand off immediately to native <audio> so background play continues!
+          // Hand off immediately from Video (YouTube IFrame) to native <audio> whenever app enters background or screen locks!
           const curTrack = queueRef.current[currentIndexRef.current];
-          if (curTrack && audioBlobCache.has(curTrack.id)) {
-            const resumeSec = ytPlayerRef.current?.getCurrentTime() ?? 0;
+          if (curTrack) {
+            const resumeSec = ytPlayerRef.current?.getCurrentTime() ?? currentTimeRef.current ?? 0;
             isVideoModeRef.current = false;
             setIsVideoMode(false);
             beginSynchronousNativeAudio(curTrack, resumeSec);
@@ -1223,7 +1272,11 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
   const playTrack = useCallback(
     (track: Track, newQueue?: Track[], openVideo?: boolean) => {
+      window.dispatchEvent(new CustomEvent('vibra:pause-offline-player'));
+      isYieldedToOfflineRef.current = false;
+      setIsYieldedToOffline(false);
       consecutiveErrorsRef.current = 0;
+      bgSkipStreakRef.current = 0;
       shouldPlayRef.current = true;
       userPausedRef.current = false;
       bgResumeAttemptsRef.current = 0;
@@ -1273,7 +1326,11 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
   const startTrackRadio = useCallback(
     (track: Track) => {
+      window.dispatchEvent(new CustomEvent('vibra:pause-offline-player'));
+      isYieldedToOfflineRef.current = false;
+      setIsYieldedToOffline(false);
       consecutiveErrorsRef.current = 0;
+      bgSkipStreakRef.current = 0;
       shouldPlayRef.current = true;
       userPausedRef.current = false;
       bgResumeAttemptsRef.current = 0;
@@ -1445,6 +1502,9 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         void releasePlaybackWakeLock();
         audio.pause();
       } else {
+        window.dispatchEvent(new CustomEvent('vibra:pause-offline-player'));
+        isYieldedToOfflineRef.current = false;
+        setIsYieldedToOffline(false);
         userPausedRef.current = false;
         shouldPlayRef.current = true;
         bgResumeAttemptsRef.current = 0;
@@ -1461,6 +1521,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       }
       return;
     }
+
+    window.dispatchEvent(new CustomEvent('vibra:pause-offline-player'));
+    isYieldedToOfflineRef.current = false;
+    setIsYieldedToOffline(false);
 
     unlockAudioFromGesture();
     const p = ytPlayerRef.current;
@@ -1670,24 +1734,52 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     void registerVibraServiceWorker();
+
+    const handlePauseFromOffline = () => {
+      isYieldedToOfflineRef.current = true;
+      setIsYieldedToOffline(true);
+      setIsExpanded(false);
+      userPausedRef.current = true;
+      shouldPlayRef.current = false;
+      stopWebAudioKeepAlive();
+      void releasePlaybackWakeLock();
+      if (audioElRef.current && !audioElRef.current.paused) {
+        try {
+          audioElRef.current.pause();
+        } catch {
+          // ignore
+        }
+      }
+      try {
+        ytPlayerRef.current?.pauseVideo();
+      } catch {
+        // ignore
+      }
+      setIsPlaying(false);
+    };
+
+    window.addEventListener('vibra:pause-online-player', handlePauseFromOffline);
     return () => {
+      window.removeEventListener('vibra:pause-online-player', handlePauseFromOffline);
       stopWebAudioKeepAlive();
       void releasePlaybackWakeLock();
     };
   }, []);
 
-  // Sync browser tab title with currently playing track
+  // Sync browser tab title with currently playing track (when online player is active)
   useEffect(() => {
+    if (isYieldedToOffline) return;
     if (!currentTrack) {
       document.title = 'VIBRA — AI Music Discovery & Streaming';
       return;
     }
 
     document.title = `${isPlaying ? '▶ ' : ''}${currentTrack.title} · ${currentTrack.artist} — VIBRA`;
-  }, [currentTrack, isPlaying]);
+  }, [currentTrack, isPlaying, isYieldedToOffline]);
 
   // OS / Lock-screen / Android & Desktop Notification Shade MediaSession integration
   useEffect(() => {
+    if (isYieldedToOffline) return;
     if (!('mediaSession' in navigator)) return;
     if (!currentTrack) {
       navigator.mediaSession.playbackState = 'none';
@@ -1706,7 +1798,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           { src: '/pwa-512x512.png', sizes: '512x512', type: 'image/png' },
         ],
       });
-      navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+      navigator.mediaSession.playbackState =
+        isPlaying || (shouldPlayRef.current && !userPausedRef.current && isBackgroundPlay)
+          ? 'playing'
+          : 'paused';
 
       navigator.mediaSession.setActionHandler('play', () => {
         userPausedRef.current = false;
@@ -1759,12 +1854,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     } catch {
       // ignore unsupported MediaSession handlers
     }
-  }, [currentTrack, isPlaying, isRadioMode, seekTo]);
+  }, [currentTrack, isPlaying, isRadioMode, isBackgroundPlay, isYieldedToOffline, seekTo]);
 
   return (
     <PlayerContext.Provider
       value={{
-        currentTrack,
+        currentTrack: isYieldedToOffline ? null : currentTrack,
         queue,
         currentIndex,
         isPlaying,
@@ -1828,6 +1923,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             applyPendingAudioSeek(a);
           }
           consecutiveErrorsRef.current = 0;
+          bgSkipStreakRef.current = 0;
           setIsPlaying(true);
           setIsBuffering(false);
           setPlayerError(null);
@@ -1843,24 +1939,37 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           if (!a || a.src.startsWith('data:')) return;
           if (!a.ended) {
             const recentlyHidden =
-              document.hidden || Date.now() - hiddenAtRef.current < 3500;
+              document.hidden || Date.now() - hiddenAtRef.current < 8000;
             if (
               isBackgroundPlayRef.current &&
               shouldPlayRef.current &&
               !userPausedRef.current &&
               recentlyHidden
             ) {
+              for (const retryMs of [40, 180, 450, 950]) {
+                window.setTimeout(() => {
+                  if (
+                    activeEngineRef.current === 'audio' &&
+                    shouldPlayRef.current &&
+                    !userPausedRef.current &&
+                    a.paused &&
+                    !a.ended
+                  ) {
+                    void a.play().catch(() => {});
+                  }
+                }, retryMs);
+              }
               window.setTimeout(() => {
                 if (
                   activeEngineRef.current === 'audio' &&
-                  shouldPlayRef.current &&
-                  !userPausedRef.current &&
                   a.paused &&
-                  !a.ended
+                  !a.ended &&
+                  (!shouldPlayRef.current || userPausedRef.current)
                 ) {
-                  void a.play().catch(() => {});
+                  setIsPlaying(false);
+                  setIsBuffering(false);
                 }
-              }, 60);
+              }, 1250);
               return;
             }
             setIsPlaying(false);
@@ -1960,6 +2069,24 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           const resumeAt = a.currentTime || 0;
           const track = queueRef.current[currentIndexRef.current];
           stopNativeAudio();
+          if (
+            document.hidden &&
+            isBackgroundPlayRef.current &&
+            shouldPlayRef.current &&
+            !userPausedRef.current &&
+            queueRef.current.length > 1 &&
+            bgSkipStreakRef.current < 8
+          ) {
+            bgSkipStreakRef.current += 1;
+            const q = queueRef.current;
+            const nextIdx = (currentIndexRef.current + 1) % q.length;
+            const nextTrackItem = q[nextIdx];
+            if (nextTrackItem && !isVideoModeRef.current) {
+              beginSynchronousNativeAudio(nextTrackItem, 0);
+            }
+            setCurrentIndex(nextIdx);
+            return;
+          }
           if (track) {
             startYouTubeTrack(track.id, resumeAt);
           }
