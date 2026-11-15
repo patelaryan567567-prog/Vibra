@@ -20,6 +20,7 @@ import {
   Plus,
   PlusSquare,
   RefreshCw,
+  RotateCcw,
   Search,
   ShieldCheck,
   Shuffle,
@@ -42,7 +43,7 @@ import type {
   Playlist,
   Track,
 } from '../types/music';
-import { formatRelativeTime } from '../utils/format';
+import { formatRelativeTime, formatSeconds } from '../utils/format';
 import { formatBytes } from '../utils/offlineMusicDb';
 
 export type LibrarySectionTab = 'mymusic' | 'playlists' | 'recent' | 'stats' | 'history';
@@ -77,6 +78,7 @@ export function LibraryPage({
     recentlyPlayed,
     searchHistory,
     listeningStats,
+    trackPositions,
     createPlaylist,
     renamePlaylist,
     deletePlaylist,
@@ -1026,6 +1028,22 @@ export function LibraryPage({
                       {filteredOfflineTracks.map((track, idx) => {
                         const isActive = activeOfflineTrack?.id === track.id;
                         const isActivePlaying = isActive && isOfflinePlaying;
+                        const savedResume =
+                          trackPositions[track.id] ||
+                          (track.sourceVideoId ? trackPositions[track.sourceVideoId] : undefined);
+                        const hasResume = Boolean(savedResume && savedResume.positionSeconds >= 3);
+                        const resumePercent =
+                          hasResume && savedResume
+                            ? Math.min(
+                                100,
+                                Math.max(
+                                  4,
+                                  (savedResume.positionSeconds /
+                                    (savedResume.durationSeconds || track.durationSeconds || 180)) *
+                                    100
+                                )
+                              )
+                            : 0;
                         return (
                           <div
                             key={track.id}
@@ -1069,6 +1087,14 @@ export function LibraryPage({
                                   <Play className="w-4 h-4 text-white fill-current ml-0.5" />
                                 )}
                               </div>
+                              {hasResume && (
+                                <div className="absolute inset-x-0 bottom-0 h-1 bg-black/65">
+                                  <div
+                                    className="h-full bg-emerald-400"
+                                    style={{ width: `${resumePercent}%` }}
+                                  />
+                                </div>
+                              )}
                             </button>
 
                             <button
@@ -1101,10 +1127,29 @@ export function LibraryPage({
                                     </span>
                                   </>
                                 )}
+                                {hasResume && savedResume && (
+                                  <>
+                                    <span aria-hidden="true" className="text-slate-500">·</span>
+                                    <span className="font-mono-tabular font-semibold text-emerald-300 whitespace-nowrap">
+                                      Resume {formatSeconds(savedResume.positionSeconds)}
+                                    </span>
+                                  </>
+                                )}
                               </div>
                             </button>
 
                             <div className="flex items-center gap-0.5 shrink-0">
+                              {hasResume && (
+                                <button
+                                  type="button"
+                                  onClick={() => playOfflineTrack(track, filteredOfflineTracks, 0)}
+                                  aria-label={`Restart ${track.title} from 0:00`}
+                                  title="Start Over (0:00)"
+                                  className="min-h-[40px] min-w-[38px] flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-white/5 transition-colors"
+                                >
+                                  <RotateCcw className="w-3.5 h-3.5" />
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 onClick={() => playNextInOfflineQueue(track)}
@@ -1431,6 +1476,10 @@ export function LibraryPage({
                                     {plTracks.map((t, idx) => {
                                       const active = activeOfflineTrack?.id === t.id;
                                       const activePlaying = active && isOfflinePlaying;
+                                      const savedResume =
+                                        trackPositions[t.id] ||
+                                        (t.sourceVideoId ? trackPositions[t.sourceVideoId] : undefined);
+                                      const hasResume = Boolean(savedResume && savedResume.positionSeconds >= 3);
                                       return (
                                         <div
                                           key={t.id}
@@ -1471,10 +1520,29 @@ export function LibraryPage({
                                             >
                                               {t.title}
                                             </p>
-                                            <p className="text-xs text-slate-400 truncate">
-                                              {t.artist} · {t.duration}
-                                            </p>
+                                            <div className="flex flex-wrap items-center gap-x-1.5 text-xs text-slate-400">
+                                              <span className="truncate">{t.artist} · {t.duration}</span>
+                                              {hasResume && savedResume && (
+                                                <>
+                                                  <span aria-hidden="true" className="text-slate-500">·</span>
+                                                  <span className="font-mono-tabular font-semibold text-emerald-300 whitespace-nowrap">
+                                                    Resume {formatSeconds(savedResume.positionSeconds)}
+                                                  </span>
+                                                </>
+                                              )}
+                                            </div>
                                           </button>
+                                          {hasResume && (
+                                            <button
+                                              type="button"
+                                              onClick={() => playOfflineTrack(t, plTracks, 0)}
+                                              aria-label={`Restart ${t.title} from 0:00`}
+                                              title="Start Over (0:00)"
+                                              className="min-h-[40px] min-w-[38px] flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-white/5"
+                                            >
+                                              <RotateCcw className="w-3.5 h-3.5" />
+                                            </button>
+                                          )}
                                           <button
                                             type="button"
                                             onClick={() =>
@@ -1868,12 +1936,21 @@ export function LibraryPage({
                   {topTracks.length > 0 && (
                     <button
                       type="button"
-                      onClick={() =>
-                        playTrack(
-                          topTracks[0].track,
-                          topTracks.map((t) => t.track)
-                        )
-                      }
+                      onClick={() => {
+                        const first = topTracks[0].track;
+                        const matchedOffline = offlineTrackMap.get(first.id);
+                        if (first.isOffline && matchedOffline) {
+                          const offlineQueue = topTracks
+                            .map((t) => offlineTrackMap.get(t.track.id))
+                            .filter((t): t is OfflineTrack => Boolean(t));
+                          playOfflineTrack(matchedOffline, offlineQueue.length > 0 ? offlineQueue : [matchedOffline]);
+                        } else {
+                          playTrack(
+                            first,
+                            topTracks.map((t) => t.track)
+                          );
+                        }
+                      }}
                       className="h-8 px-3 rounded-lg bg-white/[0.07] hover:bg-white/[0.12] text-xs font-medium text-white inline-flex items-center gap-1.5"
                     >
                       <Play className="w-3 h-3 fill-current" />

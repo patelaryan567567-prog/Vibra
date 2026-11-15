@@ -11,6 +11,7 @@ import {
   startWebAudioKeepAlive,
   stopWebAudioKeepAlive,
 } from '../utils/backgroundAudio';
+import { formatSeconds } from '../utils/format';
 import { useLibrary } from './LibraryContext';
 
 interface YTPlayerInstance {
@@ -84,7 +85,7 @@ interface PlayerContextValue {
   backgroundBlockedHint: string | null;
   clearBackgroundBlockedHint: () => void;
   playerHostRef: React.RefObject<HTMLDivElement | null>;
-  playTrack: (track: Track, newQueue?: Track[], openVideo?: boolean) => void;
+  playTrack: (track: Track, newQueue?: Track[], openVideo?: boolean, startAtSeconds?: number) => void;
   startTrackRadio: (track: Track) => void;
   addToQueue: (track: Track) => void;
   playNextInQueue: (track: Track) => void;
@@ -236,7 +237,15 @@ async function fetchTrackAudioBlobUrl(track: Track, keepIds?: Set<string>): Prom
 }
 
 export function PlayerProvider({ children }: { children: React.ReactNode }) {
-  const { recordPlayed, recordListeningSeconds, createPlaylistWithTracks, showToast } = useLibrary();
+  const {
+    recordPlayed,
+    recordListeningSeconds,
+    createPlaylistWithTracks,
+    saveTrackPosition,
+    clearTrackPosition,
+    getTrackPosition,
+    showToast,
+  } = useLibrary();
 
   const [queue, setQueue] = useState<Track[]>([]);
   const [currentIndex, setCurrentIndex] = useState<number>(-1);
@@ -296,6 +305,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const relatedFetchedForIdRef = useRef<string | null>(null);
   const lastMediaPosSyncRef = useRef<number>(0);
   const lastSessionSaveRef = useRef<number>(0);
+  const lastPosSaveRef = useRef<number>(0);
   const sessionRestoredRef = useRef(false);
   const isYieldedToOfflineRef = useRef(false);
   const [isYieldedToOffline, setIsYieldedToOffline] = useState(false);
@@ -303,6 +313,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const queueRef = useRef(queue);
   const currentIndexRef = useRef(currentIndex);
   const currentTimeRef = useRef(currentTime);
+  const durationRef = useRef(duration);
   const repeatModeRef = useRef(repeatMode);
   const isShuffleRef = useRef(isShuffle);
   const isRadioModeRef = useRef(isRadioMode);
@@ -315,6 +326,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   queueRef.current = queue;
   currentIndexRef.current = currentIndex;
   currentTimeRef.current = currentTime;
+  durationRef.current = duration;
   repeatModeRef.current = repeatMode;
   isShuffleRef.current = isShuffle;
   isRadioModeRef.current = isRadioMode;
@@ -325,6 +337,18 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   relatedTracksRef.current = relatedTracks;
 
   const currentTrack = currentIndex >= 0 && currentIndex < queue.length ? queue[currentIndex] : null;
+
+  const persistCurrentTrackResume = useCallback(
+    (overrideSec?: number) => {
+      const curTrack = queueRef.current[currentIndexRef.current];
+      if (!curTrack) return;
+      const sec = overrideSec ?? currentTimeRef.current ?? 0;
+      const dur = durationRef.current || curTrack.durationSeconds || 0;
+      saveTrackPosition(curTrack.id, sec, dur);
+      saveTrackPosition(`dl_${curTrack.id}`, sec, dur);
+    },
+    [saveTrackPosition]
+  );
 
   const applyPendingAudioSeek = useCallback((a: HTMLAudioElement) => {
     const targetSec = pendingSeekSecRef.current;
@@ -665,11 +689,17 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
     if (q.length === 0) return;
 
-    const activeLoadKey = `${idx}:${q[idx]?.id ?? ''}`;
+    const finishedTrack = q[idx];
+    const activeLoadKey = `${idx}:${finishedTrack?.id ?? ''}`;
     if (rep !== 'one' && endedHandledForLoadRef.current === activeLoadKey) {
       return;
     }
     endedHandledForLoadRef.current = activeLoadKey;
+
+    if (finishedTrack) {
+      clearTrackPosition(finishedTrack.id);
+      clearTrackPosition(`dl_${finishedTrack.id}`);
+    }
 
     shouldPlayRef.current = true;
     userPausedRef.current = false;
@@ -715,7 +745,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       }
       setCurrentIndex(0);
     }
-  }, [beginSynchronousNativeAudio, pickNextShuffleIndex, replenishRadioQueue]);
+  }, [beginSynchronousNativeAudio, clearTrackPosition, pickNextShuffleIndex, replenishRadioQueue]);
 
   // Restore saved online session on initial mount if user was last listening to Online Player
   useEffect(() => {
@@ -1042,16 +1072,24 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     const controller = new AbortController();
     resolveAbortRef.current = controller;
 
+    const alreadyStartedInGesture =
+      (activeEngineRef.current === 'audio' && loadedAudioTrackIdRef.current === currentTrack.id) ||
+      (activeEngineRef.current === 'youtube' &&
+        (loadedYtVideoIdRef.current === currentTrack.id ||
+          pendingTrackIdRef.current === currentTrack.id));
+
     loadedTrackIdRef.current = currentTrack.id;
     endedHandledForLoadRef.current = null;
     bgResumeAttemptsRef.current = 0;
-    pendingSeekSecRef.current = 0;
-    pendingYtSeekSecRef.current = 0;
-    currentTimeRef.current = 0;
+    if (!alreadyStartedInGesture) {
+      pendingSeekSecRef.current = 0;
+      pendingYtSeekSecRef.current = 0;
+      currentTimeRef.current = 0;
+      setCurrentTime(0);
+    }
     shouldPlayRef.current = true;
     userPausedRef.current = false;
     shuffleHistoryRef.current.add(currentTrack.id);
-    setCurrentTime(0);
     setDuration(currentTrack.durationSeconds || 0);
     setPlayerError(null);
     setBackgroundBlockedHint(null);
@@ -1094,15 +1132,17 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
     if (isVideoModeRef.current) {
       stopNativeAudio();
-      startYouTubeTrack(currentTrack.id, 0);
+      if (!alreadyStartedInGesture) {
+        startYouTubeTrack(currentTrack.id, pendingYtSeekSecRef.current);
+      }
       return () => window.clearTimeout(prewarmTimer);
     }
 
-    if (activeEngineRef.current === 'audio' && loadedAudioTrackIdRef.current === currentTrack.id) {
+    if (alreadyStartedInGesture) {
       return () => window.clearTimeout(prewarmTimer);
     }
 
-    beginSynchronousNativeAudio(currentTrack, 0);
+    beginSynchronousNativeAudio(currentTrack, pendingSeekSecRef.current);
     return () => window.clearTimeout(prewarmTimer);
   }, [
     currentTrack,
@@ -1275,6 +1315,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         hiddenAtRef.current = Date.now();
         bgResumeAttemptsRef.current = 0;
       }
+      persistCurrentTrackResume();
       saveOnlineSession();
       ensureOnlinePlaybackAlive();
     };
@@ -1291,7 +1332,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       window.removeEventListener('focus', onWindowFocusOrShow);
       window.removeEventListener('pageshow', onWindowFocusOrShow);
     };
-  }, [beginSynchronousNativeAudio, handleTrackEnd, saveOnlineSession]);
+  }, [beginSynchronousNativeAudio, handleTrackEnd, persistCurrentTrackResume, saveOnlineSession]);
 
   // Continuous 2-second watchdog for native <audio> engine: catches throttled `ended` events or involuntary OS pauses while screen is off
   useEffect(() => {
@@ -1413,7 +1454,9 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   }, [isPlaying, recordListeningSeconds]);
 
   const playTrack = useCallback(
-    (track: Track, newQueue?: Track[], openVideo?: boolean) => {
+    (track: Track, newQueue?: Track[], openVideo?: boolean, startAtSeconds?: number) => {
+      persistCurrentTrackResume();
+
       window.dispatchEvent(new CustomEvent('vibra:pause-offline-player'));
       isYieldedToOfflineRef.current = false;
       setIsYieldedToOffline(false);
@@ -1430,18 +1473,34 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         void acquirePlaybackWakeLock();
       }
 
+      let resumeSec = 0;
+      if (typeof startAtSeconds === 'number') {
+        resumeSec = Math.max(0, startAtSeconds);
+        if (resumeSec === 0) {
+          clearTrackPosition(track.id);
+          clearTrackPosition(`dl_${track.id}`);
+        }
+      } else {
+        const saved = getTrackPosition(track.id) || getTrackPosition(`dl_${track.id}`);
+        if (saved && saved.positionSeconds >= 3) {
+          resumeSec = saved.positionSeconds;
+          showToast(`Resuming "${track.title}" from ${formatSeconds(resumeSec)}`);
+        }
+      }
+
       const wantVideo = Boolean(openVideo || track.isVideo);
       if (wantVideo) {
         isVideoModeRef.current = true;
         setIsVideoMode(true);
         setIsExpanded(true);
         stopNativeAudio();
-        startYouTubeTrack(track.id, 0);
+        startYouTubeTrack(track.id, resumeSec);
       } else {
         isVideoModeRef.current = false;
         setIsVideoMode(false);
-        beginSynchronousNativeAudio(track, 0);
+        beginSynchronousNativeAudio(track, resumeSec);
       }
+      recordPlayed(track);
 
       if (newQueue && newQueue.length > 0) {
         const idx = newQueue.findIndex((t) => t.id === track.id);
@@ -1465,11 +1524,21 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         });
       }
     },
-    [beginSynchronousNativeAudio, startYouTubeTrack, stopNativeAudio]
+    [
+      beginSynchronousNativeAudio,
+      clearTrackPosition,
+      getTrackPosition,
+      persistCurrentTrackResume,
+      recordPlayed,
+      showToast,
+      startYouTubeTrack,
+      stopNativeAudio,
+    ]
   );
 
   const startTrackRadio = useCallback(
     (track: Track) => {
+      persistCurrentTrackResume();
       window.dispatchEvent(new CustomEvent('vibra:pause-offline-player'));
       isYieldedToOfflineRef.current = false;
       setIsYieldedToOffline(false);
@@ -1485,8 +1554,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         pokeBackgroundKeepAlive();
         void acquirePlaybackWakeLock();
       }
+      const saved = getTrackPosition(track.id) || getTrackPosition(`dl_${track.id}`);
+      const resumeSec = saved && saved.positionSeconds >= 3 ? saved.positionSeconds : 0;
       if (!isVideoModeRef.current) {
-        beginSynchronousNativeAudio(track, 0);
+        beginSynchronousNativeAudio(track, resumeSec);
       }
       setIsRadioMode(true);
       localStorage.setItem('vibra_radio_mode', 'true');
@@ -1495,7 +1566,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       showToast(`Infinite Radio started from "${track.title}"`);
       void replenishRadioQueue(track, false);
     },
-    [beginSynchronousNativeAudio, replenishRadioQueue, showToast]
+    [beginSynchronousNativeAudio, getTrackPosition, persistCurrentTrackResume, replenishRadioQueue, showToast]
   );
 
   const addToQueue = useCallback(
@@ -1648,6 +1719,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         void releasePlaybackWakeLock();
         audio.pause();
         setIsPlaying(false);
+        persistCurrentTrackResume(currentTime);
         saveOnlineSession(currentTime, false);
       } else {
         window.dispatchEvent(new CustomEvent('vibra:pause-offline-player'));
@@ -1663,14 +1735,20 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           pokeBackgroundKeepAlive();
           void acquirePlaybackWakeLock();
         }
+        const savedPos = getTrackPosition(currentTrack.id)?.positionSeconds ?? 0;
+        const effectiveResume = currentTime > 0.5 ? currentTime : savedPos;
         if (!audio.getAttribute('src') || audio.src.startsWith('data:')) {
-          beginSynchronousNativeAudio(currentTrack, currentTime);
+          beginSynchronousNativeAudio(currentTrack, effectiveResume);
         } else {
+          if (effectiveResume > 0.5 && Math.abs((audio.currentTime || 0) - effectiveResume) > 2) {
+            pendingSeekSecRef.current = effectiveResume;
+            applyPendingAudioSeek(audio);
+          }
           void audio.play().catch(() => {
-            beginSynchronousNativeAudio(currentTrack, currentTime);
+            beginSynchronousNativeAudio(currentTrack, effectiveResume);
           });
         }
-        saveOnlineSession(currentTime, true);
+        saveOnlineSession(effectiveResume, true);
       }
       return;
     }
@@ -1699,6 +1777,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       stopWebAudioKeepAlive();
       void releasePlaybackWakeLock();
       p.pauseVideo();
+      persistCurrentTrackResume(currentTime);
       saveOnlineSession(currentTime, false);
     } else {
       userPausedRef.current = false;
@@ -1713,12 +1792,23 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       p.playVideo();
       saveOnlineSession(currentTime, true);
     }
-  }, [isPlaying, currentTrack, currentTime, beginSynchronousNativeAudio, unlockAudioFromGesture, saveOnlineSession]);
+  }, [
+    applyPendingAudioSeek,
+    beginSynchronousNativeAudio,
+    currentTime,
+    currentTrack,
+    getTrackPosition,
+    isPlaying,
+    persistCurrentTrackResume,
+    saveOnlineSession,
+    unlockAudioFromGesture,
+  ]);
 
   const nextTrack = useCallback(() => {
     const q = queueRef.current;
     const idx = currentIndexRef.current;
     if (q.length === 0) return;
+    persistCurrentTrackResume();
     window.dispatchEvent(new CustomEvent('vibra:pause-offline-player'));
     isYieldedToOfflineRef.current = false;
     setIsYieldedToOffline(false);
@@ -1753,7 +1843,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       }
       setCurrentIndex(0);
     }
-  }, [beginSynchronousNativeAudio, pickNextShuffleIndex, replenishRadioQueue, unlockAudioFromGesture]);
+  }, [beginSynchronousNativeAudio, persistCurrentTrackResume, pickNextShuffleIndex, replenishRadioQueue, unlockAudioFromGesture]);
 
   const prevTrack = useCallback(() => {
     const q = queueRef.current;
@@ -1778,31 +1868,37 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         ytPlayerRef.current?.seekTo(0, true);
       }
       setCurrentTime(0);
+      if (q[idx]) clearTrackPosition(q[idx].id);
       return;
     }
+    persistCurrentTrackResume();
     const targetIdx = idx - 1 >= 0 ? idx - 1 : q.length - 1;
     if (q[targetIdx] && !isVideoModeRef.current) {
       beginSynchronousNativeAudio(q[targetIdx], 0);
     }
     setCurrentIndex(targetIdx);
-  }, [beginSynchronousNativeAudio, currentTime]);
+  }, [beginSynchronousNativeAudio, clearTrackPosition, currentTime, persistCurrentTrackResume]);
 
-  const seekTo = useCallback((seconds: number) => {
-    currentTimeRef.current = seconds;
-    setCurrentTime(seconds);
-    if (activeEngineRef.current === 'audio' && audioElRef.current) {
-      const a = audioElRef.current;
-      if (isSilentWarmupRef.current || !Number.isFinite(a.duration) || a.duration <= 3) {
-        pendingSeekSecRef.current = seconds;
+  const seekTo = useCallback(
+    (seconds: number) => {
+      currentTimeRef.current = seconds;
+      setCurrentTime(seconds);
+      persistCurrentTrackResume(seconds);
+      if (activeEngineRef.current === 'audio' && audioElRef.current) {
+        const a = audioElRef.current;
+        if (isSilentWarmupRef.current || !Number.isFinite(a.duration) || a.duration <= 3) {
+          pendingSeekSecRef.current = seconds;
+        } else {
+          pendingSeekSecRef.current = 0;
+          a.currentTime = seconds;
+        }
       } else {
-        pendingSeekSecRef.current = 0;
-        a.currentTime = seconds;
+        pendingYtSeekSecRef.current = seconds;
+        ytPlayerRef.current?.seekTo(seconds, true);
       }
-    } else {
-      pendingYtSeekSecRef.current = seconds;
-      ytPlayerRef.current?.seekTo(seconds, true);
-    }
-  }, []);
+    },
+    [persistCurrentTrackResume]
+  );
 
   const setVolume = useCallback(
     (vol: number) => {
@@ -2117,6 +2213,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           const a = audioElRef.current;
           if (!a || a.src.startsWith('data:')) return;
           if (!a.ended) {
+            persistCurrentTrackResume(a.currentTime);
             // Whenever shouldPlayRef is true and userPausedRef is false, ANY pause event
             // (whether in background for 20 minutes OR when waking/unlocking the screen!)
             // is an involuntary OS interruption and must be auto-resumed immediately.
@@ -2179,6 +2276,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           const a = e.currentTarget;
           const dur = a.duration;
           if (Number.isFinite(dur) && dur > 5) {
+            durationRef.current = dur;
             setDuration(dur);
             if (pendingSeekSecRef.current > 0.5) {
               applyPendingAudioSeek(a);
@@ -2204,6 +2302,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           }
 
           const now = Date.now();
+          if (now - lastPosSaveRef.current > 2000) {
+            lastPosSaveRef.current = now;
+            persistCurrentTrackResume(cur);
+          }
           if (now - lastSessionSaveRef.current > 5000) {
             lastSessionSaveRef.current = now;
             saveOnlineSession(cur);

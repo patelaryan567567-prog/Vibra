@@ -7,7 +7,7 @@ export type NavTab = 'home' | 'explore' | 'search' | 'library' | 'favourites';
 export type RepeatMode = 'off' | 'all' | 'one';
 
 export interface Track {
-  id: string; // YouTube videoId
+  id: string; // YouTube videoId or offline track id
   title: string;
   artist: string;
   channelTitle: string;
@@ -20,6 +20,14 @@ export interface Track {
   publishedAt?: string;
   isVideo?: boolean;
   category?: CategoryId;
+  isOffline?: boolean;
+  offlineTrackId?: string;
+}
+
+export interface TrackResumeInfo {
+  positionSeconds: number;
+  durationSeconds: number;
+  updatedAt: number;
 }
 
 export interface AiDiscoveryPlan {

@@ -1,10 +1,12 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import type {
   ListeningStats,
+  OfflineTrack,
   Playlist,
   RecentlyPlayedItem,
   SearchHistoryItem,
   Track,
+  TrackResumeInfo,
 } from '../types/music';
 
 const STORAGE_KEYS = {
@@ -13,6 +15,7 @@ const STORAGE_KEYS = {
   searchHistory: 'vibra_search_history_v1',
   playlists: 'vibra_playlists_v1',
   stats: 'vibra_stats_v1',
+  trackPositions: 'vibra_track_positions_v1',
 };
 
 const EMPTY_STATS: ListeningStats = {
@@ -49,6 +52,23 @@ function getLocalDayKey(ts = Date.now()): string {
   return `${year}-${month}-${day}`;
 }
 
+export function offlineTrackToLibraryTrack(offlineTrack: OfflineTrack): Track {
+  const art = offlineTrack.artworkDataUrl || '/pwa-512x512.png';
+  return {
+    id: offlineTrack.id,
+    title: offlineTrack.title,
+    artist: offlineTrack.artist,
+    channelTitle: offlineTrack.album || 'My Music · Offline',
+    thumbnail: art,
+    thumbnailHigh: art,
+    duration: offlineTrack.duration || '--:--',
+    durationSeconds: offlineTrack.durationSeconds || 0,
+    viewCount: 'Offline',
+    isOffline: true,
+    offlineTrackId: offlineTrack.id,
+  };
+}
+
 export interface ToastMessage {
   id: number;
   text: string;
@@ -60,12 +80,17 @@ interface LibraryContextValue {
   searchHistory: SearchHistoryItem[];
   playlists: Playlist[];
   listeningStats: ListeningStats;
+  trackPositions: Record<string, TrackResumeInfo>;
   toast: ToastMessage | null;
   showToast: (text: string) => void;
   isFavourite: (trackId: string) => boolean;
   toggleFavourite: (track: Track) => void;
   recordPlayed: (track: Track) => void;
+  recordOfflinePlayed: (offlineTrack: OfflineTrack) => void;
   recordListeningSeconds: (seconds: number) => void;
+  saveTrackPosition: (trackId: string, positionSeconds: number, durationSeconds?: number) => void;
+  clearTrackPosition: (trackId: string) => void;
+  getTrackPosition: (trackId: string) => TrackResumeInfo | null;
   clearRecentlyPlayed: () => void;
   clearListeningStats: () => void;
   addSearchQuery: (query: string) => void;
@@ -101,6 +126,12 @@ export function LibraryProvider({ children }: { children: React.ReactNode }) {
       dailyPlays: raw.dailyPlays && typeof raw.dailyPlays === 'object' ? raw.dailyPlays : {},
     };
   });
+  const [trackPositions, setTrackPositions] = useState<Record<string, TrackResumeInfo>>(() =>
+    readStorage(STORAGE_KEYS.trackPositions, {})
+  );
+  const trackPositionsRef = useRef(trackPositions);
+  trackPositionsRef.current = trackPositions;
+
   const [toast, setToast] = useState<ToastMessage | null>(null);
 
   useEffect(() => writeStorage(STORAGE_KEYS.favourites, favourites), [favourites]);
@@ -108,6 +139,7 @@ export function LibraryProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => writeStorage(STORAGE_KEYS.searchHistory, searchHistory), [searchHistory]);
   useEffect(() => writeStorage(STORAGE_KEYS.playlists, playlists), [playlists]);
   useEffect(() => writeStorage(STORAGE_KEYS.stats, listeningStats), [listeningStats]);
+  useEffect(() => writeStorage(STORAGE_KEYS.trackPositions, trackPositions), [trackPositions]);
 
   const showToast = useCallback((text: string) => {
     const id = Date.now();
@@ -143,7 +175,7 @@ export function LibraryProvider({ children }: { children: React.ReactNode }) {
 
     setRecentlyPlayed((prev) => {
       const filtered = prev.filter((item) => item.track.id !== track.id);
-      return [{ track, playedAt: now }, ...filtered].slice(0, 50);
+      return [{ track, playedAt: now }, ...filtered].slice(0, 60);
     });
 
     setListeningStats((prev) => {
@@ -184,12 +216,86 @@ export function LibraryProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const recordOfflinePlayed = useCallback(
+    (offlineTrack: OfflineTrack) => {
+      const asTrack = offlineTrackToLibraryTrack(offlineTrack);
+      recordPlayed(asTrack);
+    },
+    [recordPlayed]
+  );
+
   const recordListeningSeconds = useCallback((seconds: number) => {
     if (!Number.isFinite(seconds) || seconds <= 0) return;
     setListeningStats((prev) => ({
       ...prev,
       totalSecondsListened: prev.totalSecondsListened + Math.round(seconds),
     }));
+  }, []);
+
+  const saveTrackPosition = useCallback(
+    (trackId: string, positionSeconds: number, durationSeconds = 0) => {
+      if (!trackId || !Number.isFinite(positionSeconds)) return;
+      const pos = Math.floor(positionSeconds);
+      const dur = Number.isFinite(durationSeconds) && durationSeconds > 0 ? Math.floor(durationSeconds) : 0;
+
+      // If near the very end of the track (within last 5 seconds), clear saved resume position
+      if (dur > 10 && pos >= dur - 5) {
+        setTrackPositions((prev) => {
+          if (!prev[trackId]) return prev;
+          const next = { ...prev };
+          delete next[trackId];
+          return next;
+        });
+        return;
+      }
+
+      // Only save once playback has progressed at least 3 seconds
+      if (pos < 3) return;
+
+      setTrackPositions((prev) => {
+        const existing = prev[trackId];
+        if (existing && Math.abs(existing.positionSeconds - pos) < 2 && existing.durationSeconds === dur) {
+          return prev;
+        }
+        const next: Record<string, TrackResumeInfo> = {
+          ...prev,
+          [trackId]: {
+            positionSeconds: pos,
+            durationSeconds: dur || existing?.durationSeconds || 0,
+            updatedAt: Date.now(),
+          },
+        };
+        const keys = Object.keys(next);
+        if (keys.length > 200) {
+          const sorted = keys.sort((a, b) => (next[b]?.updatedAt ?? 0) - (next[a]?.updatedAt ?? 0));
+          for (const oldKey of sorted.slice(200)) {
+            delete next[oldKey];
+          }
+        }
+        return next;
+      });
+    },
+    []
+  );
+
+  const clearTrackPosition = useCallback((trackId: string) => {
+    if (!trackId) return;
+    setTrackPositions((prev) => {
+      if (!prev[trackId]) return prev;
+      const next = { ...prev };
+      delete next[trackId];
+      return next;
+    });
+  }, []);
+
+  const getTrackPosition = useCallback((trackId: string): TrackResumeInfo | null => {
+    if (!trackId) return null;
+    const info = trackPositionsRef.current[trackId];
+    if (!info || info.positionSeconds < 3) return null;
+    if (info.durationSeconds > 10 && info.positionSeconds >= info.durationSeconds - 5) {
+      return null;
+    }
+    return info;
   }, []);
 
   const clearRecentlyPlayed = useCallback(() => {
@@ -339,12 +445,17 @@ export function LibraryProvider({ children }: { children: React.ReactNode }) {
         searchHistory,
         playlists,
         listeningStats,
+        trackPositions,
         toast,
         showToast,
         isFavourite,
         toggleFavourite,
         recordPlayed,
+        recordOfflinePlayed,
         recordListeningSeconds,
+        saveTrackPosition,
+        clearTrackPosition,
+        getTrackPosition,
         clearRecentlyPlayed,
         clearListeningStats,
         addSearchQuery,

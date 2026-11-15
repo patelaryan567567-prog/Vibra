@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import {
   Check,
   Download,
+  HardDrive,
   Heart,
   ListPlus,
   Loader2,
@@ -12,16 +13,21 @@ import {
   Play,
   PlusSquare,
   Radio,
+  RotateCcw,
   Tv,
 } from 'lucide-react';
 import { useLibrary } from '../context/LibraryContext';
 import { useOfflineMusic } from '../context/OfflineMusicContext';
+import { useOfflinePlayer } from '../context/OfflinePlayerContext';
 import { usePlayer } from '../context/PlayerContext';
-import type { Track } from '../types/music';
+import type { OfflineTrack, Track, TrackResumeInfo } from '../types/music';
+import { formatSeconds } from '../utils/format';
 
 interface TrackActionMenuProps {
   track: Track;
   queueContext?: Track[];
+  matchedOffline?: OfflineTrack;
+  savedResume?: TrackResumeInfo | null;
   onAddToPlaylist: (track: Track) => void;
   anchorEl: HTMLButtonElement | null;
   isOpen: boolean;
@@ -31,14 +37,22 @@ interface TrackActionMenuProps {
 function TrackActionMenu({
   track,
   queueContext,
+  matchedOffline,
+  savedResume,
   onAddToPlaylist,
   anchorEl,
   isOpen,
   onClose,
 }: TrackActionMenuProps) {
   const { playTrack, startTrackRadio, addToQueue, playNextInQueue } = usePlayer();
-  const { saveOnlineTrack, isTrackSavedOffline, downloadingIds, downloadProgressMap } =
-    useOfflineMusic();
+  const { playOfflineTrack, addToOfflineQueue, playNextInOfflineQueue } = useOfflinePlayer();
+  const {
+    saveOnlineTrack,
+    exportTrackToDevice,
+    isTrackSavedOffline,
+    downloadingIds,
+    downloadProgressMap,
+  } = useOfflineMusic();
 
   const menuPanelRef = useRef<HTMLDivElement>(null);
   const [coords, setCoords] = useState<{ top: number; left: number; maxHeight: number }>({
@@ -47,9 +61,11 @@ function TrackActionMenu({
     maxHeight: 360,
   });
 
-  const savedOffline = isTrackSavedOffline(track.id);
+  const isOfflineEntry = Boolean(track.isOffline || track.offlineTrackId);
+  const savedOffline = isTrackSavedOffline(track.id) || Boolean(matchedOffline);
   const isDownloading = Boolean(downloadingIds[track.id]);
   const dlProgress = downloadProgressMap[track.id];
+  const hasResume = Boolean(savedResume && savedResume.positionSeconds >= 3);
 
   const updatePosition = useCallback(() => {
     if (!anchorEl) return;
@@ -86,7 +102,7 @@ function TrackActionMenu({
   useLayoutEffect(() => {
     if (!isOpen) return;
     updatePosition();
-  }, [isOpen, updatePosition, savedOffline, isDownloading]);
+  }, [isOpen, updatePosition, savedOffline, isDownloading, hasResume]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -154,37 +170,85 @@ function TrackActionMenu({
       }}
       className="z-[80] w-[248px] max-w-[calc(100vw-20px)] overflow-y-auto rounded-xl bg-[#181B26]/98 backdrop-blur-xl border border-white/15 shadow-[0_18px_45px_rgba(0,0,0,0.75)] py-1.5 text-xs"
     >
-      <button
-        type="button"
-        role="menuitem"
-        onClick={() => {
-          startTrackRadio(track);
-          onClose();
-        }}
-        className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] text-left transition-colors"
-      >
-        <Radio className="w-4 h-4 text-[#7A90FF] shrink-0" />
-        <span>Start Song Radio</span>
-      </button>
+      {hasResume && savedResume && (
+        <>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              if ((isOfflineEntry || !navigator.onLine) && matchedOffline) {
+                playOfflineTrack(matchedOffline, undefined, savedResume.positionSeconds);
+              } else {
+                playTrack(track, queueContext, Boolean(track.isVideo), savedResume.positionSeconds);
+              }
+              onClose();
+            }}
+            className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-emerald-300 hover:bg-white/[0.07] text-left transition-colors font-medium"
+          >
+            <Play className="w-4 h-4 fill-current shrink-0" />
+            <span>Resume from {formatSeconds(savedResume.positionSeconds)}</span>
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              if ((isOfflineEntry || !navigator.onLine) && matchedOffline) {
+                playOfflineTrack(matchedOffline, undefined, 0);
+              } else {
+                playTrack(track, queueContext, Boolean(track.isVideo), 0);
+              }
+              onClose();
+            }}
+            className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-200 hover:bg-white/[0.07] text-left transition-colors"
+          >
+            <RotateCcw className="w-4 h-4 text-slate-300 shrink-0" />
+            <span>Start Over (0:00)</span>
+          </button>
+
+          <div className="my-1 border-t border-white/[0.07]" />
+        </>
+      )}
+
+      {!isOfflineEntry && (
+        <>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              startTrackRadio(track);
+              onClose();
+            }}
+            className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] text-left transition-colors"
+          >
+            <Radio className="w-4 h-4 text-[#7A90FF] shrink-0" />
+            <span>Start Song Radio</span>
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              playTrack(track, queueContext, true);
+              onClose();
+            }}
+            className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] text-left transition-colors"
+          >
+            <Tv className="w-4 h-4 text-[#7A90FF] shrink-0" />
+            <span>Watch Music Video</span>
+          </button>
+        </>
+      )}
 
       <button
         type="button"
         role="menuitem"
         onClick={() => {
-          playTrack(track, queueContext, true);
-          onClose();
-        }}
-        className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] text-left transition-colors"
-      >
-        <Tv className="w-4 h-4 text-[#7A90FF] shrink-0" />
-        <span>Watch Music Video</span>
-      </button>
-
-      <button
-        type="button"
-        role="menuitem"
-        onClick={() => {
-          playNextInQueue(track);
+          if (isOfflineEntry && matchedOffline) {
+            playNextInOfflineQueue(matchedOffline);
+          } else {
+            playNextInQueue(track);
+          }
           onClose();
         }}
         className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] text-left transition-colors"
@@ -197,13 +261,17 @@ function TrackActionMenu({
         type="button"
         role="menuitem"
         onClick={() => {
-          addToQueue(track);
+          if (isOfflineEntry && matchedOffline) {
+            addToOfflineQueue(matchedOffline);
+          } else {
+            addToQueue(track);
+          }
           onClose();
         }}
         className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] text-left transition-colors"
       >
         <ListPlus className="w-4 h-4 text-slate-300 shrink-0" />
-        <span>Add to Queue</span>
+        <span>{isOfflineEntry ? 'Add to Offline Queue' : 'Add to Queue'}</span>
       </button>
 
       <button
@@ -221,46 +289,63 @@ function TrackActionMenu({
 
       <div className="my-1 border-t border-white/[0.07]" />
 
-      <button
-        type="button"
-        role="menuitem"
-        disabled={isDownloading}
-        onClick={() => {
-          void saveOnlineTrack(track, true);
-          onClose();
-        }}
-        className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] disabled:opacity-65 text-left transition-colors"
-      >
-        {isDownloading ? (
-          <Loader2 className="w-4 h-4 text-emerald-400 animate-spin shrink-0" />
-        ) : savedOffline ? (
-          <Check className="w-4 h-4 text-emerald-400 shrink-0" />
-        ) : (
-          <Download className="w-4 h-4 text-emerald-400 shrink-0" />
-        )}
-        <span>
-          {isDownloading
-            ? `Downloading ${dlProgress?.percent ?? 0}%`
-            : savedOffline
-              ? 'Download File to Device'
-              : 'Download (Device + My Music)'}
-        </span>
-      </button>
-
-      {!savedOffline && (
+      {isOfflineEntry && matchedOffline ? (
         <button
           type="button"
           role="menuitem"
-          disabled={isDownloading}
           onClick={() => {
-            void saveOnlineTrack(track, false);
+            void exportTrackToDevice(matchedOffline);
             onClose();
           }}
-          className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-300 hover:bg-white/[0.07] disabled:opacity-65 text-left transition-colors"
+          className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] text-left transition-colors"
         >
-          <Download className="w-4 h-4 text-[#7A90FF] shrink-0" />
-          <span>Save Only to My Music</span>
+          <Download className="w-4 h-4 text-emerald-400 shrink-0" />
+          <span>Save File to Device Downloads</span>
         </button>
+      ) : (
+        <>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={isDownloading}
+            onClick={() => {
+              void saveOnlineTrack(track, true);
+              onClose();
+            }}
+            className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] disabled:opacity-65 text-left transition-colors"
+          >
+            {isDownloading ? (
+              <Loader2 className="w-4 h-4 text-emerald-400 animate-spin shrink-0" />
+            ) : savedOffline ? (
+              <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+            ) : (
+              <Download className="w-4 h-4 text-emerald-400 shrink-0" />
+            )}
+            <span>
+              {isDownloading
+                ? `Downloading ${dlProgress?.percent ?? 0}%`
+                : savedOffline
+                  ? 'Download File to Device'
+                  : 'Download (Device + My Music)'}
+            </span>
+          </button>
+
+          {!savedOffline && (
+            <button
+              type="button"
+              role="menuitem"
+              disabled={isDownloading}
+              onClick={() => {
+                void saveOnlineTrack(track, false);
+                onClose();
+              }}
+              className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-300 hover:bg-white/[0.07] disabled:opacity-65 text-left transition-colors"
+            >
+              <Download className="w-4 h-4 text-[#7A90FF] shrink-0" />
+              <span>Save Only to My Music</span>
+            </button>
+          )}
+        </>
       )}
     </div>,
     document.body
@@ -276,22 +361,88 @@ interface TrackCardProps {
 
 export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel }: TrackCardProps) {
   const { currentTrack, isPlaying, playTrack, togglePlay } = usePlayer();
-  const { isFavourite, toggleFavourite } = useLibrary();
-  const { downloadProgressMap } = useOfflineMusic();
+  const {
+    currentTrack: currentOfflineTrack,
+    isPlaying: isOfflinePlaying,
+    playOfflineTrack,
+    togglePlay: toggleOfflinePlay,
+  } = useOfflinePlayer();
+  const { isFavourite, toggleFavourite, trackPositions, showToast } = useLibrary();
+  const { offlineTracks, downloadProgressMap } = useOfflineMusic();
   const [menuOpen, setMenuOpen] = useState(false);
   const [imgError, setImgError] = useState(false);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
 
-  const isCurrent = currentTrack?.id === track.id;
-  const isCurrentPlaying = isCurrent && isPlaying;
+  const matchedOffline = offlineTracks.find(
+    (o) =>
+      o.id === track.id ||
+      o.id === track.offlineTrackId ||
+      (o.sourceVideoId && o.sourceVideoId === track.id)
+  );
+  const isOfflineEntry = Boolean(track.isOffline || track.offlineTrackId);
+
+  const isActiveOffline = Boolean(matchedOffline && currentOfflineTrack?.id === matchedOffline.id);
+  const isActiveOnline = !isOfflineEntry && currentTrack?.id === track.id;
+  const isCurrent = isActiveOffline || isActiveOnline;
+  const isCurrentPlaying = isActiveOffline ? isOfflinePlaying : isActiveOnline ? isPlaying : false;
+
   const fav = isFavourite(track.id);
   const dlProgress = downloadProgressMap[track.id];
 
+  const savedResume =
+    trackPositions[track.id] ||
+    (matchedOffline ? trackPositions[matchedOffline.id] : undefined) ||
+    (track.offlineTrackId ? trackPositions[track.offlineTrackId] : undefined);
+  const hasResume = Boolean(savedResume && savedResume.positionSeconds >= 3);
+  const resumePercent =
+    hasResume && savedResume
+      ? Math.min(
+          100,
+          Math.max(
+            4,
+            (savedResume.positionSeconds /
+              (savedResume.durationSeconds || track.durationSeconds || 180)) *
+              100
+          )
+        )
+      : 0;
+
   const handlePrimaryPlay = () => {
-    if (isCurrent) {
+    if (isOfflineEntry) {
+      if (!matchedOffline) {
+        showToast('Offline audio file is no longer in My Music.');
+        return;
+      }
+      if (isActiveOffline) toggleOfflinePlay();
+      else playOfflineTrack(matchedOffline);
+      return;
+    }
+    if (!navigator.onLine && matchedOffline) {
+      if (isActiveOffline) toggleOfflinePlay();
+      else playOfflineTrack(matchedOffline);
+      return;
+    }
+    if (isActiveOnline) {
       togglePlay();
     } else {
       playTrack(track, queueContext, Boolean(track.isVideo));
+    }
+  };
+
+  const handleStartOver = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (isOfflineEntry) {
+      if (!matchedOffline) {
+        showToast('Offline audio file is no longer in My Music.');
+        return;
+      }
+      playOfflineTrack(matchedOffline, undefined, 0);
+      return;
+    }
+    if (!navigator.onLine && matchedOffline) {
+      playOfflineTrack(matchedOffline, undefined, 0);
+    } else {
+      playTrack(track, queueContext, Boolean(track.isVideo), 0);
     }
   };
 
@@ -329,7 +480,9 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
             className={`w-10 h-10 rounded-full flex items-center justify-center shadow-lg transition-transform active:scale-95 ${
               isCurrentPlaying
                 ? 'bg-white text-[#090A0F]'
-                : 'bg-[#4F6BFF] text-white hover:bg-[#5E78FF]'
+                : isOfflineEntry
+                  ? 'bg-emerald-500 text-white hover:bg-emerald-400'
+                  : 'bg-[#4F6BFF] text-white hover:bg-[#5E78FF]'
             }`}
           >
             {isCurrentPlaying ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current ml-0.5" />}
@@ -338,16 +491,37 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
 
         {/* Active track indicator bar */}
         {isCurrent && (
-          <div className="absolute top-2 left-2 px-2 py-0.5 rounded-md bg-[#4F6BFF] text-[11px] font-medium text-white shadow">
+          <div
+            className={`absolute top-2 left-2 px-2 py-0.5 rounded-md text-[11px] font-medium text-white shadow ${
+              isActiveOffline ? 'bg-emerald-600' : 'bg-[#4F6BFF]'
+            }`}
+          >
             {isCurrentPlaying ? 'Playing' : 'Paused'}
           </div>
         )}
 
-        {/* Live Download Percentage Badge */}
-        {dlProgress && (
+        {/* Offline / Download Indicator */}
+        {dlProgress ? (
           <div className="absolute top-2 right-2 px-2 py-0.5 rounded-md bg-emerald-600/95 text-[11px] font-mono-tabular font-bold text-white shadow flex items-center gap-1">
             {dlProgress.phase !== 'done' && <Loader2 className="w-3 h-3 animate-spin" />}
             <span>{dlProgress.percent}%</span>
+          </div>
+        ) : isOfflineEntry ? (
+          <div className="absolute top-2 right-2 px-2 py-0.5 rounded-md bg-black/75 border border-emerald-500/40 text-[10px] font-semibold text-emerald-300 shadow flex items-center gap-1">
+            <HardDrive className="w-3 h-3" />
+            <span>Offline</span>
+          </div>
+        ) : null}
+
+        {/* Saved Resume Progress Bar at Bottom of Artwork */}
+        {hasResume && (
+          <div className="absolute inset-x-0 bottom-0 h-1 bg-black/60 pointer-events-none">
+            <div
+              className={`h-full transition-all ${
+                isOfflineEntry ? 'bg-emerald-400' : 'bg-[#4F6BFF]'
+              }`}
+              style={{ width: `${resumePercent}%` }}
+            />
           </div>
         )}
       </div>
@@ -361,7 +535,11 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
         >
           <h3
             className={`text-sm sm:text-[15px] font-semibold leading-snug line-clamp-2 break-words ${
-              isCurrent ? 'text-[#8CA2FF]' : 'text-white group-hover:text-white'
+              isCurrent
+                ? isActiveOffline
+                  ? 'text-emerald-300'
+                  : 'text-[#8CA2FF]'
+                : 'text-white group-hover:text-white'
             }`}
           >
             {track.title}
@@ -371,7 +549,13 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
             {track.viewCount && (
               <>
                 <span aria-hidden="true" className="text-slate-500">·</span>
-                <span className="font-mono-tabular whitespace-nowrap text-slate-300">{track.viewCount}</span>
+                <span
+                  className={`font-mono-tabular whitespace-nowrap ${
+                    isOfflineEntry ? 'text-emerald-400' : 'text-slate-300'
+                  }`}
+                >
+                  {track.viewCount}
+                </span>
               </>
             )}
             {timestampLabel && (
@@ -424,6 +608,8 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
           <TrackActionMenu
             track={track}
             queueContext={queueContext}
+            matchedOffline={matchedOffline}
+            savedResume={savedResume}
             onAddToPlaylist={onAddToPlaylist}
             anchorEl={menuTriggerRef.current}
             isOpen={menuOpen}
@@ -431,6 +617,29 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
           />
         </div>
       </div>
+
+      {/* Resume Badge + Start Over Control */}
+      {hasResume && savedResume && (
+        <div className="mt-2 pt-2 border-t border-white/[0.06] flex items-center justify-between gap-2 text-[11px]">
+          <button
+            type="button"
+            onClick={handlePrimaryPlay}
+            className="inline-flex items-center gap-1.5 font-mono-tabular font-semibold text-emerald-300 hover:text-emerald-200 transition-colors"
+          >
+            <Play className="w-3 h-3 fill-current" />
+            <span>Resume {formatSeconds(savedResume.positionSeconds)}</span>
+          </button>
+          <button
+            type="button"
+            onClick={handleStartOver}
+            title="Start over from 0:00"
+            className="inline-flex items-center gap-1 text-slate-400 hover:text-white transition-colors"
+          >
+            <RotateCcw className="w-3 h-3" />
+            <span>0:00</span>
+          </button>
+        </div>
+      )}
     </article>
   );
 }
@@ -453,29 +662,104 @@ export function TrackRow({
   timestampLabel,
 }: TrackRowProps) {
   const { currentTrack, isPlaying, playTrack, togglePlay, addToQueue } = usePlayer();
-  const { isFavourite, toggleFavourite } = useLibrary();
-  const { saveOnlineTrack, isTrackSavedOffline, downloadingIds, downloadProgressMap } = useOfflineMusic();
+  const {
+    currentTrack: currentOfflineTrack,
+    isPlaying: isOfflinePlaying,
+    playOfflineTrack,
+    togglePlay: toggleOfflinePlay,
+    addToOfflineQueue,
+  } = useOfflinePlayer();
+  const { isFavourite, toggleFavourite, trackPositions, showToast } = useLibrary();
+  const {
+    offlineTracks,
+    saveOnlineTrack,
+    exportTrackToDevice,
+    isTrackSavedOffline,
+    downloadingIds,
+    downloadProgressMap,
+  } = useOfflineMusic();
   const [imgError, setImgError] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
 
-  const isCurrent = currentTrack?.id === track.id;
-  const isCurrentPlaying = isCurrent && isPlaying;
+  const matchedOffline = offlineTracks.find(
+    (o) =>
+      o.id === track.id ||
+      o.id === track.offlineTrackId ||
+      (o.sourceVideoId && o.sourceVideoId === track.id)
+  );
+  const isOfflineEntry = Boolean(track.isOffline || track.offlineTrackId);
+
+  const isActiveOffline = Boolean(matchedOffline && currentOfflineTrack?.id === matchedOffline.id);
+  const isActiveOnline = !isOfflineEntry && currentTrack?.id === track.id;
+  const isCurrent = isActiveOffline || isActiveOnline;
+  const isCurrentPlaying = isActiveOffline ? isOfflinePlaying : isActiveOnline ? isPlaying : false;
+
   const fav = isFavourite(track.id);
-  const savedOffline = isTrackSavedOffline(track.id);
+  const savedOffline = isTrackSavedOffline(track.id) || Boolean(matchedOffline);
   const isDownloading = Boolean(downloadingIds[track.id]);
   const dlProgress = downloadProgressMap[track.id];
 
+  const savedResume =
+    trackPositions[track.id] ||
+    (matchedOffline ? trackPositions[matchedOffline.id] : undefined) ||
+    (track.offlineTrackId ? trackPositions[track.offlineTrackId] : undefined);
+  const hasResume = Boolean(savedResume && savedResume.positionSeconds >= 3);
+  const resumePercent =
+    hasResume && savedResume
+      ? Math.min(
+          100,
+          Math.max(
+            4,
+            (savedResume.positionSeconds /
+              (savedResume.durationSeconds || track.durationSeconds || 180)) *
+              100
+          )
+        )
+      : 0;
+
   const handlePlay = () => {
-    if (isCurrent) togglePlay();
+    if (isOfflineEntry) {
+      if (!matchedOffline) {
+        showToast('Offline audio file is no longer in My Music.');
+        return;
+      }
+      if (isActiveOffline) toggleOfflinePlay();
+      else playOfflineTrack(matchedOffline);
+      return;
+    }
+    if (!navigator.onLine && matchedOffline) {
+      if (isActiveOffline) toggleOfflinePlay();
+      else playOfflineTrack(matchedOffline);
+      return;
+    }
+    if (isActiveOnline) togglePlay();
     else playTrack(track, queueContext, Boolean(track.isVideo));
+  };
+
+  const handleStartOver = () => {
+    if (isOfflineEntry) {
+      if (!matchedOffline) {
+        showToast('Offline audio file is no longer in My Music.');
+        return;
+      }
+      playOfflineTrack(matchedOffline, undefined, 0);
+      return;
+    }
+    if (!navigator.onLine && matchedOffline) {
+      playOfflineTrack(matchedOffline, undefined, 0);
+    } else {
+      playTrack(track, queueContext, Boolean(track.isVideo), 0);
+    }
   };
 
   return (
     <div
       className={`group flex items-center gap-2.5 sm:gap-3 px-3 py-2.5 rounded-xl border transition-colors ${
         isCurrent
-          ? 'bg-[#4F6BFF]/10 border-[#4F6BFF]/30'
+          ? isActiveOffline
+            ? 'bg-emerald-500/10 border-emerald-500/35'
+            : 'bg-[#4F6BFF]/10 border-[#4F6BFF]/30'
           : 'bg-[#11131A]/70 border-white/[0.05] hover:bg-[#181B26] hover:border-white/[0.12]'
       }`}
     >
@@ -516,15 +800,40 @@ export function TrackRow({
             <Play className="w-4 h-4 text-white fill-current ml-0.5" />
           )}
         </div>
+        {hasResume && (
+          <div className="absolute inset-x-0 bottom-0 h-1 bg-black/60">
+            <div
+              className={`h-full ${isOfflineEntry ? 'bg-emerald-400' : 'bg-[#4F6BFF]'}`}
+              style={{ width: `${resumePercent}%` }}
+            />
+          </div>
+        )}
       </button>
 
       <button type="button" onClick={handlePlay} className="min-w-0 flex-1 text-left">
-        <p className={`text-[13px] sm:text-[15px] font-semibold line-clamp-2 break-words leading-snug ${isCurrent ? 'text-[#8CA2FF]' : 'text-white'}`}>
+        <p
+          className={`text-[13px] sm:text-[15px] font-semibold line-clamp-2 break-words leading-snug ${
+            isCurrent
+              ? isActiveOffline
+                ? 'text-emerald-300'
+                : 'text-[#8CA2FF]'
+              : 'text-white'
+          }`}
+        >
           {track.title}
         </p>
         <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs sm:text-[13px] font-medium text-slate-300 mt-0.5">
           <span className="line-clamp-1 break-words">{track.artist}</span>
-          {track.viewCount && (
+          {isOfflineEntry && (
+            <>
+              <span aria-hidden="true" className="text-slate-500">·</span>
+              <span className="inline-flex items-center gap-1 text-emerald-400 font-semibold shrink-0">
+                <HardDrive className="w-3 h-3" />
+                <span>Offline</span>
+              </span>
+            </>
+          )}
+          {!isOfflineEntry && track.viewCount && (
             <>
               <span aria-hidden="true" className="text-slate-500">·</span>
               <span className="font-mono-tabular shrink-0 text-slate-300">{track.viewCount}</span>
@@ -536,6 +845,14 @@ export function TrackRow({
               <span className="shrink-0 text-slate-400">{timestampLabel}</span>
             </>
           )}
+          {hasResume && savedResume && (
+            <>
+              <span aria-hidden="true" className="text-slate-500">·</span>
+              <span className="font-mono-tabular font-semibold text-emerald-300 shrink-0">
+                Resume {formatSeconds(savedResume.positionSeconds)}
+              </span>
+            </>
+          )}
         </div>
       </button>
 
@@ -544,6 +861,17 @@ export function TrackRow({
       </span>
 
       <div className="flex items-center gap-0.5 shrink-0">
+        {hasResume && (
+          <button
+            type="button"
+            onClick={handleStartOver}
+            className="hidden sm:flex min-h-[40px] min-w-[38px] items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-white/5 transition-colors"
+            aria-label={`Restart ${track.title} from 0:00`}
+            title="Start Over (0:00)"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+          </button>
+        )}
         <button
           type="button"
           onClick={() => toggleFavourite(track)}
@@ -556,52 +884,70 @@ export function TrackRow({
         </button>
         <button
           type="button"
-          onClick={() => addToQueue(track)}
+          onClick={() => {
+            if (isOfflineEntry && matchedOffline) {
+              addToOfflineQueue(matchedOffline);
+            } else {
+              addToQueue(track);
+            }
+          }}
           className="min-h-[40px] min-w-[40px] hidden sm:flex items-center justify-center rounded-lg text-slate-400 hover:text-white hover:bg-white/5 transition-colors"
-          aria-label="Add to queue"
-          title="Add to queue"
+          aria-label={isOfflineEntry ? 'Add to offline queue' : 'Add to queue'}
+          title={isOfflineEntry ? 'Add to Offline Queue' : 'Add to queue'}
         >
           <ListPlus className="w-4 h-4" />
         </button>
-        <button
-          type="button"
-          disabled={isDownloading}
-          onClick={() => void saveOnlineTrack(track, true)}
-          className={`min-h-[40px] min-w-[38px] sm:min-w-[40px] px-1.5 flex items-center justify-center gap-1 rounded-lg transition-colors ${
-            isDownloading
-              ? 'bg-emerald-500/15 text-emerald-300'
-              : savedOffline
-                ? 'text-emerald-400 hover:bg-emerald-500/10'
-                : 'text-slate-400 hover:text-emerald-300 hover:bg-white/5'
-          }`}
-          aria-label={
-            isDownloading
-              ? `Downloading ${track.title} ${dlProgress?.percent ?? 0}%`
-              : savedOffline
-                ? `Saved in My Music — Download ${track.title} to Device`
-                : `Download ${track.title} to Device and My Music`
-          }
-          title={
-            isDownloading
-              ? `Downloading ${dlProgress?.percent ?? 0}%`
-              : savedOffline
-                ? 'Saved in My Music — Click to Download File to Device'
-                : 'Download to Device & My Music'
-          }
-        >
-          {isDownloading ? (
-            <>
-              <Loader2 className="w-3.5 h-3.5 text-emerald-400 animate-spin shrink-0" />
-              <span className="font-mono-tabular text-[11px] font-bold">
-                {dlProgress?.percent ?? 0}%
-              </span>
-            </>
-          ) : savedOffline ? (
-            <Check className="w-4 h-4" />
-          ) : (
+        {isOfflineEntry && matchedOffline ? (
+          <button
+            type="button"
+            onClick={() => void exportTrackToDevice(matchedOffline)}
+            className="min-h-[40px] min-w-[38px] sm:min-w-[40px] px-1.5 flex items-center justify-center rounded-lg text-emerald-400 hover:bg-emerald-500/10 transition-colors"
+            aria-label={`Save ${track.title} file to device Downloads`}
+            title="Save file to Device Downloads"
+          >
             <Download className="w-4 h-4" />
-          )}
-        </button>
+          </button>
+        ) : (
+          <button
+            type="button"
+            disabled={isDownloading}
+            onClick={() => void saveOnlineTrack(track, true)}
+            className={`min-h-[40px] min-w-[38px] sm:min-w-[40px] px-1.5 flex items-center justify-center gap-1 rounded-lg transition-colors ${
+              isDownloading
+                ? 'bg-emerald-500/15 text-emerald-300'
+                : savedOffline
+                  ? 'text-emerald-400 hover:bg-emerald-500/10'
+                  : 'text-slate-400 hover:text-emerald-300 hover:bg-white/5'
+            }`}
+            aria-label={
+              isDownloading
+                ? `Downloading ${track.title} ${dlProgress?.percent ?? 0}%`
+                : savedOffline
+                  ? `Saved in My Music — Download ${track.title} to Device`
+                  : `Download ${track.title} to Device and My Music`
+            }
+            title={
+              isDownloading
+                ? `Downloading ${dlProgress?.percent ?? 0}%`
+                : savedOffline
+                  ? 'Saved in My Music — Click to Download File to Device'
+                  : 'Download to Device & My Music'
+            }
+          >
+            {isDownloading ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 text-emerald-400 animate-spin shrink-0" />
+                <span className="font-mono-tabular text-[11px] font-bold">
+                  {dlProgress?.percent ?? 0}%
+                </span>
+              </>
+            ) : savedOffline ? (
+              <Check className="w-4 h-4" />
+            ) : (
+              <Download className="w-4 h-4" />
+            )}
+          </button>
+        )}
         <button
           type="button"
           onClick={() => onAddToPlaylist(track)}
@@ -628,6 +974,8 @@ export function TrackRow({
         <TrackActionMenu
           track={track}
           queueContext={queueContext}
+          matchedOffline={matchedOffline}
+          savedResume={savedResume}
           onAddToPlaylist={onAddToPlaylist}
           anchorEl={menuTriggerRef.current}
           isOpen={menuOpen}

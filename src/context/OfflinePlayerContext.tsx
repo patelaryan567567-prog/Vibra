@@ -8,6 +8,7 @@ import {
   startWebAudioKeepAlive,
   stopWebAudioKeepAlive,
 } from '../utils/backgroundAudio';
+import { formatSeconds } from '../utils/format';
 import { getAllOfflineTracks, getOfflineTrackBlob } from '../utils/offlineMusicDb';
 import { useLibrary } from './LibraryContext';
 
@@ -28,7 +29,7 @@ interface OfflinePlayerContextValue {
   isQueueOpen: boolean;
   isBackgroundPlay: boolean;
   playerError: string | null;
-  playOfflineTrack: (track: OfflineTrack, newQueue?: OfflineTrack[]) => void;
+  playOfflineTrack: (track: OfflineTrack, newQueue?: OfflineTrack[], startAtSeconds?: number) => void;
   addToOfflineQueue: (track: OfflineTrack) => void;
   playNextInOfflineQueue: (track: OfflineTrack) => void;
   removeFromOfflineQueue: (index: number) => void;
@@ -90,7 +91,6 @@ function pruneOfflineBlobCache(keepIds: Set<string>) {
 async function ensureOfflineBlobUrl(track: OfflineTrack, keepIds?: Set<string>): Promise<string | null> {
   const cached = offlineBlobUrlCache.get(track.id);
   if (cached) {
-    // Refresh LRU order
     offlineBlobUrlCache.delete(track.id);
     offlineBlobUrlCache.set(track.id, cached);
     return cached;
@@ -126,7 +126,14 @@ async function ensureOfflineBlobUrl(track: OfflineTrack, keepIds?: Set<string>):
 }
 
 export function OfflinePlayerProvider({ children }: { children: React.ReactNode }) {
-  const { showToast } = useLibrary();
+  const {
+    showToast,
+    recordOfflinePlayed,
+    recordListeningSeconds,
+    saveTrackPosition,
+    clearTrackPosition,
+    getTrackPosition,
+  } = useLibrary();
 
   const [queue, setQueue] = useState<OfflineTrack[]>([]);
   const [currentIndex, setCurrentIndex] = useState<number>(-1);
@@ -165,12 +172,14 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
   const nextShuffleCandidateRef = useRef<number>(-1);
   const lastMediaPosSyncRef = useRef<number>(0);
   const lastSessionSaveRef = useRef<number>(0);
+  const lastPosSaveRef = useRef<number>(0);
   const isYieldedToOnlineRef = useRef(false);
   const sessionRestoredRef = useRef(false);
 
   const queueRef = useRef(queue);
   const currentIndexRef = useRef(currentIndex);
   const currentTimeRef = useRef(currentTime);
+  const durationRef = useRef(duration);
   const repeatModeRef = useRef(repeatMode);
   const isShuffleRef = useRef(isShuffle);
   const isBackgroundPlayRef = useRef(isBackgroundPlay);
@@ -180,6 +189,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
   queueRef.current = queue;
   currentIndexRef.current = currentIndex;
   currentTimeRef.current = currentTime;
+  durationRef.current = duration;
   repeatModeRef.current = repeatMode;
   isShuffleRef.current = isShuffle;
   isBackgroundPlayRef.current = isBackgroundPlay;
@@ -187,6 +197,20 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
   isMutedRef.current = isMuted;
 
   const currentTrack = currentIndex >= 0 && currentIndex < queue.length ? queue[currentIndex] : null;
+
+  const persistCurrentTrackResume = useCallback(
+    (overrideSec?: number) => {
+      const curTrack = queueRef.current[currentIndexRef.current];
+      if (!curTrack) return;
+      const sec = overrideSec ?? currentTimeRef.current ?? 0;
+      const dur = durationRef.current || curTrack.durationSeconds || 0;
+      saveTrackPosition(curTrack.id, sec, dur);
+      if (curTrack.sourceVideoId) {
+        saveTrackPosition(curTrack.sourceVideoId, sec, dur);
+      }
+    },
+    [saveTrackPosition]
+  );
 
   const applyPendingSeek = useCallback((a: HTMLAudioElement) => {
     const targetSec = pendingSeekSecRef.current;
@@ -228,10 +252,8 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
 
       loadedAudioTrackIdRef.current = track.id;
       pendingSeekSecRef.current = resumeSec > 0.5 ? resumeSec : 0;
-      if (resumeSec > 0.5) {
-        currentTimeRef.current = resumeSec;
-        setCurrentTime(resumeSec);
-      }
+      currentTimeRef.current = resumeSec > 0.5 ? resumeSec : 0;
+      setCurrentTime(resumeSec > 0.5 ? resumeSec : 0);
 
       audio.muted = isMutedRef.current;
       audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
@@ -247,6 +269,12 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         audio.loop = false;
         if (audio.src !== cachedUrl) {
           audio.src = cachedUrl;
+        } else if (resumeSec <= 0.5) {
+          try {
+            audio.currentTime = 0;
+          } catch {
+            // ignore
+          }
         }
         if (audio.readyState >= 1 && pendingSeekSecRef.current > 0.5) {
           applyPendingSeek(audio);
@@ -272,9 +300,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         return;
       }
 
-      // CRITICAL: Even when document.hidden is true (screen is off!), NEVER leave <audio> idle/ended
-      // while waiting for IndexedDB to resolve the Blob. Keep <audio> actively looping the non-zero
-      // sub-audible WAV bridge so Android/iOS hardware AudioTrack never drops between songs!
+      // Keep <audio> actively looping the non-zero sub-audible WAV bridge while IndexedDB loads
       isSilentWarmupRef.current = true;
       const silentUrl = getSilentLoopBlobUrl();
       audio.loop = true;
@@ -396,11 +422,20 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
 
     if (q.length === 0) return;
 
-    const activeLoadKey = `${idx}:${q[idx]?.id ?? ''}`;
+    const finishedTrack = q[idx];
+    const activeLoadKey = `${idx}:${finishedTrack?.id ?? ''}`;
     if (rep !== 'one' && endedHandledForLoadRef.current === activeLoadKey) {
       return;
     }
     endedHandledForLoadRef.current = activeLoadKey;
+
+    // Clear saved resume position for the track that just completed naturally
+    if (finishedTrack) {
+      clearTrackPosition(finishedTrack.id);
+      if (finishedTrack.sourceVideoId) {
+        clearTrackPosition(finishedTrack.sourceVideoId);
+      }
+    }
 
     shouldPlayRef.current = true;
     userPausedRef.current = false;
@@ -427,15 +462,13 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       return;
     }
 
-    // Endless playback: even if repeatMode is 'off', wrap around to index 0 after the last track
-    // so background music never stops after 2-3 songs!
     const targetIdx = idx + 1 < q.length ? idx + 1 : 0;
     const nextItem = q[targetIdx];
     if (nextItem) {
       beginOfflineTrackAudio(nextItem, 0);
     }
     setCurrentIndex(targetIdx);
-  }, [beginOfflineTrackAudio, pickNextShuffleIndex]);
+  }, [beginOfflineTrackAudio, clearTrackPosition, pickNextShuffleIndex]);
 
   // Restore saved offline session on initial mount if user was last listening to My Music
   useEffect(() => {
@@ -469,24 +502,26 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
             0,
             Math.min(restoredQueue.length - 1, parsed.currentIndex ?? 0)
           );
-          const restoredTime = Math.max(0, parsed.currentTime ?? 0);
+          const restoredTrack = restoredQueue[restoredIdx];
+          const savedPos = getTrackPosition(restoredTrack.id);
+          const restoredTime = Math.max(0, parsed.currentTime ?? savedPos?.positionSeconds ?? 0);
 
           if (parsed.repeatMode) setRepeatMode(parsed.repeatMode);
           if (typeof parsed.isShuffle === 'boolean') setIsShuffle(parsed.isShuffle);
 
-          loadedTrackIdRef.current = restoredQueue[restoredIdx].id;
+          loadedTrackIdRef.current = restoredTrack.id;
+          loadedAudioTrackIdRef.current = restoredTrack.id;
           pendingSeekSecRef.current = restoredTime;
           currentTimeRef.current = restoredTime;
           setCurrentTime(restoredTime);
-          setDuration(restoredQueue[restoredIdx].durationSeconds || 0);
+          setDuration(restoredTrack.durationSeconds || 0);
           setQueue(restoredQueue);
           setCurrentIndex(restoredIdx);
 
-          // Pre-load the restored track's Blob URL so tapping Play (or auto-resume) is 0ms
-          const keepSet = new Set<string>([restoredQueue[restoredIdx].id]);
+          const keepSet = new Set<string>([restoredTrack.id]);
           const nextInQ = restoredQueue[(restoredIdx + 1) % restoredQueue.length];
           if (nextInQ) keepSet.add(nextInQ.id);
-          void ensureOfflineBlobUrl(restoredQueue[restoredIdx], keepSet).then((blobUrl) => {
+          void ensureOfflineBlobUrl(restoredTrack, keepSet).then((blobUrl) => {
             const audio = audioElRef.current;
             if (!audio || !blobUrl) return;
             if (!audio.getAttribute('src')) {
@@ -501,9 +536,11 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
                   .then(() => {
                     audioUnlockedRef.current = true;
                     setIsPlaying(true);
+                    if (pendingSeekSecRef.current > 0.5) {
+                      applyPendingSeek(audio);
+                    }
                   })
                   .catch(() => {
-                    // Browser requires a tap after hard reload; resume on first interaction
                     setIsPlaying(false);
                   });
               }
@@ -514,7 +551,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
     } catch {
       // ignore malformed storage
     }
-  }, []);
+  }, [applyPendingSeek, getTrackPosition]);
 
   // Persist offline session state so OS tab eviction/reload never loses the queue or song position
   const saveOfflineSession = useCallback(
@@ -545,7 +582,18 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
     saveOfflineSession();
   }, [queue, currentIndex, repeatMode, isShuffle, isPlaying, saveOfflineSession]);
 
-  // Sync & pre-warm ONLY the immediate next track (capped at 3 Blobs max in RAM to prevent OOM!)
+  // Track offline listening seconds cleanly (5s interval when audio is actively playing)
+  useEffect(() => {
+    if (!isPlaying || isYieldedToOnline) return;
+    const timer = window.setInterval(() => {
+      if (audioElRef.current && !audioElRef.current.paused && !isYieldedToOnlineRef.current) {
+        recordListeningSeconds(5);
+      }
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [isPlaying, isYieldedToOnline, recordListeningSeconds]);
+
+  // Sync & pre-warm ONLY the immediate next track + record offline song in Recently Played!
   useEffect(() => {
     if (!currentTrack) {
       loadedTrackIdRef.current = null;
@@ -564,16 +612,24 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       return;
     }
 
+    const alreadyStartedInGesture = loadedAudioTrackIdRef.current === currentTrack.id;
     loadedTrackIdRef.current = currentTrack.id;
     endedHandledForLoadRef.current = null;
-    pendingSeekSecRef.current = 0;
-    currentTimeRef.current = 0;
+
+    if (!alreadyStartedInGesture) {
+      pendingSeekSecRef.current = 0;
+      currentTimeRef.current = 0;
+      setCurrentTime(0);
+    }
+
     shouldPlayRef.current = true;
     userPausedRef.current = false;
     shuffleHistoryRef.current.add(currentTrack.id);
-    setCurrentTime(0);
     setDuration(currentTrack.durationSeconds || 0);
     setPlayerError(null);
+
+    // Record this offline song in Recently Played and Listening Stats!
+    recordOfflinePlayed(currentTrack);
 
     if (isBackgroundPlayRef.current) {
       startWebAudioKeepAlive();
@@ -589,7 +645,6 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         const idx = currentIndexRef.current;
         if (q.length === 0) return;
 
-        // Pre-pick next shuffle candidate if shuffle is on so we pre-warm the exact track that will play next
         let nextIdx = (idx + 1) % q.length;
         if (isShuffleRef.current && q.length > 1) {
           const unplayed: number[] = [];
@@ -612,7 +667,6 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         const keepIds = new Set<string>([currentTrack.id]);
         if (nextTrackItem) keepIds.add(nextTrackItem.id);
 
-        // Immediately revoke older track Blob URLs so background memory stays flat (~10 MB)
         pruneOfflineBlobCache(keepIds);
 
         await ensureOfflineBlobUrl(currentTrack, keepIds);
@@ -622,15 +676,15 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       })();
     }, 80);
 
-    if (loadedAudioTrackIdRef.current !== currentTrack.id) {
-      beginOfflineTrackAudio(currentTrack, 0);
+    if (!alreadyStartedInGesture) {
+      beginOfflineTrackAudio(currentTrack, pendingSeekSecRef.current);
     }
 
     return () => {
       cancelled = true;
       window.clearTimeout(prewarmTimer);
     };
-  }, [currentTrack, beginOfflineTrackAudio, stopAudio]);
+  }, [currentTrack, beginOfflineTrackAudio, recordOfflinePlayed, stopAudio]);
 
   // Background & Screen-Wake Continuity (handles both screen lock AND screen unlock/wake!)
   useEffect(() => {
@@ -649,7 +703,6 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       const a = audioElRef.current;
       if (!a) return;
 
-      // Check if track actually finished while screen was off/waking
       if (
         !isSilentWarmupRef.current &&
         (a.ended || (Number.isFinite(a.duration) && a.duration > 3 && a.currentTime >= a.duration - 0.25))
@@ -676,6 +729,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
     };
 
     const onVisibilityChange = () => {
+      persistCurrentTrackResume();
       saveOfflineSession();
       ensurePlaybackAlive();
     };
@@ -692,7 +746,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       window.removeEventListener('focus', onWindowFocusOrShow);
       window.removeEventListener('pageshow', onWindowFocusOrShow);
     };
-  }, [handleTrackEnd, saveOfflineSession]);
+  }, [handleTrackEnd, persistCurrentTrackResume, saveOfflineSession]);
 
   // Continuous 2-second watchdog timer: catches throttled `ended` events or involuntary OS pauses while screen is off
   useEffect(() => {
@@ -726,6 +780,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
   // Mutual exclusion with online PlayerContext
   useEffect(() => {
     const handlePauseFromOnline = () => {
+      persistCurrentTrackResume();
       isYieldedToOnlineRef.current = true;
       setIsYieldedToOnline(true);
       setIsExpanded(false);
@@ -746,10 +801,13 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
     return () => {
       window.removeEventListener('vibra:pause-offline-player', handlePauseFromOnline);
     };
-  }, []);
+  }, [persistCurrentTrackResume]);
 
   const playOfflineTrack = useCallback(
-    (track: OfflineTrack, newQueue?: OfflineTrack[]) => {
+    (track: OfflineTrack, newQueue?: OfflineTrack[], startAtSeconds?: number) => {
+      // Save previous track position before switching
+      persistCurrentTrackResume();
+
       window.dispatchEvent(new CustomEvent('vibra:pause-online-player'));
       isYieldedToOnlineRef.current = false;
       setIsYieldedToOnline(false);
@@ -763,7 +821,27 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         void acquirePlaybackWakeLock();
       }
 
-      beginOfflineTrackAudio(track, 0);
+      // Determine resume position: explicit startAtSeconds OR saved pause/stop position
+      let resumeSec = 0;
+      if (typeof startAtSeconds === 'number') {
+        resumeSec = Math.max(0, startAtSeconds);
+        if (resumeSec === 0) {
+          clearTrackPosition(track.id);
+          if (track.sourceVideoId) clearTrackPosition(track.sourceVideoId);
+        }
+      } else {
+        const saved =
+          getTrackPosition(track.id) ||
+          (track.sourceVideoId ? getTrackPosition(track.sourceVideoId) : null);
+        if (saved && saved.positionSeconds >= 3) {
+          resumeSec = saved.positionSeconds;
+          showToast(`Resuming "${track.title}" from ${formatSeconds(resumeSec)}`);
+        }
+      }
+
+      beginOfflineTrackAudio(track, resumeSec);
+      // Record in Recently Played even if re-playing the same track id
+      recordOfflinePlayed(track);
 
       if (newQueue && newQueue.length > 0) {
         const idx = newQueue.findIndex((t) => t.id === track.id);
@@ -787,7 +865,14 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         });
       }
     },
-    [beginOfflineTrackAudio]
+    [
+      beginOfflineTrackAudio,
+      clearTrackPosition,
+      getTrackPosition,
+      persistCurrentTrackResume,
+      recordOfflinePlayed,
+      showToast,
+    ]
   );
 
   const addToOfflineQueue = useCallback(
@@ -834,6 +919,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         if (index < 0 || index >= prev.length) return prev;
         const next = prev.filter((_, i) => i !== index);
         if (next.length === 0) {
+          persistCurrentTrackResume();
           shouldPlayRef.current = false;
           userPausedRef.current = true;
           stopAudio();
@@ -850,7 +936,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         return next;
       });
     },
-    [stopAudio]
+    [persistCurrentTrackResume, stopAudio]
   );
 
   const moveOfflineQueueItem = useCallback((fromIndex: number, toIndex: number) => {
@@ -915,6 +1001,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       void releasePlaybackWakeLock();
       audio.pause();
       setIsPlaying(false);
+      persistCurrentTrackResume(currentTime);
       saveOfflineSession(currentTime, false);
     } else {
       window.dispatchEvent(new CustomEvent('vibra:pause-online-player'));
@@ -928,21 +1015,36 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         pokeBackgroundKeepAlive();
         void acquirePlaybackWakeLock();
       }
+      const savedPos = getTrackPosition(currentTrack.id)?.positionSeconds ?? 0;
+      const effectiveResume = currentTime > 0.5 ? currentTime : savedPos;
       if (!audio.getAttribute('src') || audio.src.startsWith('data:')) {
-        beginOfflineTrackAudio(currentTrack, currentTime);
+        beginOfflineTrackAudio(currentTrack, effectiveResume);
       } else {
+        if (effectiveResume > 0.5 && Math.abs((audio.currentTime || 0) - effectiveResume) > 2) {
+          pendingSeekSecRef.current = effectiveResume;
+          applyPendingSeek(audio);
+        }
         void audio.play().catch(() => {
-          beginOfflineTrackAudio(currentTrack, currentTime);
+          beginOfflineTrackAudio(currentTrack, effectiveResume);
         });
       }
-      saveOfflineSession(currentTime, true);
+      saveOfflineSession(effectiveResume, true);
     }
-  }, [beginOfflineTrackAudio, currentTime, currentTrack, saveOfflineSession]);
+  }, [
+    applyPendingSeek,
+    beginOfflineTrackAudio,
+    currentTime,
+    currentTrack,
+    getTrackPosition,
+    persistCurrentTrackResume,
+    saveOfflineSession,
+  ]);
 
   const nextTrack = useCallback(() => {
     const q = queueRef.current;
     const idx = currentIndexRef.current;
     if (q.length === 0) return;
+    persistCurrentTrackResume();
     window.dispatchEvent(new CustomEvent('vibra:pause-online-player'));
     isYieldedToOnlineRef.current = false;
     setIsYieldedToOnline(false);
@@ -963,7 +1065,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
     const targetIdx = idx + 1 < q.length ? idx + 1 : 0;
     if (q[targetIdx]) beginOfflineTrackAudio(q[targetIdx], 0);
     setCurrentIndex(targetIdx);
-  }, [beginOfflineTrackAudio, pickNextShuffleIndex]);
+  }, [beginOfflineTrackAudio, persistCurrentTrackResume, pickNextShuffleIndex]);
 
   const prevTrack = useCallback(() => {
     const q = queueRef.current;
@@ -983,25 +1085,31 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
     if (currentTime > 4 && audioElRef.current && !isSilentWarmupRef.current) {
       audioElRef.current.currentTime = 0;
       setCurrentTime(0);
+      if (q[idx]) clearTrackPosition(q[idx].id);
       return;
     }
+    persistCurrentTrackResume();
     const targetIdx = idx - 1 >= 0 ? idx - 1 : q.length - 1;
     if (q[targetIdx]) beginOfflineTrackAudio(q[targetIdx], 0);
     setCurrentIndex(targetIdx);
-  }, [beginOfflineTrackAudio, currentTime]);
+  }, [beginOfflineTrackAudio, clearTrackPosition, currentTime, persistCurrentTrackResume]);
 
-  const seekTo = useCallback((seconds: number) => {
-    currentTimeRef.current = seconds;
-    setCurrentTime(seconds);
-    const a = audioElRef.current;
-    if (!a) return;
-    if (isSilentWarmupRef.current || !Number.isFinite(a.duration) || a.duration <= 3) {
-      pendingSeekSecRef.current = seconds;
-    } else {
-      pendingSeekSecRef.current = 0;
-      a.currentTime = seconds;
-    }
-  }, []);
+  const seekTo = useCallback(
+    (seconds: number) => {
+      currentTimeRef.current = seconds;
+      setCurrentTime(seconds);
+      persistCurrentTrackResume(seconds);
+      const a = audioElRef.current;
+      if (!a) return;
+      if (isSilentWarmupRef.current || !Number.isFinite(a.duration) || a.duration <= 3) {
+        pendingSeekSecRef.current = seconds;
+      } else {
+        pendingSeekSecRef.current = 0;
+        a.currentTime = seconds;
+      }
+    },
+    [persistCurrentTrackResume]
+  );
 
   const setVolume = useCallback(
     (vol: number) => {
@@ -1062,6 +1170,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
   const jumpToOfflineQueueIndex = useCallback(
     (index: number) => {
       if (index >= 0 && index < queueRef.current.length) {
+        persistCurrentTrackResume();
         window.dispatchEvent(new CustomEvent('vibra:pause-online-player'));
         isYieldedToOnlineRef.current = false;
         setIsYieldedToOnline(false);
@@ -1074,11 +1183,14 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
           void acquirePlaybackWakeLock();
         }
         const target = queueRef.current[index];
-        if (target) beginOfflineTrackAudio(target, 0);
+        if (target) {
+          const saved = getTrackPosition(target.id);
+          beginOfflineTrackAudio(target, saved?.positionSeconds ?? 0);
+        }
         setCurrentIndex(index);
       }
     },
-    [beginOfflineTrackAudio]
+    [beginOfflineTrackAudio, getTrackPosition, persistCurrentTrackResume]
   );
 
   const nextTrackRef = useRef(nextTrack);
@@ -1126,6 +1238,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       navigator.mediaSession.setActionHandler('pause', () => {
         userPausedRef.current = true;
         shouldPlayRef.current = false;
+        persistCurrentTrackResume();
         stopWebAudioKeepAlive();
         void releasePlaybackWakeLock();
         audioElRef.current?.pause();
@@ -1152,7 +1265,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
     } catch {
       // ignore unsupported MediaSession
     }
-  }, [currentTrack, isPlaying, isBackgroundPlay, isYieldedToOnline, seekTo]);
+  }, [currentTrack, isPlaying, isBackgroundPlay, isYieldedToOnline, persistCurrentTrackResume, seekTo]);
 
   return (
     <OfflinePlayerContext.Provider
@@ -1221,9 +1334,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
           const a = audioElRef.current;
           if (!a || a.src.startsWith('data:')) return;
           if (!a.ended) {
-            // Whenever shouldPlayRef is true and userPausedRef is false, ANY pause event
-            // (whether in background for 20 minutes OR when waking/unlocking the screen!)
-            // is an involuntary OS interruption and must be auto-resumed immediately.
+            persistCurrentTrackResume(a.currentTime);
             if (
               !isYieldedToOnlineRef.current &&
               isBackgroundPlayRef.current &&
@@ -1272,6 +1383,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
           const a = e.currentTarget;
           const dur = a.duration;
           if (Number.isFinite(dur) && dur > 3) {
+            durationRef.current = dur;
             setDuration(dur);
             if (pendingSeekSecRef.current > 0.5) {
               applyPendingSeek(a);
@@ -1294,6 +1406,10 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
           }
 
           const now = Date.now();
+          if (now - lastPosSaveRef.current > 2000) {
+            lastPosSaveRef.current = now;
+            persistCurrentTrackResume(cur);
+          }
           if (now - lastSessionSaveRef.current > 5000) {
             lastSessionSaveRef.current = now;
             saveOfflineSession(cur);
