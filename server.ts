@@ -2,7 +2,9 @@ import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gzip } from 'node:zlib';
 import {
+  getArtistProfile,
   getCategoryTracks,
   getRelatedTracks,
   getSearchSuggestions,
@@ -14,17 +16,21 @@ import {
   YouTubeApiError,
 } from './server/youtube.ts';
 import {
+  enhanceLyricsWithAi,
   GeminiApiError,
   generateMoodDiscoveryPlan,
   getGeminiKeyStatus,
   hasConfiguredGeminiKeys,
 } from './server/gemini.ts';
+import { fetchTrackLyrics } from './server/lyrics.ts';
 import {
   type AudioSourceProvider,
+  prewarmAudioStreamsBatch,
   proxyAudioStream,
   proxyDirectAudioUrl,
   resolveBackgroundAudioStream,
   searchMultiSourceTracks,
+  warmAudioResolverStartup,
 } from './server/audioResolver.ts';
 import type {
   AiDiscoveryResponse,
@@ -94,6 +100,7 @@ async function startServer() {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
+  warmAudioResolverStartup();
 
   // Safe baseline security headers (iframe-compatible)
   app.use((_req, res, next) => {
@@ -103,7 +110,37 @@ async function startServer() {
     next();
   });
 
-  app.use(express.json({ limit: '16kb' }));
+  // Lightweight gzip compression for JSON API payloads > 1 KB
+  app.use('/api', (req, res, next) => {
+    const acceptEnc = String(req.headers['accept-encoding'] || '');
+    if (!acceptEnc.includes('gzip')) {
+      next();
+      return;
+    }
+    const origJson = res.json.bind(res);
+    res.json = ((body: unknown) => {
+      if (res.headersSent) return origJson(body);
+      const raw = JSON.stringify(body);
+      if (typeof raw !== 'string' || raw.length < 1024) {
+        return origJson(body);
+      }
+      gzip(Buffer.from(raw, 'utf8'), (err, compressed) => {
+        if (err || res.headersSent) {
+          origJson(body);
+          return;
+        }
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Content-Encoding', 'gzip');
+        res.setHeader('Vary', 'Accept-Encoding');
+        res.setHeader('Content-Length', String(compressed.length));
+        res.send(compressed);
+      });
+      return res;
+    }) as typeof res.json;
+    next();
+  });
+
+  app.use(express.json({ limit: '64kb' }));
 
   // Range-capable audio stream & attachment download proxy
   app.get('/api/audio/stream', async (req, res) => {
@@ -125,7 +162,7 @@ async function startServer() {
     await proxyDirectAudioUrl(req, res, rawUrl);
   });
 
-  const generalApiLimiter = createRateLimiter(60_000, 120);
+  const generalApiLimiter = createRateLimiter(60_000, 240);
   const aiApiLimiter = createRateLimiter(60_000, 20);
   app.use('/api', generalApiLimiter);
 
@@ -174,6 +211,33 @@ async function startServer() {
       res.json(resolved);
     } catch {
       res.json({ mode: 'youtube' });
+    }
+  });
+
+  // Batch pre-warm audio stream URLs for visible/upcoming tracks so clicking Play starts near-instantly
+  app.post('/api/audio/prewarm', async (req, res) => {
+    try {
+      const rawTracks = Array.isArray(req.body?.tracks) ? req.body.tracks : [];
+      const sanitized: Array<{ videoId: string; title: string; artist?: string; durationSeconds?: number }> = [];
+      for (const item of rawTracks.slice(0, 8)) {
+        if (!item || typeof item !== 'object') continue;
+        const videoId = typeof item.videoId === 'string' ? item.videoId.trim() : '';
+        const title = typeof item.title === 'string' ? item.title.trim().slice(0, 180) : '';
+        const artist = typeof item.artist === 'string' ? item.artist.trim().slice(0, 120) : '';
+        const durRaw = Number(item.durationSeconds);
+        const durationSeconds = Number.isFinite(durRaw) && durRaw > 0 ? durRaw : 0;
+        if (AUDIO_STREAM_ID_RE.test(videoId) && title) {
+          sanitized.push({ videoId, title, artist, durationSeconds });
+        }
+      }
+      if (sanitized.length === 0) {
+        res.json({ results: {} });
+        return;
+      }
+      const results = await prewarmAudioStreamsBatch(sanitized);
+      res.json({ results });
+    } catch {
+      res.json({ results: {} });
     }
   });
 
@@ -315,6 +379,117 @@ async function startServer() {
       res.status(500).json({
         error: 'INTERNAL_ERROR',
         message: err instanceof Error ? err.message : 'Failed to load related tracks.',
+      });
+    }
+  });
+
+  // Artist / Channel Profile endpoint
+  app.get('/api/youtube/artist', async (req, res) => {
+    try {
+      const artist = typeof req.query.artist === 'string' ? req.query.artist.trim().slice(0, 100) : '';
+      const seedVideoId =
+        typeof req.query.seedVideoId === 'string' && AUDIO_STREAM_ID_RE.test(req.query.seedVideoId.trim())
+          ? req.query.seedVideoId.trim()
+          : undefined;
+      if (!artist) {
+        res.status(400).json({ error: 'MISSING_ARTIST', message: 'Artist name is required.' });
+        return;
+      }
+      const profile = await getArtistProfile(artist, seedVideoId);
+      res.json(profile);
+    } catch (err) {
+      if (err instanceof YouTubeApiError) {
+        res.status(err.status).json({ error: err.code, message: err.message });
+        return;
+      }
+      res.status(500).json({
+        error: 'INTERNAL_ERROR',
+        message: err instanceof Error ? err.message : 'Failed to load artist profile.',
+      });
+    }
+  });
+
+  // Synced & Plain Lyrics endpoint (LRCLIB + Lyrics.ovh + Web/Gemini AI)
+  app.get('/api/lyrics', async (req, res) => {
+    try {
+      const title = typeof req.query.title === 'string' ? req.query.title.trim().slice(0, 180) : '';
+      const artist = typeof req.query.artist === 'string' ? req.query.artist.trim().slice(0, 120) : '';
+      const durationRaw = Number(req.query.duration);
+      const durationSeconds = Number.isFinite(durationRaw) && durationRaw > 0 ? durationRaw : 0;
+      const forceAi = req.query.ai === '1';
+
+      if (!title) {
+        res.json({ found: false, syncedLines: [], plainLyrics: null });
+        return;
+      }
+      const lyrics = await fetchTrackLyrics({ title, artist, durationSeconds, forceAi });
+      res.json(lyrics);
+    } catch {
+      res.json({ found: false, syncedLines: [], plainLyrics: null });
+    }
+  });
+
+  // Gemini AI Lyrics Formatter / Hinglish Transliteration / Finder
+  app.post('/api/lyrics/enhance', aiApiLimiter, async (req, res) => {
+    try {
+      const title = typeof req.body?.title === 'string' ? req.body.title.trim().slice(0, 180) : '';
+      const artist = typeof req.body?.artist === 'string' ? req.body.artist.trim().slice(0, 120) : '';
+      const rawLyrics = typeof req.body?.rawLyrics === 'string' ? req.body.rawLyrics.slice(0, 9000) : null;
+      const rawMode = req.body?.mode;
+      const mode: 'polish' | 'hinglish' | 'find' =
+        rawMode === 'hinglish' || rawMode === 'find' ? rawMode : 'polish';
+
+      const inputSynced: Array<{ timeSeconds: number; text: string }> = Array.isArray(req.body?.syncedLines)
+        ? req.body.syncedLines
+            .filter(
+              (l: unknown): l is { timeSeconds: number; text: string } =>
+                Boolean(l) &&
+                typeof l === 'object' &&
+                typeof (l as { timeSeconds?: unknown }).timeSeconds === 'number' &&
+                typeof (l as { text?: unknown }).text === 'string'
+            )
+            .slice(0, 160)
+        : [];
+
+      if (!title) {
+        res.status(400).json({ error: 'MISSING_TITLE', message: 'Song title is required.' });
+        return;
+      }
+
+      const aiRes = await enhanceLyricsWithAi({
+        title,
+        artist,
+        rawLyrics,
+        syncedTexts: inputSynced.map((l) => l.text),
+        mode,
+      });
+
+      const rebuiltSynced =
+        aiRes.cleanedSyncedTexts && aiRes.cleanedSyncedTexts.length === inputSynced.length
+          ? inputSynced.map((orig, idx) => ({
+              timeSeconds: orig.timeSeconds,
+              text: aiRes.cleanedSyncedTexts![idx],
+            }))
+          : [];
+
+      res.json({
+        found: aiRes.found,
+        trackName: title,
+        artistName: artist || undefined,
+        syncedLines: rebuiltSynced,
+        plainLyrics: aiRes.plainLyrics,
+        source: aiRes.source,
+        aiEnhanced: true,
+        mode,
+      });
+    } catch (err) {
+      if (err instanceof GeminiApiError) {
+        res.status(err.status).json({ error: err.code, message: err.message });
+        return;
+      }
+      res.status(500).json({
+        error: 'LYRICS_AI_ERROR',
+        message: err instanceof Error ? err.message : 'Unable to enhance lyrics with AI.',
       });
     }
   });

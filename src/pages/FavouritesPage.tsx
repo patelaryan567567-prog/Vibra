@@ -1,7 +1,8 @@
 import React, { useMemo, useState } from 'react';
-import { Heart, Play, Search, Shuffle } from 'lucide-react';
+import { Check, Download, Heart, Loader2, Play, Search, Shuffle } from 'lucide-react';
 import { TrackRow } from '../components/TrackCard';
 import { useLibrary } from '../context/LibraryContext';
+import { useOfflineMusic } from '../context/OfflineMusicContext';
 import { usePlayer } from '../context/PlayerContext';
 import type { NavTab, Track } from '../types/music';
 
@@ -13,6 +14,12 @@ interface FavouritesPageProps {
 export function FavouritesPage({ onAddToPlaylist, onNavigate }: FavouritesPageProps) {
   const { favourites } = useLibrary();
   const { playTrack } = usePlayer();
+  const {
+    offlineTracks,
+    batchDownloadTracks,
+    isBatchDownloading,
+    batchDownloadState,
+  } = useOfflineMusic();
   const [filterText, setFilterText] = useState('');
 
   const filtered = useMemo(() => {
@@ -22,6 +29,17 @@ export function FavouritesPage({ onAddToPlaylist, onNavigate }: FavouritesPagePr
       (t) => t.title.toLowerCase().includes(q) || t.artist.toLowerCase().includes(q)
     );
   }, [favourites, filterText]);
+
+  const downloadableTracks = useMemo(
+    () => filtered.filter((t) => !t.isOffline),
+    [filtered]
+  );
+
+  const allDownloaded =
+    downloadableTracks.length > 0 &&
+    downloadableTracks.every((t) =>
+      offlineTracks.some((o) => o.id === t.id || o.sourceVideoId === t.id)
+    );
 
   const handleShuffle = () => {
     if (filtered.length === 0) return;
@@ -40,7 +58,7 @@ export function FavouritesPage({ onAddToPlaylist, onNavigate }: FavouritesPagePr
         </div>
 
         {filtered.length > 0 && (
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={() => playTrack(filtered[0], filtered)}
@@ -57,6 +75,37 @@ export function FavouritesPage({ onAddToPlaylist, onNavigate }: FavouritesPagePr
               <Shuffle className="w-4 h-4" />
               <span>Shuffle</span>
             </button>
+            {downloadableTracks.length > 0 && (
+              <button
+                type="button"
+                disabled={isBatchDownloading || allDownloaded}
+                onClick={() => void batchDownloadTracks(downloadableTracks, 'Favourites', false)}
+                className={`h-10 px-4 rounded-xl text-xs font-semibold inline-flex items-center gap-2 whitespace-nowrap transition-colors ${
+                  allDownloaded
+                    ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                    : 'bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white'
+                }`}
+              >
+                {isBatchDownloading && batchDownloadState?.label === 'Favourites' ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span className="font-mono-tabular">
+                      Downloading {batchDownloadState.completed}/{batchDownloadState.total}
+                    </span>
+                  </>
+                ) : allDownloaded ? (
+                  <>
+                    <Check className="w-4 h-4" />
+                    <span>All Saved</span>
+                  </>
+                ) : (
+                  <>
+                    <Download className="w-4 h-4" />
+                    <span>Download All ({downloadableTracks.length})</span>
+                  </>
+                )}
+              </button>
+            )}
           </div>
         )}
       </div>

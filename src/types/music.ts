@@ -2,7 +2,7 @@ export type CategoryId = 'trending' | 'energetic' | 'sad' | 'discover';
 
 export type IndiaLanguageFilter = 'all' | 'hindi' | 'punjabi' | 'mix' | 'english';
 
-export type NavTab = 'home' | 'explore' | 'search' | 'library' | 'favourites';
+export type NavTab = 'home' | 'explore' | 'search' | 'library' | 'favourites' | 'artist';
 
 export type RepeatMode = 'off' | 'all' | 'one';
 
@@ -126,6 +126,15 @@ export interface DownloadProgressItem {
   phase: 'resolving' | 'downloading' | 'saving' | 'done';
 }
 
+export interface BatchDownloadState {
+  label: string;
+  total: number;
+  completed: number;
+  skipped: number;
+  failed: number;
+  currentTitle: string;
+}
+
 export type AudioSourceProvider = 'jiosaavn' | 'soundcloud' | 'audius' | 'archive';
 
 export interface MultiSourceTrack {
@@ -138,4 +147,46 @@ export interface MultiSourceTrack {
   thumbnailHigh: string;
   provider: AudioSourceProvider;
   sourceLabel: string;
+}
+
+export interface LyricLine {
+  timeSeconds: number;
+  text: string;
+}
+
+export type LyricsEnhanceMode = 'polish' | 'hinglish' | 'find';
+
+export interface LyricsResponse {
+  found: boolean;
+  trackName?: string;
+  artistName?: string;
+  albumName?: string;
+  syncedLines: LyricLine[];
+  plainLyrics: string | null;
+  source?: string;
+  aiEnhanced?: boolean;
+  mode?: string;
+}
+
+export interface ArtistProfileResponse {
+  artistName: string;
+  avatarUrl?: string;
+  subscriberCount?: string;
+  channelTitle?: string;
+  topTracks: Track[];
+  musicVideos: Track[];
+  relatedArtists: string[];
+}
+
+export interface LibraryBackupPayload {
+  version: 1;
+  app: 'VIBRA';
+  exportedAt: number;
+  favourites: Track[];
+  playlists: Playlist[];
+  recentlyPlayed: RecentlyPlayedItem[];
+  searchHistory: SearchHistoryItem[];
+  listeningStats: ListeningStats;
+  trackPositions: Record<string, TrackResumeInfo>;
+  offlinePlaylists?: OfflinePlaylist[];
 }

@@ -15,11 +15,14 @@ import {
   Radio,
   RotateCcw,
   Tv,
+  User,
 } from 'lucide-react';
+import { useArtistNavigation } from '../context/ArtistNavigationContext';
 import { useLibrary } from '../context/LibraryContext';
 import { useOfflineMusic } from '../context/OfflineMusicContext';
 import { useOfflinePlayer } from '../context/OfflinePlayerContext';
 import { usePlayer } from '../context/PlayerContext';
+import { prewarmTrackAudio } from '../services/api';
 import type { OfflineTrack, Track, TrackResumeInfo } from '../types/music';
 import { formatSeconds } from '../utils/format';
 
@@ -46,6 +49,7 @@ function TrackActionMenu({
 }: TrackActionMenuProps) {
   const { playTrack, startTrackRadio, addToQueue, playNextInQueue } = usePlayer();
   const { playOfflineTrack, addToOfflineQueue, playNextInOfflineQueue } = useOfflinePlayer();
+  const { openArtistPage } = useArtistNavigation();
   const {
     saveOnlineTrack,
     exportTrackToDevice,
@@ -287,6 +291,21 @@ function TrackActionMenu({
         <span>Add to Playlist</span>
       </button>
 
+      {track.artist && (
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => {
+            openArtistPage(track.artist, isOfflineEntry ? undefined : track);
+            onClose();
+          }}
+          className="w-full min-h-[40px] px-3.5 py-2 flex items-center gap-2.5 text-slate-100 hover:bg-white/[0.07] text-left transition-colors"
+        >
+          <User className="w-4 h-4 text-[#7A90FF] shrink-0" />
+          <span>View Artist</span>
+        </button>
+      )}
+
       <div className="my-1 border-t border-white/[0.07]" />
 
       {isOfflineEntry && matchedOffline ? (
@@ -359,7 +378,7 @@ interface TrackCardProps {
   timestampLabel?: string;
 }
 
-export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel }: TrackCardProps) {
+export const TrackCard = React.memo(function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel }: TrackCardProps) {
   const { currentTrack, isPlaying, playTrack, togglePlay } = usePlayer();
   const {
     currentTrack: currentOfflineTrack,
@@ -369,6 +388,7 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
   } = useOfflinePlayer();
   const { isFavourite, toggleFavourite, trackPositions, showToast } = useLibrary();
   const { offlineTracks, downloadProgressMap } = useOfflineMusic();
+  const { openArtistPage } = useArtistNavigation();
   const [menuOpen, setMenuOpen] = useState(false);
   const [imgError, setImgError] = useState(false);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
@@ -447,7 +467,15 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
   };
 
   return (
-    <article className="group relative flex flex-col rounded-xl bg-[#11131A] border border-white/[0.07] hover:border-white/[0.15] hover:bg-[#161923] transition-colors p-3">
+    <article
+      onMouseEnter={() => {
+        if (!isOfflineEntry) prewarmTrackAudio(track);
+      }}
+      onTouchStart={() => {
+        if (!isOfflineEntry) prewarmTrackAudio(track);
+      }}
+      className="group relative flex flex-col rounded-xl bg-[#11131A] border border-white/[0.07] hover:border-white/[0.15] hover:bg-[#161923] transition-colors p-3"
+    >
       {/* Artwork / Thumbnail */}
       <div className="relative aspect-video w-full rounded-lg overflow-hidden bg-[#181B26] mb-3">
         {!imgError ? (
@@ -528,24 +556,32 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
 
       {/* Title & Clean Unboxed Metadata */}
       <div className="flex items-start justify-between gap-2 min-w-0">
-        <button
-          type="button"
-          onClick={handlePrimaryPlay}
-          className="text-left min-w-0 flex-1 focus:outline-none"
-        >
-          <h3
-            className={`text-sm sm:text-[15px] font-semibold leading-snug line-clamp-2 break-words ${
-              isCurrent
-                ? isActiveOffline
-                  ? 'text-emerald-300'
-                  : 'text-[#8CA2FF]'
-                : 'text-white group-hover:text-white'
-            }`}
+        <div className="min-w-0 flex-1">
+          <button
+            type="button"
+            onClick={handlePrimaryPlay}
+            className="w-full text-left focus:outline-none"
           >
-            {track.title}
-          </h3>
+            <h3
+              className={`text-sm sm:text-[15px] font-semibold leading-snug line-clamp-2 break-words ${
+                isCurrent
+                  ? isActiveOffline
+                    ? 'text-emerald-300'
+                    : 'text-[#8CA2FF]'
+                  : 'text-white group-hover:text-white'
+              }`}
+            >
+              {track.title}
+            </h3>
+          </button>
           <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs sm:text-[13px] font-medium text-slate-300">
-            <span className="line-clamp-1 break-words">{track.artist}</span>
+            <button
+              type="button"
+              onClick={() => openArtistPage(track.artist, isOfflineEntry ? undefined : track)}
+              className="text-left hover:text-white hover:underline line-clamp-1 break-words transition-colors"
+            >
+              {track.artist}
+            </button>
             {track.viewCount && (
               <>
                 <span aria-hidden="true" className="text-slate-500">·</span>
@@ -565,7 +601,7 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
               </>
             )}
           </div>
-        </button>
+        </div>
 
         {/* Quick actions */}
         <div className="flex items-center shrink-0 -mr-1.5">
@@ -642,7 +678,7 @@ export function TrackCard({ track, queueContext, onAddToPlaylist, timestampLabel
       )}
     </article>
   );
-}
+});
 
 interface TrackRowProps {
   track: Track;
@@ -653,7 +689,7 @@ interface TrackRowProps {
   timestampLabel?: string;
 }
 
-export function TrackRow({
+export const TrackRow = React.memo(function TrackRow({
   track,
   index,
   queueContext,
@@ -670,6 +706,7 @@ export function TrackRow({
     addToOfflineQueue,
   } = useOfflinePlayer();
   const { isFavourite, toggleFavourite, trackPositions, showToast } = useLibrary();
+  const { openArtistPage } = useArtistNavigation();
   const {
     offlineTracks,
     saveOnlineTrack,
@@ -755,6 +792,12 @@ export function TrackRow({
 
   return (
     <div
+      onMouseEnter={() => {
+        if (!isOfflineEntry) prewarmTrackAudio(track);
+      }}
+      onTouchStart={() => {
+        if (!isOfflineEntry) prewarmTrackAudio(track);
+      }}
       className={`group flex items-center gap-2.5 sm:gap-3 px-3 py-2.5 rounded-xl border transition-colors ${
         isCurrent
           ? isActiveOffline
@@ -810,20 +853,28 @@ export function TrackRow({
         )}
       </button>
 
-      <button type="button" onClick={handlePlay} className="min-w-0 flex-1 text-left">
-        <p
-          className={`text-[13px] sm:text-[15px] font-semibold line-clamp-2 break-words leading-snug ${
-            isCurrent
-              ? isActiveOffline
-                ? 'text-emerald-300'
-                : 'text-[#8CA2FF]'
-              : 'text-white'
-          }`}
-        >
-          {track.title}
-        </p>
+      <div className="min-w-0 flex-1">
+        <button type="button" onClick={handlePlay} className="w-full text-left focus:outline-none">
+          <p
+            className={`text-[13px] sm:text-[15px] font-semibold line-clamp-2 break-words leading-snug ${
+              isCurrent
+                ? isActiveOffline
+                  ? 'text-emerald-300'
+                  : 'text-[#8CA2FF]'
+                : 'text-white'
+            }`}
+          >
+            {track.title}
+          </p>
+        </button>
         <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs sm:text-[13px] font-medium text-slate-300 mt-0.5">
-          <span className="line-clamp-1 break-words">{track.artist}</span>
+          <button
+            type="button"
+            onClick={() => openArtistPage(track.artist, isOfflineEntry ? undefined : track)}
+            className="text-left hover:text-white hover:underline line-clamp-1 break-words transition-colors"
+          >
+            {track.artist}
+          </button>
           {isOfflineEntry && (
             <>
               <span aria-hidden="true" className="text-slate-500">·</span>
@@ -854,7 +905,7 @@ export function TrackRow({
             </>
           )}
         </div>
-      </button>
+      </div>
 
       <span className="hidden sm:inline-block font-mono-tabular text-xs text-slate-400 px-2 shrink-0">
         {track.duration}
@@ -985,7 +1036,7 @@ export function TrackRow({
       </div>
     </div>
   );
-}
+});
 
 export function TrackCardSkeleton() {
   return (

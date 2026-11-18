@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Archive,
   BarChart3,
   Check,
   Clock,
@@ -29,7 +30,10 @@ import {
   User,
   WifiOff,
 } from 'lucide-react';
+import { BackupRestoreModal } from '../components/BackupRestoreModal';
 import { TrackRow } from '../components/TrackCard';
+import { useArtistNavigation } from '../context/ArtistNavigationContext';
+import { useConfirm } from '../context/ConfirmContext';
 import { useLibrary } from '../context/LibraryContext';
 import { useOfflineMusic } from '../context/OfflineMusicContext';
 import { useOfflinePlayer } from '../context/OfflinePlayerContext';
@@ -73,6 +77,7 @@ export function LibraryPage({
   requestedSection,
   onConsumeRequestedSection,
 }: LibraryPageProps) {
+  const confirm = useConfirm();
   const {
     playlists,
     recentlyPlayed,
@@ -89,6 +94,7 @@ export function LibraryPage({
     clearSearchHistory,
   } = useLibrary();
   const { playTrack } = usePlayer();
+  const { openArtistPage } = useArtistNavigation();
   const {
     offlineTracks,
     offlinePlaylists,
@@ -115,6 +121,9 @@ export function LibraryPage({
     renameOfflinePlaylist,
     deleteOfflinePlaylist,
     removeTrackFromOfflinePlaylist,
+    batchDownloadState,
+    isBatchDownloading,
+    batchDownloadTracks,
   } = useOfflineMusic();
   const {
     currentTrack: activeOfflineTrack,
@@ -156,6 +165,7 @@ export function LibraryPage({
 
   const [editingPlaylistId, setEditingPlaylistId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
+  const [isBackupModalOpen, setIsBackupModalOpen] = useState(false);
 
   useEffect(() => {
     if (requestedSection) {
@@ -316,48 +326,58 @@ export function LibraryPage({
           </p>
         </div>
 
-        {sectionTab === 'mymusic' ? (
-          <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
-            <button
-              type="button"
-              onClick={() => void handleAllowStorageAndScan()}
-              disabled={isScanning}
-              className="h-10 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white text-xs font-semibold inline-flex items-center gap-2 whitespace-nowrap transition-colors"
-            >
-              {isScanning ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <FolderOpen className="w-4 h-4" />
-              )}
-              <span>{storageGranted ? 'Add More Music' : 'Allow Storage & Scan'}</span>
-            </button>
-            {offlineTracks.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+          {sectionTab === 'mymusic' ? (
+            <>
               <button
                 type="button"
-                onClick={() => {
-                  setMyMusicView('playlists');
-                  setShowOfflinePlaylistBuilder((v) => !v);
-                }}
-                className="h-10 px-4 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-xs font-semibold inline-flex items-center gap-2 whitespace-nowrap transition-colors"
+                onClick={() => void handleAllowStorageAndScan()}
+                disabled={isScanning}
+                className="h-10 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white text-xs font-semibold inline-flex items-center gap-2 whitespace-nowrap transition-colors"
               >
-                <Plus className="w-4 h-4" />
-                <span>Offline Playlist</span>
+                {isScanning ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <FolderOpen className="w-4 h-4" />
+                )}
+                <span>{storageGranted ? 'Add More Music' : 'Allow Storage & Scan'}</span>
               </button>
-            )}
-          </div>
-        ) : (
+              {offlineTracks.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMyMusicView('playlists');
+                    setShowOfflinePlaylistBuilder((v) => !v);
+                  }}
+                  className="h-10 px-4 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-xs font-semibold inline-flex items-center gap-2 whitespace-nowrap transition-colors"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Offline Playlist</span>
+                </button>
+              )}
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                setSectionTab('playlists');
+                setShowCreateForm((v) => !v);
+              }}
+              className="h-10 px-4 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-xs font-semibold inline-flex items-center gap-2 whitespace-nowrap transition-colors"
+            >
+              <Plus className="w-4 h-4" />
+              <span>New Playlist</span>
+            </button>
+          )}
           <button
             type="button"
-            onClick={() => {
-              setSectionTab('playlists');
-              setShowCreateForm((v) => !v);
-            }}
-            className="h-10 px-4 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-xs font-semibold inline-flex items-center gap-2 self-start sm:self-auto whitespace-nowrap transition-colors"
+            onClick={() => setIsBackupModalOpen(true)}
+            className="h-10 px-3.5 rounded-xl bg-[#11131A] hover:bg-[#181B26] border border-white/10 text-slate-200 hover:text-white text-xs font-medium inline-flex items-center gap-2 whitespace-nowrap transition-colors"
           >
-            <Plus className="w-4 h-4" />
-            <span>New Playlist</span>
+            <Archive className="w-4 h-4 text-[#7A90FF]" />
+            <span>Backup / Restore</span>
           </button>
-        )}
+        </div>
       </div>
 
       {/* Hidden File & Folder Inputs for universal Android / iOS / Tablet / Desktop storage access */}
@@ -1012,7 +1032,17 @@ export function LibraryPage({
                     </div>
                     <button
                       type="button"
-                      onClick={() => void clearAllOfflineTracks()}
+                      onClick={async () => {
+                        if (
+                          await confirm({
+                            title: 'Delete All Offline Songs?',
+                            message: `This will permanently delete all ${offlineTracks.length} downloaded/imported songs from My Music on this device. This action cannot be undone.`,
+                            confirmText: 'Delete All',
+                          })
+                        ) {
+                          await clearAllOfflineTracks();
+                        }
+                      }}
                       className="text-xs text-slate-400 hover:text-rose-400 self-start sm:self-auto"
                     >
                       Clear all downloaded songs
@@ -1189,7 +1219,17 @@ export function LibraryPage({
                               </button>
                               <button
                                 type="button"
-                                onClick={() => void deleteOfflineTrack(track.id)}
+                                onClick={async () => {
+                                  if (
+                                    await confirm({
+                                      title: 'Delete Offline Song?',
+                                      message: `Remove "${track.title}" from My Music on this device?`,
+                                      confirmText: 'Delete',
+                                    })
+                                  ) {
+                                    await deleteOfflineTrack(track.id);
+                                  }
+                                }}
                                 aria-label={`Delete ${track.title} from My Music`}
                                 title="Remove from My Music"
                                 className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-lg text-slate-400 hover:text-rose-400 hover:bg-white/5 transition-colors"
@@ -1396,10 +1436,18 @@ export function LibraryPage({
                                     </button>
                                     <button
                                       type="button"
-                                      onClick={() => {
-                                        deleteOfflinePlaylist(pl.id);
-                                        if (selectedOfflinePlaylistId === pl.id) {
-                                          setSelectedOfflinePlaylistId(null);
+                                      onClick={async () => {
+                                        if (
+                                          await confirm({
+                                            title: 'Delete Offline Playlist?',
+                                            message: `Delete "${pl.name}"? Your downloaded songs will stay in My Music.`,
+                                            confirmText: 'Delete Playlist',
+                                          })
+                                        ) {
+                                          deleteOfflinePlaylist(pl.id);
+                                          if (selectedOfflinePlaylistId === pl.id) {
+                                            setSelectedOfflinePlaylistId(null);
+                                          }
                                         }
                                       }}
                                       aria-label={`Delete ${pl.name}`}
@@ -1545,9 +1593,20 @@ export function LibraryPage({
                                           )}
                                           <button
                                             type="button"
-                                            onClick={() =>
-                                              removeTrackFromOfflinePlaylist(selectedOfflinePlaylist.id, t.id)
-                                            }
+                                            onClick={async () => {
+                                              if (
+                                                await confirm({
+                                                  title: 'Remove Song from Playlist?',
+                                                  message: `Remove "${t.title}" from "${selectedOfflinePlaylist.name}"?`,
+                                                  confirmText: 'Remove',
+                                                })
+                                              ) {
+                                                removeTrackFromOfflinePlaylist(
+                                                  selectedOfflinePlaylist.id,
+                                                  t.id
+                                                );
+                                              }
+                                            }}
                                             aria-label={`Remove ${t.title} from offline playlist`}
                                             className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-lg text-slate-400 hover:text-rose-400 hover:bg-white/5"
                                           >
@@ -1704,9 +1763,17 @@ export function LibraryPage({
                             </button>
                             <button
                               type="button"
-                              onClick={() => {
-                                deletePlaylist(pl.id);
-                                if (selectedPlaylistId === pl.id) setSelectedPlaylistId(null);
+                              onClick={async () => {
+                                if (
+                                  await confirm({
+                                    title: 'Delete Playlist?',
+                                    message: `Permanently delete "${pl.name}" (${pl.tracks.length} ${pl.tracks.length === 1 ? 'track' : 'tracks'})?`,
+                                    confirmText: 'Delete Playlist',
+                                  })
+                                ) {
+                                  deletePlaylist(pl.id);
+                                  if (selectedPlaylistId === pl.id) setSelectedPlaylistId(null);
+                                }
                               }}
                               aria-label={`Delete ${pl.name}`}
                               className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-lg text-slate-400 hover:text-rose-400 hover:bg-white/5"
@@ -1733,7 +1800,7 @@ export function LibraryPage({
                         )}
                       </div>
                       {selectedPlaylist.tracks.length > 0 && (
-                        <div className="flex items-center gap-2 shrink-0">
+                        <div className="flex flex-wrap items-center gap-2 shrink-0">
                           <button
                             type="button"
                             onClick={() => playTrack(selectedPlaylist.tracks[0], selectedPlaylist.tracks)}
@@ -1750,6 +1817,35 @@ export function LibraryPage({
                             <Shuffle className="w-3.5 h-3.5" />
                             <span>Shuffle</span>
                           </button>
+                          {selectedPlaylist.tracks.some((t) => !t.isOffline) && (
+                            <button
+                              type="button"
+                              disabled={isBatchDownloading}
+                              onClick={() =>
+                                void batchDownloadTracks(
+                                  selectedPlaylist.tracks.filter((t) => !t.isOffline),
+                                  selectedPlaylist.name,
+                                  false
+                                )
+                              }
+                              className="h-9 px-3.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-xs font-semibold text-white inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                            >
+                              {isBatchDownloading &&
+                              batchDownloadState?.label === selectedPlaylist.name ? (
+                                <>
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                  <span className="font-mono-tabular">
+                                    {batchDownloadState.completed}/{batchDownloadState.total}
+                                  </span>
+                                </>
+                              ) : (
+                                <>
+                                  <Download className="w-3.5 h-3.5" />
+                                  <span>Download Playlist</span>
+                                </>
+                              )}
+                            </button>
+                          )}
                         </div>
                       )}
                     </div>
@@ -1778,7 +1874,17 @@ export function LibraryPage({
                             rightAction={
                               <button
                                 type="button"
-                                onClick={() => removeTrackFromPlaylist(selectedPlaylist.id, track.id)}
+                                onClick={async () => {
+                                  if (
+                                    await confirm({
+                                      title: 'Remove Track?',
+                                      message: `Remove "${track.title}" from "${selectedPlaylist.name}"?`,
+                                      confirmText: 'Remove',
+                                    })
+                                  ) {
+                                    removeTrackFromPlaylist(selectedPlaylist.id, track.id);
+                                  }
+                                }}
                                 aria-label={`Remove ${track.title} from playlist`}
                                 className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-lg text-slate-400 hover:text-rose-400 hover:bg-white/5"
                               >
@@ -1809,7 +1915,17 @@ export function LibraryPage({
               <p className="text-xs text-slate-400">Tracks played on this device with timestamps</p>
               <button
                 type="button"
-                onClick={clearRecentlyPlayed}
+                onClick={async () => {
+                  if (
+                    await confirm({
+                      title: 'Clear Recently Played?',
+                      message: `Remove all ${recentlyPlayed.length} recently played entries from this device?`,
+                      confirmText: 'Clear History',
+                    })
+                  ) {
+                    clearRecentlyPlayed();
+                  }
+                }}
                 className="text-xs text-slate-400 hover:text-rose-400"
               >
                 Clear history
@@ -1850,7 +1966,18 @@ export function LibraryPage({
             {listeningStats.totalPlays > 0 && (
               <button
                 type="button"
-                onClick={clearListeningStats}
+                onClick={async () => {
+                  if (
+                    await confirm({
+                      title: 'Reset Listening Stats?',
+                      message:
+                        'Reset all play counts, top artists, and total listening time back to zero? This cannot be undone.',
+                      confirmText: 'Reset Stats',
+                    })
+                  ) {
+                    clearListeningStats();
+                  }
+                }}
                 className="text-xs text-slate-400 hover:text-rose-400 whitespace-nowrap"
               >
                 Reset stats
@@ -1907,7 +2034,7 @@ export function LibraryPage({
                     <button
                       key={artistStat.artist}
                       type="button"
-                      onClick={() => onRunSearchQuery(artistStat.artist)}
+                      onClick={() => openArtistPage(artistStat.artist)}
                       className="w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl bg-[#0D0F16] hover:bg-[#181B26] border border-white/[0.05] text-left transition-colors"
                     >
                       <div className="flex items-center gap-3 min-w-0">
@@ -1985,7 +2112,17 @@ export function LibraryPage({
               <p className="text-xs text-slate-400">Click any past search to run it again</p>
               <button
                 type="button"
-                onClick={clearSearchHistory}
+                onClick={async () => {
+                  if (
+                    await confirm({
+                      title: 'Clear Search History?',
+                      message: `Delete all ${searchHistory.length} saved search queries?`,
+                      confirmText: 'Clear All',
+                    })
+                  ) {
+                    clearSearchHistory();
+                  }
+                }}
                 className="text-xs text-slate-400 hover:text-rose-400"
               >
                 Clear search history
@@ -2019,7 +2156,17 @@ export function LibraryPage({
                   </button>
                   <button
                     type="button"
-                    onClick={() => removeSearchQuery(item.query)}
+                    onClick={async () => {
+                      if (
+                        await confirm({
+                          title: 'Delete Search Entry?',
+                          message: `Remove "${item.query}" from search history?`,
+                          confirmText: 'Delete',
+                        })
+                      ) {
+                        removeSearchQuery(item.query);
+                      }
+                    }}
                     aria-label={`Delete ${item.query}`}
                     className="p-2 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-white/5"
                   >
@@ -2031,6 +2178,11 @@ export function LibraryPage({
           )}
         </div>
       )}
+      {/* Backup & Restore Library Modal */}
+      <BackupRestoreModal
+        isOpen={isBackupModalOpen}
+        onClose={() => setIsBackupModalOpen(false)}
+      />
     </div>
   );
 }

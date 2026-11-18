@@ -27,9 +27,12 @@ export interface MultiSourceTrackResult {
 interface InternalResolvedEntry {
   result: ResolvedAudioStream;
   upstreamKind?: 'direct-url' | 'soundcloud-hls-fmp4';
+  upstreamMimeType?: string;
   upstreamUrl?: string;
   upstreamHeaders?: Record<string, string>;
   scTranscodingUrl?: string;
+  scManifest?: { hasInitMap: boolean; allUrls: string[] };
+  scManifestPromise?: Promise<{ hasInitMap: boolean; allUrls: string[] } | null>;
   assembledBuffer?: Buffer;
   assemblingPromise?: Promise<Buffer | null>;
   expiresAt: number;
@@ -37,11 +40,13 @@ interface InternalResolvedEntry {
 
 const RESOLVE_TTL_MS = 25 * 60 * 1000;
 const NEGATIVE_TTL_MS = 8 * 60 * 1000;
+const MAX_RESOLVED_CACHE = 450;
 const resolvedCache = new Map<string, InternalResolvedEntry>();
 const inFlightResolves = new Map<string, Promise<InternalResolvedEntry>>();
 
 let cachedScClientId = '';
 let cachedScClientIdExpires = 0;
+let inFlightScClientId: Promise<string | null> | null = null;
 
 const BLOCKED_VARIANT_RE =
   /\b(slowed|reverb|reverbed|lofi|lo-fi|karaoke|instrumental|8d|16d|16-?bit|emulation|female\s*reply|male\s*reply|cover\s*version|tribute|ringtone|whatsapp\s*status|house\s*mix|dj\s*mix|mashup|parody|acoustic\s*cover|nightcore|sped\s*up)\b/i;
@@ -378,24 +383,34 @@ async function resolveViaJioSaavn(
 
   const collectedItems: SaavnSearchResultItem[] = [];
 
-  for (const query of parsed.searchQueries) {
+  const fetchSaavnQuery = async (query: string, timeoutMs = 2600): Promise<SaavnSearchResultItem[]> => {
     try {
       const searchUrl = `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&cc=in&n=8&q=${encodeURIComponent(
         query
       )}`;
       const res = await fetch(searchUrl, {
         headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(4000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
-      if (!res.ok) continue;
+      if (!res.ok) return [];
       const data = (await res.json()) as { results?: SaavnSearchResultItem[] };
-      if (data.results?.length) {
-        collectedItems.push(...data.results);
-      }
-      if (collectedItems.length >= 12) break;
+      return data.results ?? [];
     } catch {
-      // ignore timeout/network error on this attempt
+      return [];
     }
+  };
+
+  // Fire top 2 queries in parallel so resolve time is ~300-500ms instead of sequential waterfall
+  const primaryBatch = await Promise.all(
+    parsed.searchQueries.slice(0, 2).map((q) => fetchSaavnQuery(q, 2600))
+  );
+  for (const list of primaryBatch) {
+    collectedItems.push(...list);
+  }
+
+  if (collectedItems.length === 0 && parsed.searchQueries.length > 2) {
+    const extra = await fetchSaavnQuery(parsed.searchQueries[2], 2000);
+    collectedItems.push(...extra);
   }
 
   for (const allowExtendedVariants of [false, true]) {
@@ -466,7 +481,7 @@ async function resolveViaJioSaavn(
       `https://www.jiosaavn.com/api.php?__call=song.generateAuthToken&url=${encodeURIComponent(
         bestCandidate.encUrl
       )}&bitrate=160&api_version=4&_format=json&ctx=web6dot0&_marker=0`,
-      { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(4000) }
+      { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(2800) }
     );
     if (!authRes.ok) return null;
     const authJson = (await authRes.json()) as { auth_url?: string };
@@ -500,30 +515,62 @@ async function getSoundCloudClientId(): Promise<string | null> {
   if (cachedScClientId && cachedScClientIdExpires > Date.now()) {
     return cachedScClientId;
   }
-  try {
-    const homeRes = await fetch('https://soundcloud.com', {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      signal: AbortSignal.timeout(4000),
-    });
-    if (!homeRes.ok) return null;
-    const html = await homeRes.text();
-    const scripts = [...html.matchAll(/https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js/g)].map((m) => m[0]);
-
-    for (const scriptUrl of scripts.slice(-5)) {
-      const jsRes = await fetch(scriptUrl, { signal: AbortSignal.timeout(4000) });
-      if (!jsRes.ok) continue;
-      const js = await jsRes.text();
-      const match = js.match(/client_id\s*[:=]\s*"([a-zA-Z0-9]{20,40})"/);
-      if (match?.[1]) {
-        cachedScClientId = match[1];
-        cachedScClientIdExpires = Date.now() + 12 * 60 * 60 * 1000;
-        return cachedScClientId;
-      }
-    }
-  } catch {
-    // ignore SoundCloud bootstrap error
+  if (inFlightScClientId) {
+    return inFlightScClientId;
   }
-  return null;
+
+  inFlightScClientId = (async (): Promise<string | null> => {
+    try {
+      const homeRes = await fetch('https://soundcloud.com', {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!homeRes.ok) return null;
+      const html = await homeRes.text();
+      const scripts = [...html.matchAll(/https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js/g)].map(
+        (m) => m[0]
+      );
+      if (scripts.length === 0) return null;
+
+      // Scan last 5 asset bundles concurrently instead of sequentially
+      const candidates = await Promise.all(
+        scripts.slice(-5).map(async (scriptUrl) => {
+          try {
+            const jsRes = await fetch(scriptUrl, { signal: AbortSignal.timeout(2600) });
+            if (!jsRes.ok) return null;
+            const js = await jsRes.text();
+            const match = js.match(/client_id\s*[:=]\s*"([a-zA-Z0-9]{20,40})"/);
+            return match?.[1] ?? null;
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      const foundId = candidates.find((id): id is string => Boolean(id));
+      if (foundId) {
+        cachedScClientId = foundId;
+        cachedScClientIdExpires = Date.now() + 12 * 60 * 60 * 1000;
+        return foundId;
+      }
+    } catch {
+      // ignore SoundCloud bootstrap error
+    }
+    return null;
+  })().finally(() => {
+    inFlightScClientId = null;
+  });
+
+  return inFlightScClientId;
+}
+
+export function warmAudioResolverStartup(): void {
+  void getSoundCloudClientId();
+  const refreshTimer = setInterval(() => {
+    cachedScClientIdExpires = 0;
+    void getSoundCloudClientId();
+  }, 6 * 60 * 60 * 1000);
+  refreshTimer.unref?.();
 }
 
 interface SoundCloudTrackItem {
@@ -553,24 +600,29 @@ async function resolveViaSoundCloud(
   const parsed = parseYouTubeMetadata(title, artist);
   const collectedItems: SoundCloudTrackItem[] = [];
 
-  for (const query of parsed.searchQueries) {
+  const searchScQuery = async (query: string, timeoutMs = 2600): Promise<SoundCloudTrackItem[]> => {
     try {
       const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(
         query
       )}&client_id=${encodeURIComponent(clientId)}&limit=10`;
       const res = await fetch(searchUrl, {
         headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(4000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
-      if (!res.ok) continue;
+      if (!res.ok) return [];
       const data = (await res.json()) as { collection?: SoundCloudTrackItem[] };
-      if (data.collection) {
-        collectedItems.push(...data.collection);
-      }
-      if (collectedItems.length >= 10) break;
+      return data.collection ?? [];
     } catch {
-      // ignore SoundCloud search failure
+      return [];
     }
+  };
+
+  const batch = await Promise.all(parsed.searchQueries.slice(0, 2).map((q) => searchScQuery(q, 2600)));
+  for (const list of batch) {
+    collectedItems.push(...list);
+  }
+  if (collectedItems.length === 0 && parsed.searchQueries.length > 2) {
+    collectedItems.push(...(await searchScQuery(parsed.searchQueries[2], 2000)));
   }
 
   if (collectedItems.length === 0) return null;
@@ -658,7 +710,7 @@ async function resolveViaSoundCloud(
       };
     }
 
-    // Serve SoundCloud fMP4 HLS through /api/audio/stream as a native audio/mp4 stream so Android <audio> plays in background without hls.js MSE!
+    // Serve SoundCloud HLS through /api/audio/stream as a native byte-range stream so <audio> plays cleanly
     return {
       result: {
         mode: 'proxy',
@@ -669,6 +721,7 @@ async function resolveViaSoundCloud(
         durationSeconds: best.track.duration ? Math.round(best.track.duration / 1000) : undefined,
       },
       upstreamKind: 'soundcloud-hls-fmp4',
+      upstreamMimeType: best.mimeType.includes('mpeg') ? 'audio/mpeg' : 'audio/mp4',
       upstreamUrl: signJson.url,
       scTranscodingUrl: best.transcodingUrl,
       expiresAt: Date.now() + RESOLVE_TTL_MS,
@@ -678,18 +731,35 @@ async function resolveViaSoundCloud(
   }
 }
 
-async function assembleSoundCloudFmp4Buffer(entry: InternalResolvedEntry): Promise<Buffer | null> {
-  if (entry.assembledBuffer) return entry.assembledBuffer;
-  if (entry.assemblingPromise) return entry.assemblingPromise;
+function stripStypSidx(buf: Buffer): Buffer {
+  let offset = 0;
+  while (offset + 8 <= buf.length) {
+    const size = buf.readUInt32BE(offset);
+    const type = buf.subarray(offset + 4, offset + 8).toString('ascii');
+    if (size < 8 || offset + size > buf.length) break;
+    if (type === 'styp' || type === 'sidx') {
+      offset += size;
+    } else {
+      break;
+    }
+  }
+  return offset > 0 ? buf.subarray(offset) : buf;
+}
 
-  const job = (async (): Promise<Buffer | null> => {
+async function fetchSoundCloudManifest(
+  entry: InternalResolvedEntry
+): Promise<{ hasInitMap: boolean; allUrls: string[] } | null> {
+  if (entry.scManifest) return entry.scManifest;
+  if (entry.scManifestPromise) return entry.scManifestPromise;
+
+  const job = (async () => {
     try {
       let m3u8Url = entry.upstreamUrl;
       if (!m3u8Url && entry.scTranscodingUrl) {
         const cid = await getSoundCloudClientId();
         if (!cid) return null;
         const sr = await fetch(`${entry.scTranscodingUrl}?client_id=${encodeURIComponent(cid)}`, {
-          signal: AbortSignal.timeout(4000),
+          signal: AbortSignal.timeout(3000),
         });
         if (!sr.ok) return null;
         const sj = (await sr.json()) as { url?: string };
@@ -697,18 +767,18 @@ async function assembleSoundCloudFmp4Buffer(entry: InternalResolvedEntry): Promi
       }
       if (!m3u8Url) return null;
 
-      let m3u8Res = await fetch(m3u8Url, { signal: AbortSignal.timeout(4500) });
+      let m3u8Res = await fetch(m3u8Url, { signal: AbortSignal.timeout(3000) });
       if (!m3u8Res.ok && entry.scTranscodingUrl) {
         const cid = await getSoundCloudClientId();
         if (cid) {
           const sr = await fetch(`${entry.scTranscodingUrl}?client_id=${encodeURIComponent(cid)}`, {
-            signal: AbortSignal.timeout(4000),
+            signal: AbortSignal.timeout(3000),
           });
           if (sr.ok) {
             const sj = (await sr.json()) as { url?: string };
             if (sj.url) {
               entry.upstreamUrl = sj.url;
-              m3u8Res = await fetch(sj.url, { signal: AbortSignal.timeout(4500) });
+              m3u8Res = await fetch(sj.url, { signal: AbortSignal.timeout(3000) });
             }
           }
         }
@@ -726,21 +796,30 @@ async function assembleSoundCloudFmp4Buffer(entry: InternalResolvedEntry): Promi
       const allUrls = mapMatch?.[1] ? [mapMatch[1], ...segUrls] : segUrls;
       if (allUrls.length === 0) return null;
 
-      const stripStypSidx = (buf: Buffer): Buffer => {
-        let offset = 0;
-        while (offset + 8 <= buf.length) {
-          const size = buf.readUInt32BE(offset);
-          const type = buf.subarray(offset + 4, offset + 8).toString('ascii');
-          if (size < 8 || offset + size > buf.length) break;
-          if (type === 'styp' || type === 'sidx') {
-            offset += size;
-          } else {
-            break;
-          }
-        }
-        return offset > 0 ? buf.subarray(offset) : buf;
-      };
+      const manifest = { hasInitMap, allUrls };
+      entry.scManifest = manifest;
+      return manifest;
+    } catch {
+      return null;
+    } finally {
+      entry.scManifestPromise = undefined;
+    }
+  })();
 
+  entry.scManifestPromise = job;
+  return job;
+}
+
+async function assembleSoundCloudFmp4Buffer(entry: InternalResolvedEntry): Promise<Buffer | null> {
+  if (entry.assembledBuffer) return entry.assembledBuffer;
+  if (entry.assemblingPromise) return entry.assemblingPromise;
+
+  const job = (async (): Promise<Buffer | null> => {
+    try {
+      const manifest = await fetchSoundCloudManifest(entry);
+      if (!manifest || manifest.allUrls.length === 0) return null;
+
+      const { hasInitMap, allUrls } = manifest;
       const chunks: Buffer[] = new Array(allUrls.length);
       const batchSize = 32;
       for (let i = 0; i < allUrls.length; i += batchSize) {
@@ -773,6 +852,82 @@ async function assembleSoundCloudFmp4Buffer(entry: InternalResolvedEntry): Promi
   return job;
 }
 
+async function streamSoundCloudFmp4Progressive(
+  entry: InternalResolvedEntry,
+  req: Request,
+  res: Response,
+  cleanFileBase: string,
+  wantsDownload: boolean
+): Promise<void> {
+  const manifest = await fetchSoundCloudManifest(entry);
+  if (!manifest || manifest.allUrls.length === 0) {
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'SC_STREAM_FAILED', message: 'Failed to load audio manifest.' });
+    }
+    return;
+  }
+
+  let clientClosed = false;
+  req.on('close', () => {
+    clientClosed = true;
+  });
+
+  const scMime = entry.upstreamMimeType || 'audio/mp4';
+  res.status(200);
+  res.setHeader('Content-Type', scMime);
+  res.setHeader('Cache-Control', 'private, max-age=900');
+  if (wantsDownload) {
+    const ext = scMime === 'audio/mpeg' ? '.mp3' : '.m4a';
+    const dlName = cleanFileBase.endsWith(ext) ? cleanFileBase : `${cleanFileBase}${ext}`;
+    res.setHeader('Content-Disposition', `attachment; filename="${dlName}"`);
+  }
+
+  const { hasInitMap, allUrls } = manifest;
+  const collected: Buffer[] = new Array(allUrls.length);
+  let allComplete = true;
+
+  // Fetch initial 3 segments (init + first 2 audio chunks) first for < 350ms TTFB, then larger batches
+  let cursor = 0;
+  while (cursor < allUrls.length) {
+    if (clientClosed || res.writableEnded) {
+      allComplete = false;
+      break;
+    }
+    const batchSize = cursor === 0 ? 3 : cursor < 12 ? 6 : 12;
+    const slice = allUrls.slice(cursor, cursor + batchSize);
+    try {
+      const fetched = await Promise.all(
+        slice.map(async (u, localIdx) => {
+          const r = await fetch(u, { signal: AbortSignal.timeout(5500) });
+          if (!r.ok) throw new Error(`Segment HTTP ${r.status}`);
+          const raw = Buffer.from(await r.arrayBuffer());
+          const globalIdx = cursor + localIdx;
+          return hasInitMap && globalIdx > 0 ? stripStypSidx(raw) : raw;
+        })
+      );
+      if (clientClosed || res.writableEnded) {
+        allComplete = false;
+        break;
+      }
+      for (let j = 0; j < fetched.length; j++) {
+        collected[cursor + j] = fetched[j];
+        res.write(fetched[j]);
+      }
+      cursor += slice.length;
+    } catch {
+      allComplete = false;
+      break;
+    }
+  }
+
+  if (!res.writableEnded) {
+    res.end();
+  }
+  if (allComplete && collected.every(Boolean)) {
+    entry.assembledBuffer = Buffer.concat(collected);
+  }
+}
+
 function formatDurLabel(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return '0:00';
   const m = Math.floor(seconds / 60);
@@ -800,24 +955,26 @@ async function resolveViaAudius(
   const parsed = parseYouTubeMetadata(title, artist);
   const collected: AudiusTrackItem[] = [];
 
-  for (const query of parsed.searchQueries.slice(0, 2)) {
+  const fetchAudiusQuery = async (query: string): Promise<AudiusTrackItem[]> => {
     try {
       const searchUrl = `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(
         query
       )}&app_name=VIBRA`;
       const res = await fetch(searchUrl, {
         headers: { Accept: 'application/json' },
-        signal: AbortSignal.timeout(4000),
+        signal: AbortSignal.timeout(2600),
       });
-      if (!res.ok) continue;
+      if (!res.ok) return [];
       const json = (await res.json()) as { data?: AudiusTrackItem[] };
-      if (Array.isArray(json.data)) {
-        collected.push(...json.data.slice(0, 10));
-      }
-      if (collected.length >= 10) break;
+      return Array.isArray(json.data) ? json.data.slice(0, 10) : [];
     } catch {
-      // ignore Audius network failure
+      return [];
     }
+  };
+
+  const audiusBatches = await Promise.all(parsed.searchQueries.slice(0, 2).map(fetchAudiusQuery));
+  for (const list of audiusBatches) {
+    collected.push(...list);
   }
 
   let best: { item: AudiusTrackItem; streamUrl: string; score: number } | null = null;
@@ -934,13 +1091,13 @@ async function resolveViaArchiveOrg(
     const searchUrl = `https://archive.org/advancedsearch.php?q=${encodeURIComponent(
       `mediatype:audio AND (${mainQuery})`
     )}&fl[]=identifier,title,creator&rows=5&output=json`;
-    const res = await fetch(searchUrl, { signal: AbortSignal.timeout(4000) });
+    const res = await fetch(searchUrl, { signal: AbortSignal.timeout(2200) });
     if (!res.ok) return null;
     const data = (await res.json()) as { response?: { docs?: ArchiveDoc[] } };
     const docs = data.response?.docs ?? [];
 
-    for (const doc of docs.slice(0, 3)) {
-      if (!doc.identifier || !doc.title) continue;
+    const matchedDocs = docs.slice(0, 3).filter((doc) => {
+      if (!doc.identifier || !doc.title) return false;
       const creatorStr = Array.isArray(doc.creator) ? doc.creator.join(', ') : doc.creator || '';
       const preScore = scoreAudioCandidate({
         candTitle: doc.title,
@@ -953,25 +1110,36 @@ async function resolveViaArchiveOrg(
         cleanedYtTitle: parsed.cleanedTitle,
         allowExtendedVariants: true,
       });
-      if (preScore < 68) continue;
+      return preScore >= 68;
+    });
 
-      const fileInfo = await resolveArchiveAudioFile(doc.identifier);
-      if (!fileInfo) continue;
-
-      return {
-        result: {
-          mode: 'proxy',
-          provider: 'archive',
-          streamUrl: `/api/audio/stream?videoId=${encodeURIComponent(videoId)}`,
-          matchedTitle: doc.title,
-          matchedArtist: creatorStr || 'Internet Archive',
-          durationSeconds: fileInfo.duration || undefined,
-        },
-        upstreamKind: 'direct-url',
-        upstreamUrl: fileInfo.url,
-        upstreamHeaders: { 'User-Agent': 'Mozilla/5.0' },
-        expiresAt: Date.now() + RESOLVE_TTL_MS,
-      };
+    if (matchedDocs.length > 0) {
+      const docFiles = await Promise.all(
+        matchedDocs.slice(0, 2).map(async (doc) => ({
+          doc,
+          fileInfo: await resolveArchiveAudioFile(doc.identifier!),
+        }))
+      );
+      const valid = docFiles.find((d) => Boolean(d.fileInfo));
+      if (valid && valid.fileInfo) {
+        const creatorStr = Array.isArray(valid.doc.creator)
+          ? valid.doc.creator.join(', ')
+          : valid.doc.creator || '';
+        return {
+          result: {
+            mode: 'proxy',
+            provider: 'archive',
+            streamUrl: `/api/audio/stream?videoId=${encodeURIComponent(videoId)}`,
+            matchedTitle: valid.doc.title,
+            matchedArtist: creatorStr || 'Internet Archive',
+            durationSeconds: valid.fileInfo.duration || undefined,
+          },
+          upstreamKind: 'direct-url',
+          upstreamUrl: valid.fileInfo.url,
+          upstreamHeaders: { 'User-Agent': 'Mozilla/5.0' },
+          expiresAt: Date.now() + RESOLVE_TTL_MS,
+        };
+      }
     }
   } catch {
     // ignore Archive.org error
@@ -997,38 +1165,44 @@ export async function resolveBackgroundAudioStream(
   }
 
   const job = (async (): Promise<InternalResolvedEntry> => {
-    // 1. JioSaavn 320/160kbps MP4/AAC
-    const saavnEntry = await resolveViaJioSaavn(videoId, title, artist, durationSeconds);
+    // Launch JioSaavn, SoundCloud, and Audius IN PARALLEL instead of sequentially!
+    // If JioSaavn resolves first (~350-550ms), return immediately; otherwise SoundCloud/Audius are already ready!
+    const saavnPromise = resolveViaJioSaavn(videoId, title, artist, durationSeconds).catch(() => null);
+    const scPromise = resolveViaSoundCloud(videoId, title, artist, durationSeconds).catch(() => null);
+    const audiusPromise = resolveViaAudius(videoId, title, artist, durationSeconds).catch(() => null);
+
+    const saavnEntry = await saavnPromise;
     if (saavnEntry) {
       resolvedCache.set(videoId, saavnEntry);
       return saavnEntry;
     }
 
-    // 2. SoundCloud verified full-length progressive MP3 / fMP4
-    const scEntry = await resolveViaSoundCloud(videoId, title, artist, durationSeconds);
+    const scEntry = await scPromise;
     if (scEntry) {
       resolvedCache.set(videoId, scEntry);
       if (scEntry.upstreamKind === 'soundcloud-hls-fmp4') {
-        void assembleSoundCloudFmp4Buffer(scEntry);
+        // Pre-fetch manifest right away so progressive streaming begins immediately
+        void fetchSoundCloudManifest(scEntry);
       }
       return scEntry;
     }
 
-    // 3. Audius decentralized high-bitrate MP3 catalog
-    const audiusEntry = await resolveViaAudius(videoId, title, artist, durationSeconds);
+    const audiusEntry = await audiusPromise;
     if (audiusEntry) {
       resolvedCache.set(videoId, audiusEntry);
       return audiusEntry;
     }
 
-    // 4. Internet Archive public audio catalog
-    const archiveEntry = await resolveViaArchiveOrg(videoId, title, artist, durationSeconds);
+    // Fast fallback race for public-domain Archive.org
+    const archiveEntry = await resolveViaArchiveOrg(videoId, title, artist, durationSeconds).catch(
+      () => null
+    );
     if (archiveEntry) {
       resolvedCache.set(videoId, archiveEntry);
       return archiveEntry;
     }
 
-    // 5. No verified audio match -> client falls back to official YouTube IFrame
+    // No verified audio match -> client falls back to official YouTube IFrame
     const ytFallback: InternalResolvedEntry = {
       result: { mode: 'youtube' },
       expiresAt: Date.now() + NEGATIVE_TTL_MS,
@@ -1041,13 +1215,32 @@ export async function resolveBackgroundAudioStream(
 
   inFlightResolves.set(videoId, job);
 
-  if (resolvedCache.size > 200) {
+  while (resolvedCache.size > MAX_RESOLVED_CACHE) {
     const oldest = resolvedCache.keys().next().value;
     if (oldest !== undefined) resolvedCache.delete(oldest);
+    else break;
   }
 
   const resolved = await job;
   return resolved.result;
+}
+
+export async function prewarmAudioStreamsBatch(
+  items: Array<{ videoId: string; title: string; artist?: string; durationSeconds?: number }>
+): Promise<Record<string, ResolvedAudioStream>> {
+  const limited = items.slice(0, 8).filter((item) => item.videoId && item.title);
+  const settled = await Promise.all(
+    limited.map(async (item) => {
+      const res = await resolveBackgroundAudioStream(
+        item.videoId,
+        item.title,
+        item.artist || '',
+        item.durationSeconds || 0
+      ).catch((): ResolvedAudioStream => ({ mode: 'youtube' }));
+      return [item.videoId, res] as const;
+    })
+  );
+  return Object.fromEntries(settled);
 }
 
 export async function proxyAudioStream(req: Request, res: Response, videoId: string): Promise<void> {
@@ -1074,8 +1267,19 @@ export async function proxyAudioStream(req: Request, res: Response, videoId: str
       : `${entry.result.matchedTitle || 'vibra-track'}`;
   const cleanFileBase = rawFileBase.replace(/[^\w\s.-]/g, '').trim().slice(0, 80) || 'vibra-track';
 
-  // Case A: SoundCloud fMP4 assembled into a native byte-range-capable audio/mp4 buffer
+  // Case A: SoundCloud fMP4 (progressive stream on initial byte-0 play; instant 206 Range once assembled!)
   if (entry.upstreamKind === 'soundcloud-hls-fmp4') {
+    const rangeHeader = req.headers.range;
+    const isInitialZeroStream =
+      !wantsDownload &&
+      !entry.assembledBuffer &&
+      (!rangeHeader || rangeHeader === 'bytes=0-');
+
+    if (isInitialZeroStream) {
+      await streamSoundCloudFmp4Progressive(entry, req, res, cleanFileBase, false);
+      return;
+    }
+
     const buf = await assembleSoundCloudFmp4Buffer(entry);
     if (!buf || buf.length === 0) {
       res.status(502).json({ error: 'SC_STREAM_FAILED', message: 'Failed to assemble audio stream.' });
@@ -1083,15 +1287,16 @@ export async function proxyAudioStream(req: Request, res: Response, videoId: str
     }
 
     const total = buf.length;
-    res.setHeader('Content-Type', 'audio/mp4');
+    const scMime = entry.upstreamMimeType || 'audio/mp4';
+    res.setHeader('Content-Type', scMime);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'private, max-age=900');
     if (wantsDownload) {
-      const dlName = cleanFileBase.endsWith('.m4a') ? cleanFileBase : `${cleanFileBase}.m4a`;
+      const ext = scMime === 'audio/mpeg' ? '.mp3' : '.m4a';
+      const dlName = cleanFileBase.endsWith(ext) ? cleanFileBase : `${cleanFileBase}${ext}`;
       res.setHeader('Content-Disposition', `attachment; filename="${dlName}"`);
     }
 
-    const rangeHeader = req.headers.range;
     if (typeof rangeHeader === 'string' && rangeHeader.startsWith('bytes=')) {
       const [startStr, endStr] = rangeHeader.replace(/bytes=/, '').split('-');
       const start = Math.max(0, parseInt(startStr, 10) || 0);
@@ -1115,12 +1320,13 @@ export async function proxyAudioStream(req: Request, res: Response, videoId: str
   }
 
   // Case B: Direct upstream byte-range proxy (JioSaavn 320kbps MP4, SoundCloud progressive MP3, Audius MP3, Archive.org MP3)
-  const headers: Record<string, string> = {
-    ...(entry.upstreamHeaders ?? {}),
+  const buildHeaders = (e: InternalResolvedEntry) => {
+    const h: Record<string, string> = { ...(e.upstreamHeaders ?? {}) };
+    if (typeof req.headers.range === 'string' && req.headers.range.startsWith('bytes=')) {
+      h.Range = req.headers.range;
+    }
+    return h;
   };
-  if (typeof req.headers.range === 'string' && req.headers.range.startsWith('bytes=')) {
-    headers.Range = req.headers.range;
-  }
 
   const controller = new AbortController();
   res.on('close', () => {
@@ -1128,10 +1334,30 @@ export async function proxyAudioStream(req: Request, res: Response, videoId: str
   });
 
   try {
-    const upstreamRes = await fetch(entry.upstreamUrl, {
-      headers,
+    let upstreamRes = await fetch(entry.upstreamUrl, {
+      headers: buildHeaders(entry),
       signal: controller.signal,
     });
+
+    // If cached signed CDN token expired (401/403/410), re-resolve once transparently
+    if (
+      (upstreamRes.status === 401 || upstreamRes.status === 403 || upstreamRes.status === 410) &&
+      typeof req.query.title === 'string'
+    ) {
+      resolvedCache.delete(videoId);
+      const title = req.query.title.slice(0, 180);
+      const artist = typeof req.query.artist === 'string' ? req.query.artist.slice(0, 120) : '';
+      const dur = Number(req.query.duration);
+      await resolveBackgroundAudioStream(videoId, title, artist, Number.isFinite(dur) && dur > 0 ? dur : 0);
+      const refreshed = resolvedCache.get(videoId);
+      if (refreshed?.upstreamUrl) {
+        entry = refreshed;
+        upstreamRes = await fetch(refreshed.upstreamUrl, {
+          headers: buildHeaders(refreshed),
+          signal: controller.signal,
+        });
+      }
+    }
 
     if (!upstreamRes.ok && upstreamRes.status !== 206) {
       if (!res.headersSent) {

@@ -95,26 +95,44 @@ function ensureKeepAliveBridgeAudio(): HTMLAudioElement | null {
   return keepAliveAudioEl;
 }
 
-export function pokeBackgroundKeepAlive(): void {
+export function pauseKeepAliveBridgeIfForeground(): void {
+  if (typeof document === 'undefined' || document.hidden) return;
+  if (keepAliveAudioEl && !keepAliveAudioEl.paused) {
+    try {
+      keepAliveAudioEl.pause();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+export function pokeBackgroundKeepAlive(forceBridge = false): void {
   if (!isKeepAliveActive || typeof window === 'undefined') return;
-  try {
-    if (keepAliveCtx && keepAliveCtx.state === 'suspended') {
-      void keepAliveCtx.resume().catch(() => {});
+  const isBg = typeof document !== 'undefined' && document.hidden;
+
+  if (isBg || forceBridge) {
+    try {
+      if (keepAliveCtx && keepAliveCtx.state === 'suspended') {
+        void keepAliveCtx.resume().catch(() => {});
+      }
+    } catch {
+      // ignore
     }
-  } catch {
-    // ignore
-  }
-  try {
-    const bridge = ensureKeepAliveBridgeAudio();
-    if (bridge && bridge.paused) {
-      bridge.loop = true;
-      bridge.volume = 0.01;
-      if (!bridge.src) bridge.src = getSilentLoopBlobUrl();
-      void bridge.play().catch(() => {});
+    try {
+      const bridge = ensureKeepAliveBridgeAudio();
+      if (bridge && bridge.paused) {
+        bridge.loop = true;
+        bridge.volume = 0.01;
+        if (!bridge.src) bridge.src = getSilentLoopBlobUrl();
+        void bridge.play().catch(() => {});
+      }
+    } catch {
+      // ignore
     }
-  } catch {
-    // ignore
+  } else {
+    pauseKeepAliveBridgeIfForeground();
   }
+
   if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
     void acquirePlaybackWakeLock();
   }
@@ -134,16 +152,18 @@ export function startWebAudioKeepAlive(): void {
   if (typeof window === 'undefined') return;
   isKeepAliveActive = true;
 
+  const isBg = typeof document !== 'undefined' && document.hidden;
+
   const AudioCtx =
     window.AudioContext ||
     (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
 
-  if (AudioCtx) {
+  if (AudioCtx && isBg) {
     try {
       if (!keepAliveCtx) {
         keepAliveCtx = new AudioCtx();
         const gain = keepAliveCtx.createGain();
-        gain.gain.value = 0.0002; // Sub-audible non-zero gain so Chromium silence detector never suspends the audio thread
+        gain.gain.value = 0.0001; // Sub-audible non-zero gain so Chromium silence detector never suspends the audio thread
         keepAliveOsc = keepAliveCtx.createOscillator();
         keepAliveOsc.frequency.value = 1;
         keepAliveOsc.connect(gain);
@@ -158,15 +178,17 @@ export function startWebAudioKeepAlive(): void {
     }
   }
 
-  try {
-    const bridge = ensureKeepAliveBridgeAudio();
-    if (bridge && bridge.paused) {
-      bridge.loop = true;
-      bridge.volume = 0.01;
-      void bridge.play().catch(() => {});
+  if (isBg) {
+    try {
+      const bridge = ensureKeepAliveBridgeAudio();
+      if (bridge && bridge.paused) {
+        bridge.loop = true;
+        bridge.volume = 0.01;
+        void bridge.play().catch(() => {});
+      }
+    } catch {
+      // ignore
     }
-  } catch {
-    // ignore
   }
 
   if (keepAliveTimer === null) {

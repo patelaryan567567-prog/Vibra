@@ -34,6 +34,18 @@
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
+
+  .font-lyrics-modern {
+    font-family: 'Sora', 'Noto Sans Devanagari', 'Plus Jakarta Sans', system-ui, sans-serif;
+  }
+
+  .font-lyrics-serif {
+    font-family: 'Lora', 'Noto Sans Devanagari', Georgia, serif;
+  }
+
+  .font-lyrics-clean {
+    font-family: 'Plus Jakarta Sans', 'Noto Sans Devanagari', system-ui, sans-serif;
+  }
 }
 
 /* Safe-area utilities for notched phones & gesture bars */

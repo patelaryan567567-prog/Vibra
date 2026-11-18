@@ -9,8 +9,16 @@ interface AppSplashIntroProps {
 const BRAND_LETTERS = ['V', 'I', 'B', 'R', 'A'];
 const EQ_BARS = [0.42, 0.75, 1.0, 0.64, 0.88, 0.52, 0.95, 0.68, 0.45];
 
+const SPLASH_SESSION_KEY = 'vibra_splash_seen_v1';
+
 export function AppSplashIntro({ forceTriggerCount = 0 }: AppSplashIntroProps) {
-  const [visible, setVisible] = useState<boolean>(true);
+  const [visible, setVisible] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem(SPLASH_SESSION_KEY) !== '1';
+    } catch {
+      return true;
+    }
+  });
   const [isStandalonePWA, setIsStandalonePWA] = useState<boolean>(false);
 
   useEffect(() => {
@@ -25,24 +33,31 @@ export function AppSplashIntro({ forceTriggerCount = 0 }: AppSplashIntroProps) {
 
     checkStandalone();
 
-    const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const durationMs = prefersReducedMotion ? 550 : 2100;
-
-    const timer = window.setTimeout(() => {
-      setVisible(false);
-    }, durationMs);
+    let timer: number | undefined;
+    if (visible) {
+      try {
+        sessionStorage.setItem(SPLASH_SESSION_KEY, '1');
+      } catch {
+        // ignore
+      }
+      const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      const durationMs = prefersReducedMotion ? 450 : 1050;
+      timer = window.setTimeout(() => {
+        setVisible(false);
+      }, durationMs);
+    }
 
     const handleAppInstalled = () => {
       setIsStandalonePWA(true);
       setVisible(true);
       window.setTimeout(() => {
         setVisible(false);
-      }, 2200);
+      }, 1800);
     };
 
     window.addEventListener('appinstalled', handleAppInstalled);
     return () => {
-      window.clearTimeout(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
       window.removeEventListener('appinstalled', handleAppInstalled);
     };
   }, []);
@@ -65,11 +80,12 @@ export function AppSplashIntro({ forceTriggerCount = 0 }: AppSplashIntroProps) {
           exit={{
             opacity: 0,
             scale: 1.035,
-            transition: { duration: 0.48, ease: [0.16, 1, 0.3, 1] },
+            transition: { duration: 0.4, ease: [0.16, 1, 0.3, 1] },
           }}
+          onClick={() => setVisible(false)}
           role="dialog"
           aria-label="VIBRA App Opening Screen"
-          className="fixed inset-0 z-[100] bg-[#090A0F] flex flex-col items-center justify-between px-6 py-10 select-none overflow-hidden"
+          className="fixed inset-0 z-[100] bg-[#090A0F] flex flex-col items-center justify-between px-6 py-10 select-none overflow-hidden cursor-pointer"
         >
           {/* Ambient radial studio soundstage lighting */}
           <div className="pointer-events-none absolute inset-0 overflow-hidden">

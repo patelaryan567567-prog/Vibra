@@ -1,6 +1,8 @@
-import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  LibraryBackupPayload,
   ListeningStats,
+  OfflinePlaylist,
   OfflineTrack,
   Playlist,
   RecentlyPlayedItem,
@@ -102,6 +104,11 @@ interface LibraryContextValue {
   deletePlaylist: (playlistId: string) => void;
   addTrackToPlaylist: (playlistId: string, track: Track) => void;
   removeTrackFromPlaylist: (playlistId: string, trackId: string) => void;
+  exportLibraryBackup: (offlinePlaylists?: OfflinePlaylist[]) => LibraryBackupPayload;
+  importLibraryBackup: (
+    payload: unknown,
+    mode: 'merge' | 'replace'
+  ) => { playlists: number; favourites: number; recent: number; offlinePlaylists?: OfflinePlaylist[] };
 }
 
 const LibraryContext = createContext<LibraryContextValue | null>(null);
@@ -437,38 +444,251 @@ export function LibraryProvider({ children }: { children: React.ReactNode }) {
     [showToast]
   );
 
+  const exportLibraryBackup = useCallback(
+    (offlinePlaylists?: OfflinePlaylist[]): LibraryBackupPayload => ({
+      version: 1,
+      app: 'VIBRA',
+      exportedAt: Date.now(),
+      favourites,
+      playlists,
+      recentlyPlayed,
+      searchHistory,
+      listeningStats,
+      trackPositions,
+      ...(offlinePlaylists && offlinePlaylists.length > 0 ? { offlinePlaylists } : {}),
+    }),
+    [favourites, listeningStats, playlists, recentlyPlayed, searchHistory, trackPositions]
+  );
+
+  const importLibraryBackup = useCallback(
+    (
+      rawPayload: unknown,
+      mode: 'merge' | 'replace'
+    ): { playlists: number; favourites: number; recent: number; offlinePlaylists?: OfflinePlaylist[] } => {
+      if (!rawPayload || typeof rawPayload !== 'object') {
+        throw new Error('Invalid backup file format.');
+      }
+      const data = rawPayload as Partial<LibraryBackupPayload>;
+      if (data.app !== 'VIBRA' || data.version !== 1) {
+        throw new Error('Unsupported or corrupted VIBRA backup file.');
+      }
+
+      const incomingFavs = Array.isArray(data.favourites)
+        ? data.favourites.filter((t): t is Track => Boolean(t && t.id && t.title))
+        : [];
+      const incomingPlaylists = Array.isArray(data.playlists)
+        ? data.playlists.filter((p): p is Playlist => Boolean(p && p.id && p.name && Array.isArray(p.tracks)))
+        : [];
+      const incomingRecent = Array.isArray(data.recentlyPlayed)
+        ? data.recentlyPlayed.filter((r): r is RecentlyPlayedItem => Boolean(r && r.track?.id && r.track?.title))
+        : [];
+      const incomingSearches = Array.isArray(data.searchHistory)
+        ? data.searchHistory.filter((s): s is SearchHistoryItem => Boolean(s && typeof s.query === 'string'))
+        : [];
+      const incomingPositions =
+        data.trackPositions && typeof data.trackPositions === 'object' ? data.trackPositions : {};
+      const incomingStats =
+        data.listeningStats && typeof data.listeningStats === 'object' ? data.listeningStats : EMPTY_STATS;
+      const incomingOfflinePlaylists = Array.isArray(data.offlinePlaylists)
+        ? data.offlinePlaylists.filter(
+            (p): p is OfflinePlaylist => Boolean(p && p.id && p.name && Array.isArray(p.trackIds))
+          )
+        : undefined;
+
+      if (mode === 'replace') {
+        setFavourites(incomingFavs);
+        setPlaylists(incomingPlaylists);
+        setRecentlyPlayed(incomingRecent.slice(0, 60));
+        setSearchHistory(incomingSearches.slice(0, 25));
+        setTrackPositions(incomingPositions);
+        setListeningStats({
+          totalPlays: typeof incomingStats.totalPlays === 'number' ? incomingStats.totalPlays : 0,
+          totalSecondsListened:
+            typeof incomingStats.totalSecondsListened === 'number' ? incomingStats.totalSecondsListened : 0,
+          trackStats: incomingStats.trackStats ?? {},
+          artistStats: incomingStats.artistStats ?? {},
+          dailyPlays: incomingStats.dailyPlays ?? {},
+        });
+      } else {
+        setFavourites((prev) => {
+          const seen = new Set(prev.map((t) => t.id));
+          return [...prev, ...incomingFavs.filter((t) => !seen.has(t.id))];
+        });
+
+        setPlaylists((prev) => {
+          const byId = new Map(prev.map((p) => [p.id, p]));
+          for (const imp of incomingPlaylists) {
+            const existing = byId.get(imp.id);
+            if (existing) {
+              const trackIds = new Set(existing.tracks.map((t) => t.id));
+              const mergedTracks = [...existing.tracks, ...imp.tracks.filter((t) => !trackIds.has(t.id))];
+              byId.set(imp.id, { ...existing, tracks: mergedTracks, updatedAt: Date.now() });
+            } else {
+              byId.set(imp.id, imp);
+            }
+          }
+          return Array.from(byId.values());
+        });
+
+        setRecentlyPlayed((prev) => {
+          const map = new Map<string, RecentlyPlayedItem>();
+          for (const item of [...prev, ...incomingRecent]) {
+            const prevItem = map.get(item.track.id);
+            if (!prevItem || item.playedAt > prevItem.playedAt) {
+              map.set(item.track.id, item);
+            }
+          }
+          return Array.from(map.values())
+            .sort((a, b) => b.playedAt - a.playedAt)
+            .slice(0, 60);
+        });
+
+        setSearchHistory((prev) => {
+          const map = new Map<string, SearchHistoryItem>();
+          for (const item of [...prev, ...incomingSearches]) {
+            const k = item.query.toLowerCase();
+            const existing = map.get(k);
+            if (!existing || item.timestamp > existing.timestamp) {
+              map.set(k, item);
+            }
+          }
+          return Array.from(map.values())
+            .sort((a, b) => b.timestamp - a.timestamp)
+            .slice(0, 25);
+        });
+
+        setTrackPositions((prev) => {
+          const next = { ...prev };
+          for (const [id, info] of Object.entries(incomingPositions)) {
+            if (!info || typeof info.positionSeconds !== 'number') continue;
+            if (!next[id] || info.updatedAt > next[id].updatedAt) {
+              next[id] = info;
+            }
+          }
+          return next;
+        });
+
+        setListeningStats((prev) => {
+          const mergedTrackStats = { ...prev.trackStats };
+          for (const [id, stat] of Object.entries(incomingStats.trackStats ?? {})) {
+            const existing = mergedTrackStats[id];
+            if (!existing) {
+              mergedTrackStats[id] = stat;
+            } else {
+              mergedTrackStats[id] = {
+                track: existing.track || stat.track,
+                playCount: Math.max(existing.playCount, stat.playCount),
+                lastPlayedAt: Math.max(existing.lastPlayedAt, stat.lastPlayedAt),
+              };
+            }
+          }
+          const mergedArtistStats = { ...prev.artistStats };
+          for (const [k, stat] of Object.entries(incomingStats.artistStats ?? {})) {
+            const existing = mergedArtistStats[k];
+            if (!existing) {
+              mergedArtistStats[k] = stat;
+            } else {
+              mergedArtistStats[k] = {
+                artist: existing.artist || stat.artist,
+                playCount: Math.max(existing.playCount, stat.playCount),
+                lastPlayedAt: Math.max(existing.lastPlayedAt, stat.lastPlayedAt),
+              };
+            }
+          }
+          const mergedDailyPlays = { ...prev.dailyPlays };
+          for (const [day, count] of Object.entries(incomingStats.dailyPlays ?? {})) {
+            mergedDailyPlays[day] = Math.max(mergedDailyPlays[day] ?? 0, count);
+          }
+          return {
+            totalPlays: Math.max(prev.totalPlays, incomingStats.totalPlays ?? 0),
+            totalSecondsListened: Math.max(
+              prev.totalSecondsListened,
+              incomingStats.totalSecondsListened ?? 0
+            ),
+            trackStats: mergedTrackStats,
+            artistStats: mergedArtistStats,
+            dailyPlays: mergedDailyPlays,
+          };
+        });
+      }
+
+      return {
+        playlists: incomingPlaylists.length,
+        favourites: incomingFavs.length,
+        recent: incomingRecent.length,
+        offlinePlaylists: incomingOfflinePlaylists,
+      };
+    },
+    []
+  );
+
+  const contextValue = useMemo<LibraryContextValue>(
+    () => ({
+      favourites,
+      recentlyPlayed,
+      searchHistory,
+      playlists,
+      listeningStats,
+      trackPositions,
+      toast,
+      showToast,
+      isFavourite,
+      toggleFavourite,
+      recordPlayed,
+      recordOfflinePlayed,
+      recordListeningSeconds,
+      saveTrackPosition,
+      clearTrackPosition,
+      getTrackPosition,
+      clearRecentlyPlayed,
+      clearListeningStats,
+      addSearchQuery,
+      removeSearchQuery,
+      clearSearchHistory,
+      createPlaylist,
+      createPlaylistWithTracks,
+      renamePlaylist,
+      deletePlaylist,
+      addTrackToPlaylist,
+      removeTrackFromPlaylist,
+      exportLibraryBackup,
+      importLibraryBackup,
+    }),
+    [
+      favourites,
+      recentlyPlayed,
+      searchHistory,
+      playlists,
+      listeningStats,
+      trackPositions,
+      toast,
+      showToast,
+      isFavourite,
+      toggleFavourite,
+      recordPlayed,
+      recordOfflinePlayed,
+      recordListeningSeconds,
+      saveTrackPosition,
+      clearTrackPosition,
+      getTrackPosition,
+      clearRecentlyPlayed,
+      clearListeningStats,
+      addSearchQuery,
+      removeSearchQuery,
+      clearSearchHistory,
+      createPlaylist,
+      createPlaylistWithTracks,
+      renamePlaylist,
+      deletePlaylist,
+      addTrackToPlaylist,
+      removeTrackFromPlaylist,
+      exportLibraryBackup,
+      importLibraryBackup,
+    ]
+  );
+
   return (
-    <LibraryContext.Provider
-      value={{
-        favourites,
-        recentlyPlayed,
-        searchHistory,
-        playlists,
-        listeningStats,
-        trackPositions,
-        toast,
-        showToast,
-        isFavourite,
-        toggleFavourite,
-        recordPlayed,
-        recordOfflinePlayed,
-        recordListeningSeconds,
-        saveTrackPosition,
-        clearTrackPosition,
-        getTrackPosition,
-        clearRecentlyPlayed,
-        clearListeningStats,
-        addSearchQuery,
-        removeSearchQuery,
-        clearSearchHistory,
-        createPlaylist,
-        createPlaylistWithTracks,
-        renamePlaylist,
-        deletePlaylist,
-        addTrackToPlaylist,
-        removeTrackFromPlaylist,
-      }}
-    >
+    <LibraryContext.Provider value={contextValue}>
       {children}
     </LibraryContext.Provider>
   );

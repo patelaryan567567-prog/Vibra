@@ -1,8 +1,12 @@
 import type {
   AiDiscoveryResponse,
+  ArtistProfileResponse,
   CategoryId,
   ConfigStatus,
   IndiaLanguageFilter,
+  LyricLine,
+  LyricsEnhanceMode,
+  LyricsResponse,
   Track,
 } from '../types/music';
 
@@ -204,11 +208,20 @@ export async function discoverWithAi(prompt: string, signal?: AbortSignal): Prom
 
 export interface ResolvedAudioStream {
   mode: 'proxy' | 'hls' | 'direct' | 'youtube';
-  provider?: 'jiosaavn' | 'soundcloud';
+  provider?: 'jiosaavn' | 'soundcloud' | 'audius' | 'archive';
   streamUrl?: string;
   matchedTitle?: string;
   matchedArtist?: string;
   durationSeconds?: number;
+}
+
+const prewarmRequestedIds = new Set<string>();
+
+export function getCachedAudioMode(
+  videoId: string
+): ResolvedAudioStream['mode'] | undefined {
+  const hit = getClientCache<ResolvedAudioStream>(`audio_res:${videoId}`);
+  return hit?.mode;
 }
 
 export async function resolveAudioStream(
@@ -234,5 +247,169 @@ export async function resolveAudioStream(
   } catch {
     return { mode: 'youtube' };
   }
+}
+
+export function prewarmTrackAudio(track: Track | null | undefined): void {
+  if (!track?.id || !track.title) return;
+  if (track.isOffline || track.offlineTrackId || track.isVideo || track.id.startsWith('dl_') || track.id.startsWith('local_')) {
+    return;
+  }
+  if (getClientCache<ResolvedAudioStream>(`audio_res:${track.id}`)) return;
+  if (prewarmRequestedIds.has(track.id)) return;
+
+  prewarmRequestedIds.add(track.id);
+  if (prewarmRequestedIds.size > 300) {
+    const first = prewarmRequestedIds.values().next().value;
+    if (first) prewarmRequestedIds.delete(first);
+  }
+
+  void resolveAudioStream(track);
+}
+
+export function prewarmTrackBatch(tracks: Track[]): void {
+  if (!Array.isArray(tracks) || tracks.length === 0) return;
+  const targets = tracks
+    .filter(
+      (t) =>
+        Boolean(t?.id && t.title) &&
+        !t.isOffline &&
+        !t.offlineTrackId &&
+        !t.isVideo &&
+        !t.id.startsWith('dl_') &&
+        !t.id.startsWith('local_') &&
+        !prewarmRequestedIds.has(t.id) &&
+        !getClientCache<ResolvedAudioStream>(`audio_res:${t.id}`)
+    )
+    .slice(0, 6);
+
+  if (targets.length === 0) return;
+  for (const t of targets) {
+    prewarmRequestedIds.add(t.id);
+  }
+  if (prewarmRequestedIds.size > 300) {
+    for (const key of Array.from(prewarmRequestedIds).slice(0, 80)) {
+      prewarmRequestedIds.delete(key);
+    }
+  }
+
+  void fetch('/api/audio/prewarm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      tracks: targets.map((t) => ({
+        videoId: t.id,
+        title: t.title,
+        artist: t.artist,
+        durationSeconds: t.durationSeconds || 0,
+      })),
+    }),
+  })
+    .then(async (res) => {
+      if (!res.ok) return;
+      const data = (await res.json()) as { results?: Record<string, ResolvedAudioStream> };
+      if (!data.results) return;
+      for (const [vid, resolved] of Object.entries(data.results)) {
+        if (resolved && resolved.mode) {
+          setClientCache(
+            `audio_res:${vid}`,
+            resolved,
+            resolved.mode === 'youtube' ? 8 * 60 * 1000 : 20 * 60 * 1000
+          );
+        }
+      }
+    })
+    .catch(() => {
+      // ignore background prewarm failure
+    });
+}
+
+export async function fetchTrackLyrics(params: {
+  title: string;
+  artist?: string;
+  durationSeconds?: number;
+  forceAi?: boolean;
+  signal?: AbortSignal;
+}): Promise<LyricsResponse> {
+  const title = params.title.trim();
+  const artist = (params.artist || '').trim();
+  const dur = Math.round(params.durationSeconds || 0);
+  const forceAi = Boolean(params.forceAi);
+  if (!title) return { found: false, syncedLines: [], plainLyrics: null };
+
+  const cacheKey = `lyrics:${forceAi ? 'ai' : 'std'}:${title.toLowerCase()}:${artist.toLowerCase()}:${dur}`;
+  const hit = getClientCache<LyricsResponse>(cacheKey);
+  if (hit && hit.found) return hit;
+
+  const sp = new URLSearchParams({ title });
+  if (artist) sp.set('artist', artist);
+  if (dur > 0) sp.set('duration', String(dur));
+  if (forceAi) sp.set('ai', '1');
+
+  const res = await fetch(`/api/lyrics?${sp.toString()}`, { signal: params.signal });
+  const data = await handleResponse<LyricsResponse>(res);
+  if (data.found) {
+    setClientCache(cacheKey, data, 6 * 60 * 60 * 1000);
+  }
+  return data;
+}
+
+export async function enhanceTrackLyrics(params: {
+  title: string;
+  artist?: string;
+  rawLyrics?: string | null;
+  syncedLines?: LyricLine[];
+  mode: LyricsEnhanceMode;
+  signal?: AbortSignal;
+}): Promise<LyricsResponse> {
+  const title = params.title.trim();
+  const artist = (params.artist || '').trim();
+  if (!title) return { found: false, syncedLines: [], plainLyrics: null };
+
+  const cacheKey = `lyrics_enh:${params.mode}:${title.toLowerCase()}:${artist.toLowerCase()}:${params.syncedLines?.length || 0}:${params.rawLyrics?.length || 0}`;
+  const hit = getClientCache<LyricsResponse>(cacheKey);
+  if (hit && hit.found) return hit;
+
+  const res = await fetch('/api/lyrics/enhance', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      title,
+      artist,
+      rawLyrics: params.rawLyrics ?? null,
+      syncedLines: params.syncedLines ?? [],
+      mode: params.mode,
+    }),
+    signal: params.signal,
+  });
+  const data = await handleResponse<LyricsResponse>(res);
+  if (data.found) {
+    setClientCache(cacheKey, data, 6 * 60 * 60 * 1000);
+  }
+  return data;
+}
+
+export async function fetchArtistProfile(params: {
+  artist: string;
+  seedVideoId?: string;
+  signal?: AbortSignal;
+}): Promise<ArtistProfileResponse> {
+  const artist = params.artist.trim();
+  if (!artist) {
+    return { artistName: 'Unknown Artist', topTracks: [], musicVideos: [], relatedArtists: [] };
+  }
+  const cacheKey = `artist:${artist.toLowerCase()}:${params.seedVideoId || ''}`;
+  const hit = getClientCache<ArtistProfileResponse>(cacheKey);
+  if (hit && hit.topTracks.length > 0) return hit;
+
+  const sp = new URLSearchParams({ artist });
+  if (params.seedVideoId && !params.seedVideoId.startsWith('dl_') && !params.seedVideoId.startsWith('local_') && !params.seedVideoId.startsWith('src_')) {
+    sp.set('seedVideoId', params.seedVideoId);
+  }
+  const res = await fetch(`/api/youtube/artist?${sp.toString()}`, { signal: params.signal });
+  const data = await handleResponse<ArtistProfileResponse>(res);
+  if (data.topTracks.length > 0) {
+    setClientCache(cacheKey, data, 45 * 60 * 1000);
+  }
+  return data;
 }
 

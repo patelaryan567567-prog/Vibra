@@ -1,6 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AudioSourceProvider,
+  BatchDownloadState,
   DownloadProgressItem,
   MultiSourceTrack,
   OfflinePlaylist,
@@ -74,6 +75,18 @@ interface OfflineMusicContextValue {
   deleteOfflinePlaylist: (playlistId: string) => void;
   addTrackToOfflinePlaylist: (playlistId: string, trackId: string) => void;
   removeTrackFromOfflinePlaylist: (playlistId: string, trackId: string) => void;
+  batchDownloadState: BatchDownloadState | null;
+  isBatchDownloading: boolean;
+  batchDownloadTracks: (
+    tracks: Track[],
+    label?: string,
+    alsoDownloadToDevice?: boolean
+  ) => Promise<void>;
+  cancelBatchDownload: () => void;
+  importOfflinePlaylistsBackup: (
+    incoming: OfflinePlaylist[],
+    mode: 'merge' | 'replace'
+  ) => void;
 }
 
 const OfflineMusicContext = createContext<OfflineMusicContextValue | null>(null);
@@ -96,6 +109,11 @@ export function OfflineMusicProvider({ children }: { children: React.ReactNode }
   const [savedFolderHandle, setSavedFolderHandle] = useState<FileSystemDirectoryHandleLike | null>(null);
   const [downloadingIds, setDownloadingIds] = useState<Record<string, boolean>>({});
   const [downloadProgressMap, setDownloadProgressMap] = useState<Record<string, DownloadProgressItem>>({});
+  const [batchDownloadState, setBatchDownloadState] = useState<BatchDownloadState | null>(null);
+  const batchCancelRef = useRef(false);
+  const batchRunningRef = useRef(false);
+  const offlineTracksRef = useRef<OfflineTrack[]>([]);
+  offlineTracksRef.current = offlineTracks;
   const clearTimersRef = useRef<Record<string, number>>({});
   const [isOnline, setIsOnline] = useState<boolean>(() =>
     typeof navigator !== 'undefined' ? navigator.onLine : true
@@ -613,6 +631,191 @@ export function OfflineMusicProvider({ children }: { children: React.ReactNode }
     [showToast]
   );
 
+  const cancelBatchDownload = useCallback(() => {
+    batchCancelRef.current = true;
+    showToast('Stopping batch download after current song...');
+  }, [showToast]);
+
+  const batchDownloadTracks = useCallback(
+    async (tracks: Track[], label = 'Playlist', alsoDownloadToDevice = false) => {
+      if (batchRunningRef.current) {
+        showToast('A batch download is already in progress');
+        return;
+      }
+
+      const seen = new Set<string>();
+      const uniqueTracks = tracks.filter((t) => {
+        if (!t || !t.id || t.isOffline) return false;
+        if (seen.has(t.id)) return false;
+        seen.add(t.id);
+        return true;
+      });
+
+      if (uniqueTracks.length === 0) {
+        showToast('No downloadable online tracks found in this list');
+        return;
+      }
+
+      batchRunningRef.current = true;
+      batchCancelRef.current = false;
+
+      let completed = 0;
+      let skipped = 0;
+      let failed = 0;
+
+      await requestPersistentBrowserStorage();
+      setBatchDownloadState({
+        label,
+        total: uniqueTracks.length,
+        completed: 0,
+        skipped: 0,
+        failed: 0,
+        currentTitle: uniqueTracks[0].title,
+      });
+
+      showToast(`Starting download for "${label}" (${uniqueTracks.length} songs)...`);
+
+      try {
+        for (const track of uniqueTracks) {
+          if (batchCancelRef.current) break;
+
+          const alreadySaved = offlineTracksRef.current.some(
+            (o) => o.sourceVideoId === track.id || o.id === `dl_${track.id}`
+          );
+          if (alreadySaved) {
+            skipped += 1;
+            setBatchDownloadState({
+              label,
+              total: uniqueTracks.length,
+              completed,
+              skipped,
+              failed,
+              currentTitle: track.title,
+            });
+            continue;
+          }
+
+          setBatchDownloadState({
+            label,
+            total: uniqueTracks.length,
+            completed,
+            skipped,
+            failed,
+            currentTitle: track.title,
+          });
+
+          setDownloadingIds((prev) => ({ ...prev, [track.id]: true }));
+          setTrackProgress({
+            trackId: track.id,
+            title: track.title,
+            artist: track.artist,
+            percent: 2,
+            loadedBytes: 0,
+            totalBytes: 0,
+            remainingBytes: 0,
+            phase: 'resolving',
+          });
+
+          let ok = false;
+          try {
+            await saveOnlineTrackOffline(track, {
+              alsoDownloadToDevice,
+              onProgress: (p) => {
+                setTrackProgress({
+                  trackId: track.id,
+                  title: track.title,
+                  artist: track.artist,
+                  percent: p.percent,
+                  loadedBytes: p.loadedBytes,
+                  totalBytes: p.totalBytes,
+                  remainingBytes: p.remainingBytes,
+                  phase: p.percent >= 100 ? 'saving' : 'downloading',
+                });
+              },
+            });
+            ok = true;
+            completed += 1;
+            setTrackProgress({
+              trackId: track.id,
+              title: track.title,
+              artist: track.artist,
+              percent: 100,
+              loadedBytes: 1,
+              totalBytes: 1,
+              remainingBytes: 0,
+              phase: 'done',
+            });
+            await refreshTracksFromDb();
+          } catch {
+            failed += 1;
+          } finally {
+            setDownloadingIds((prev) => {
+              const next = { ...prev };
+              delete next[track.id];
+              return next;
+            });
+            clearTrackProgressLater(track.id, ok ? 1400 : 0);
+          }
+
+          setBatchDownloadState({
+            label,
+            total: uniqueTracks.length,
+            completed,
+            skipped,
+            failed,
+            currentTitle: track.title,
+          });
+        }
+
+        if (batchCancelRef.current) {
+          showToast(
+            `Batch cancelled · ${completed} saved${skipped > 0 ? `, ${skipped} already offline` : ''}`
+          );
+        } else {
+          const parts = [`${completed} saved to My Music`];
+          if (skipped > 0) parts.push(`${skipped} already offline`);
+          if (failed > 0) parts.push(`${failed} failed`);
+          showToast(`Finished "${label}": ${parts.join(' · ')}`);
+        }
+      } finally {
+        batchRunningRef.current = false;
+        batchCancelRef.current = false;
+        setBatchDownloadState(null);
+      }
+    },
+    [
+      clearTrackProgressLater,
+      refreshTracksFromDb,
+      requestPersistentBrowserStorage,
+      setTrackProgress,
+      showToast,
+    ]
+  );
+
+  const importOfflinePlaylistsBackup = useCallback(
+    (incoming: OfflinePlaylist[], mode: 'merge' | 'replace') => {
+      if (!Array.isArray(incoming)) return;
+      if (mode === 'replace') {
+        setOfflinePlaylists(incoming);
+        return;
+      }
+      setOfflinePlaylists((prev) => {
+        const byId = new Map(prev.map((p) => [p.id, p]));
+        for (const imp of incoming) {
+          const existing = byId.get(imp.id);
+          if (existing) {
+            const ids = Array.from(new Set([...existing.trackIds, ...imp.trackIds]));
+            byId.set(imp.id, { ...existing, trackIds: ids, updatedAt: Date.now() });
+          } else {
+            byId.set(imp.id, imp);
+          }
+        }
+        return Array.from(byId.values());
+      });
+    },
+    []
+  );
+
   return (
     <OfflineMusicContext.Provider
       value={{
@@ -644,6 +847,11 @@ export function OfflineMusicProvider({ children }: { children: React.ReactNode }
         deleteOfflinePlaylist,
         addTrackToOfflinePlaylist,
         removeTrackFromOfflinePlaylist,
+        batchDownloadState,
+        isBatchDownloading: Boolean(batchDownloadState),
+        batchDownloadTracks,
+        cancelBatchDownload,
+        importOfflinePlaylistsBackup,
       }}
     >
       {children}

@@ -1,16 +1,22 @@
-import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { OfflineTrack, RepeatMode } from '../types/music';
 import {
   acquirePlaybackWakeLock,
   getSilentLoopBlobUrl,
+  pauseKeepAliveBridgeIfForeground,
   pokeBackgroundKeepAlive,
   releasePlaybackWakeLock,
   startWebAudioKeepAlive,
   stopWebAudioKeepAlive,
 } from '../utils/backgroundAudio';
-import { formatSeconds } from '../utils/format';
+import { formatSeconds, parseDurationLabel } from '../utils/format';
 import { getAllOfflineTracks, getOfflineTrackBlob } from '../utils/offlineMusicDb';
 import { useLibrary } from './LibraryContext';
+
+interface OfflinePlayerTimeContextValue {
+  currentTime: number;
+  duration: number;
+}
 
 interface OfflinePlayerContextValue {
   currentTrack: OfflineTrack | null;
@@ -18,14 +24,12 @@ interface OfflinePlayerContextValue {
   currentIndex: number;
   isPlaying: boolean;
   isBuffering: boolean;
-  currentTime: number;
-  duration: number;
   volume: number;
   isMuted: boolean;
   repeatMode: RepeatMode;
   isShuffle: boolean;
   isExpanded: boolean;
-  mobilePlayerView: 'player' | 'queue';
+  mobilePlayerView: 'player' | 'queue' | 'lyrics';
   isQueueOpen: boolean;
   isBackgroundPlay: boolean;
   playerError: string | null;
@@ -40,18 +44,20 @@ interface OfflinePlayerContextValue {
   nextTrack: () => void;
   prevTrack: () => void;
   seekTo: (seconds: number) => void;
+  seekBy: (deltaSeconds: number) => void;
   setVolume: (vol: number) => void;
   toggleMute: () => void;
   cycleRepeat: () => void;
   toggleShuffle: () => void;
   toggleBackgroundPlay: () => void;
   setIsExpanded: (val: boolean) => void;
-  setMobilePlayerView: (view: 'player' | 'queue') => void;
+  setMobilePlayerView: (view: 'player' | 'queue' | 'lyrics') => void;
   setIsQueueOpen: (val: boolean) => void;
   jumpToOfflineQueueIndex: (index: number) => void;
 }
 
 const OfflinePlayerContext = createContext<OfflinePlayerContextValue | null>(null);
+const OfflinePlayerTimeContext = createContext<OfflinePlayerTimeContextValue | null>(null);
 
 const OFFLINE_SESSION_KEY = 'vibra_offline_session_v1';
 const ACTIVE_PLAYER_KEY = 'vibra_active_player';
@@ -149,7 +155,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
   const [repeatMode, setRepeatMode] = useState<RepeatMode>('all');
   const [isShuffle, setIsShuffle] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
-  const [mobilePlayerView, setMobilePlayerView] = useState<'player' | 'queue'>('player');
+  const [mobilePlayerView, setMobilePlayerView] = useState<'player' | 'queue' | 'lyrics'>('player');
   const [isQueueOpen, setIsQueueOpen] = useState(false);
   const [isBackgroundPlay, setIsBackgroundPlay] = useState<boolean>(() => {
     const saved = localStorage.getItem('vibra_bg_play');
@@ -164,6 +170,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
   const pendingSeekSecRef = useRef<number>(0);
   const loadedTrackIdRef = useRef<string | null>(null);
   const loadedAudioTrackIdRef = useRef<string | null>(null);
+  const audioKickDoneForLoadRef = useRef<string | null>(null);
   const shouldPlayRef = useRef(false);
   const userPausedRef = useRef(false);
   const endedHandledForLoadRef = useRef<string | null>(null);
@@ -251,16 +258,20 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       if (!audio) return;
 
       loadedAudioTrackIdRef.current = track.id;
+      audioKickDoneForLoadRef.current = null;
       pendingSeekSecRef.current = resumeSec > 0.5 ? resumeSec : 0;
       currentTimeRef.current = resumeSec > 0.5 ? resumeSec : 0;
       setCurrentTime(resumeSec > 0.5 ? resumeSec : 0);
 
       audio.muted = isMutedRef.current;
       audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
+      audio.playbackRate = 1;
 
-      if (isBackgroundPlayRef.current && shouldPlayRef.current && !userPausedRef.current) {
+      if (isBackgroundPlayRef.current && shouldPlayRef.current && !userPausedRef.current && document.hidden) {
         startWebAudioKeepAlive();
         pokeBackgroundKeepAlive();
+      } else {
+        pauseKeepAliveBridgeIfForeground();
       }
 
       const cachedUrl = offlineBlobUrlCache.get(track.id);
@@ -268,7 +279,9 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         isSilentWarmupRef.current = false;
         audio.loop = false;
         if (audio.src !== cachedUrl) {
+          audio.pause();
           audio.src = cachedUrl;
+          audio.load();
         } else if (resumeSec <= 0.5) {
           try {
             audio.currentTime = 0;
@@ -286,6 +299,8 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
             void p
               .then(() => {
                 audioUnlockedRef.current = true;
+                audio.muted = isMutedRef.current;
+                audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
                 if (pendingSeekSecRef.current > 0.5) {
                   applyPendingSeek(audio);
                 }
@@ -300,28 +315,34 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         return;
       }
 
-      // Keep <audio> actively looping the non-zero sub-audible WAV bridge while IndexedDB loads
-      isSilentWarmupRef.current = true;
-      const silentUrl = getSilentLoopBlobUrl();
-      audio.loop = true;
-      if (audio.src !== silentUrl) {
-        audio.src = silentUrl;
+      // Only run the silent WAV warmup on <audio> when tab is hidden/backgrounded
+      // (avoids swapping audio.src twice in 10ms in foreground which can stall Chromium's decoder!)
+      if (document.hidden) {
+        isSilentWarmupRef.current = true;
+        const silentUrl = getSilentLoopBlobUrl();
+        audio.loop = true;
+        if (audio.src !== silentUrl) {
+          audio.src = silentUrl;
+        }
+        if (shouldPlayRef.current && !userPausedRef.current) {
+          try {
+            const wp = audio.play();
+            if (wp) {
+              void wp
+                .then(() => {
+                  audioUnlockedRef.current = true;
+                })
+                .catch(() => {});
+            }
+          } catch {
+            // ignore
+          }
+        }
+      } else {
+        isSilentWarmupRef.current = false;
+        audio.loop = false;
       }
       setIsBuffering(true);
-      if (shouldPlayRef.current && !userPausedRef.current) {
-        try {
-          const wp = audio.play();
-          if (wp) {
-            void wp
-              .then(() => {
-                audioUnlockedRef.current = true;
-              })
-              .catch(() => {});
-          }
-        } catch {
-          // ignore
-        }
-      }
 
       const keepSet = new Set<string>([track.id]);
       const q = queueRef.current;
@@ -352,11 +373,20 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         }
 
         isSilentWarmupRef.current = false;
+        audio.pause();
         audio.loop = false;
         audio.muted = isMutedRef.current;
         audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
+        audio.playbackRate = 1;
         if (audio.src !== blobUrl) {
           audio.src = blobUrl;
+          audio.load();
+        } else if (resumeSec <= 0.5) {
+          try {
+            audio.currentTime = 0;
+          } catch {
+            // ignore
+          }
         }
 
         if (shouldPlayRef.current && !userPausedRef.current) {
@@ -365,6 +395,8 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
             void p
               .then(() => {
                 audioUnlockedRef.current = true;
+                audio.muted = isMutedRef.current;
+                audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
                 if (pendingSeekSecRef.current > 0.5) {
                   applyPendingSeek(audio);
                 }
@@ -509,10 +541,15 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
           if (parsed.repeatMode) setRepeatMode(parsed.repeatMode);
           if (typeof parsed.isShuffle === 'boolean') setIsShuffle(parsed.isShuffle);
 
+          // Always restore the previous offline song in PAUSED state on app open so the user chooses when to resume
+          shouldPlayRef.current = false;
+          userPausedRef.current = true;
           loadedTrackIdRef.current = restoredTrack.id;
           loadedAudioTrackIdRef.current = restoredTrack.id;
           pendingSeekSecRef.current = restoredTime;
           currentTimeRef.current = restoredTime;
+          setIsPlaying(false);
+          setIsBuffering(false);
           setCurrentTime(restoredTime);
           setDuration(restoredTrack.durationSeconds || 0);
           setQueue(restoredQueue);
@@ -524,26 +561,13 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
           void ensureOfflineBlobUrl(restoredTrack, keepSet).then((blobUrl) => {
             const audio = audioElRef.current;
             if (!audio || !blobUrl) return;
+            if (loadedAudioTrackIdRef.current !== restoredTrack.id) return;
+            audio.muted = isMutedRef.current;
+            audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
             if (!audio.getAttribute('src')) {
+              audio.pause();
               audio.src = blobUrl;
-            }
-            if (parsed.wasPlaying) {
-              shouldPlayRef.current = true;
-              userPausedRef.current = false;
-              const p = audio.play();
-              if (p) {
-                void p
-                  .then(() => {
-                    audioUnlockedRef.current = true;
-                    setIsPlaying(true);
-                    if (pendingSeekSecRef.current > 0.5) {
-                      applyPendingSeek(audio);
-                    }
-                  })
-                  .catch(() => {
-                    setIsPlaying(false);
-                  });
-              }
+              audio.load();
             }
           });
         })
@@ -551,7 +575,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
     } catch {
       // ignore malformed storage
     }
-  }, [applyPendingSeek, getTrackPosition]);
+  }, [getTrackPosition]);
 
   // Persist offline session state so OS tab eviction/reload never loses the queue or song position
   const saveOfflineSession = useCallback(
@@ -994,6 +1018,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
   const togglePlay = useCallback(() => {
     if (!currentTrack || !audioElRef.current) return;
     const audio = audioElRef.current;
+    const curSec = currentTimeRef.current;
     if (!audio.paused && shouldPlayRef.current) {
       userPausedRef.current = true;
       shouldPlayRef.current = false;
@@ -1001,8 +1026,8 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       void releasePlaybackWakeLock();
       audio.pause();
       setIsPlaying(false);
-      persistCurrentTrackResume(currentTime);
-      saveOfflineSession(currentTime, false);
+      persistCurrentTrackResume(curSec);
+      saveOfflineSession(curSec, false);
     } else {
       window.dispatchEvent(new CustomEvent('vibra:pause-online-player'));
       isYieldedToOnlineRef.current = false;
@@ -1016,10 +1041,17 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         void acquirePlaybackWakeLock();
       }
       const savedPos = getTrackPosition(currentTrack.id)?.positionSeconds ?? 0;
-      const effectiveResume = currentTime > 0.5 ? currentTime : savedPos;
-      if (!audio.getAttribute('src') || audio.src.startsWith('data:')) {
+      const effectiveResume = curSec > 0.5 ? curSec : savedPos;
+      if (
+        !audio.getAttribute('src') ||
+        audio.src.startsWith('data:') ||
+        audio.error ||
+        loadedAudioTrackIdRef.current !== currentTrack.id
+      ) {
         beginOfflineTrackAudio(currentTrack, effectiveResume);
       } else {
+        audio.muted = isMutedRef.current;
+        audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
         if (effectiveResume > 0.5 && Math.abs((audio.currentTime || 0) - effectiveResume) > 2) {
           pendingSeekSecRef.current = effectiveResume;
           applyPendingSeek(audio);
@@ -1033,7 +1065,6 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
   }, [
     applyPendingSeek,
     beginOfflineTrackAudio,
-    currentTime,
     currentTrack,
     getTrackPosition,
     persistCurrentTrackResume,
@@ -1082,8 +1113,9 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       pokeBackgroundKeepAlive();
       void acquirePlaybackWakeLock();
     }
-    if (currentTime > 4 && audioElRef.current && !isSilentWarmupRef.current) {
+    if (currentTimeRef.current > 4 && audioElRef.current && !isSilentWarmupRef.current) {
       audioElRef.current.currentTime = 0;
+      currentTimeRef.current = 0;
       setCurrentTime(0);
       if (q[idx]) clearTrackPosition(q[idx].id);
       return;
@@ -1092,7 +1124,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
     const targetIdx = idx - 1 >= 0 ? idx - 1 : q.length - 1;
     if (q[targetIdx]) beginOfflineTrackAudio(q[targetIdx], 0);
     setCurrentIndex(targetIdx);
-  }, [beginOfflineTrackAudio, clearTrackPosition, currentTime, persistCurrentTrackResume]);
+  }, [beginOfflineTrackAudio, clearTrackPosition, persistCurrentTrackResume]);
 
   const seekTo = useCallback(
     (seconds: number) => {
@@ -1109,6 +1141,20 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       }
     },
     [persistCurrentTrackResume]
+  );
+
+  const seekBy = useCallback(
+    (deltaSeconds: number) => {
+      const curTrack = queueRef.current[currentIndexRef.current];
+      const effDur =
+        durationRef.current > 0
+          ? durationRef.current
+          : curTrack?.durationSeconds || parseDurationLabel(curTrack?.duration) || 0;
+      const rawNext = currentTimeRef.current + deltaSeconds;
+      const clamped = effDur > 0 ? Math.max(0, Math.min(effDur, rawNext)) : Math.max(0, rawNext);
+      seekTo(clamped);
+    },
+    [seekTo]
   );
 
   const setVolume = useCallback(
@@ -1267,47 +1313,90 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
     }
   }, [currentTrack, isPlaying, isBackgroundPlay, isYieldedToOnline, persistCurrentTrackResume, seekTo]);
 
+  const effectiveCurrentTrack = isYieldedToOnline ? null : currentTrack;
+
+  const offlineContextValue = useMemo<OfflinePlayerContextValue>(
+    () => ({
+      currentTrack: effectiveCurrentTrack,
+      queue,
+      currentIndex,
+      isPlaying,
+      isBuffering,
+      volume,
+      isMuted,
+      repeatMode,
+      isShuffle,
+      isExpanded,
+      mobilePlayerView,
+      isQueueOpen,
+      isBackgroundPlay,
+      playerError,
+      playOfflineTrack,
+      addToOfflineQueue,
+      playNextInOfflineQueue,
+      removeFromOfflineQueue,
+      moveOfflineQueueItem,
+      shuffleUpcomingOfflineQueue,
+      clearOfflineQueue,
+      togglePlay,
+      nextTrack,
+      prevTrack,
+      seekTo,
+      seekBy,
+      setVolume,
+      toggleMute,
+      cycleRepeat,
+      toggleShuffle,
+      toggleBackgroundPlay,
+      setIsExpanded,
+      setMobilePlayerView,
+      setIsQueueOpen,
+      jumpToOfflineQueueIndex,
+    }),
+    [
+      effectiveCurrentTrack,
+      queue,
+      currentIndex,
+      isPlaying,
+      isBuffering,
+      volume,
+      isMuted,
+      repeatMode,
+      isShuffle,
+      isExpanded,
+      mobilePlayerView,
+      isQueueOpen,
+      isBackgroundPlay,
+      playerError,
+      playOfflineTrack,
+      addToOfflineQueue,
+      playNextInOfflineQueue,
+      removeFromOfflineQueue,
+      moveOfflineQueueItem,
+      shuffleUpcomingOfflineQueue,
+      clearOfflineQueue,
+      togglePlay,
+      nextTrack,
+      prevTrack,
+      seekTo,
+      seekBy,
+      setVolume,
+      toggleMute,
+      cycleRepeat,
+      toggleShuffle,
+      toggleBackgroundPlay,
+      jumpToOfflineQueueIndex,
+    ]
+  );
+
+  const offlineTimeValue = useMemo<OfflinePlayerTimeContextValue>(
+    () => ({ currentTime, duration }),
+    [currentTime, duration]
+  );
+
   return (
-    <OfflinePlayerContext.Provider
-      value={{
-        currentTrack: isYieldedToOnline ? null : currentTrack,
-        queue,
-        currentIndex,
-        isPlaying,
-        isBuffering,
-        currentTime,
-        duration,
-        volume,
-        isMuted,
-        repeatMode,
-        isShuffle,
-        isExpanded,
-        mobilePlayerView,
-        isQueueOpen,
-        isBackgroundPlay,
-        playerError,
-        playOfflineTrack,
-        addToOfflineQueue,
-        playNextInOfflineQueue,
-        removeFromOfflineQueue,
-        moveOfflineQueueItem,
-        shuffleUpcomingOfflineQueue,
-        clearOfflineQueue,
-        togglePlay,
-        nextTrack,
-        prevTrack,
-        seekTo,
-        setVolume,
-        toggleMute,
-        cycleRepeat,
-        toggleShuffle,
-        toggleBackgroundPlay,
-        setIsExpanded,
-        setMobilePlayerView,
-        setIsQueueOpen,
-        jumpToOfflineQueueIndex,
-      }}
-    >
+    <OfflinePlayerContext.Provider value={offlineContextValue}>
+      <OfflinePlayerTimeContext.Provider value={offlineTimeValue}>
       <audio
         ref={audioElRef}
         preload="auto"
@@ -1316,9 +1405,42 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         onPlaying={() => {
           if (isSilentWarmupRef.current) return;
           const a = audioElRef.current;
-          if (a && pendingSeekSecRef.current > 0.5) {
-            applyPendingSeek(a);
+          if (a) {
+            a.muted = isMutedRef.current;
+            a.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
+            a.playbackRate = 1;
+            if (pendingSeekSecRef.current > 0.5) {
+              applyPendingSeek(a);
+            } else if (
+              a.currentTime < 0.35 &&
+              audioKickDoneForLoadRef.current !== loadedAudioTrackIdRef.current
+            ) {
+              const loadTrackId = loadedAudioTrackIdRef.current;
+              audioKickDoneForLoadRef.current = loadTrackId;
+              window.setTimeout(() => {
+                const el = audioElRef.current;
+                if (
+                  !el ||
+                  loadedAudioTrackIdRef.current !== loadTrackId ||
+                  el.paused ||
+                  el.ended ||
+                  isSilentWarmupRef.current
+                ) {
+                  return;
+                }
+                el.muted = isMutedRef.current;
+                el.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
+                if (Number.isFinite(el.duration) && el.duration > 3 && el.currentTime < 0.08) {
+                  try {
+                    el.currentTime = 0.08;
+                  } catch {
+                    // ignore
+                  }
+                }
+              }, 220);
+            }
           }
+          pauseKeepAliveBridgeIfForeground();
           errorSkipStreakRef.current = 0;
           setIsPlaying(true);
           setIsBuffering(false);
@@ -1463,6 +1585,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         }}
       />
       {children}
+      </OfflinePlayerTimeContext.Provider>
     </OfflinePlayerContext.Provider>
   );
 }
@@ -1470,5 +1593,11 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
 export function useOfflinePlayer(): OfflinePlayerContextValue {
   const ctx = useContext(OfflinePlayerContext);
   if (!ctx) throw new Error('useOfflinePlayer must be used within OfflinePlayerProvider');
+  return ctx;
+}
+
+export function useOfflinePlayerTime(): OfflinePlayerTimeContextValue {
+  const ctx = useContext(OfflinePlayerTimeContext);
+  if (!ctx) throw new Error('useOfflinePlayerTime must be used within OfflinePlayerProvider');
   return ctx;
 }

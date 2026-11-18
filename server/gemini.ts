@@ -580,3 +580,257 @@ export async function generateCategoryQueries(
   inFlightCatSongs.set(cacheKey, job);
   return job;
 }
+
+export interface AiLyricsResult {
+  found: boolean;
+  plainLyrics: string | null;
+  cleanedSyncedTexts?: string[];
+  source: string;
+}
+
+const aiLyricsCache = new Map<string, CacheEntry<AiLyricsResult>>();
+const aiLyricsInFlight = new Map<string, Promise<AiLyricsResult>>();
+
+export async function findAndFormatLyricsWithAi(params: {
+  title: string;
+  artist?: string;
+}): Promise<AiLyricsResult> {
+  const title = params.title.trim().slice(0, 180);
+  const artist = (params.artist || '').trim().slice(0, 120);
+  if (!title) return { found: false, plainLyrics: null, source: 'Gemini AI' };
+
+  const cacheKey = `find:${title.toLowerCase()}::${artist.toLowerCase()}`;
+  const hit = getCached(aiLyricsCache, cacheKey);
+  if (hit) return hit;
+
+  const existing = aiLyricsInFlight.get(cacheKey);
+  if (existing) return existing;
+
+  const job = (async (): Promise<AiLyricsResult> => {
+    // Step 1: Use Google Search grounding to fetch exact lyrics from lyrics websites and format cleanly
+    let searchText = '';
+    try {
+      const searchResp = await executeGeminiWithFailover(
+        (ai) =>
+          ai.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents:
+              `Search live lyrics websites (like Genius, Musixmatch, LyricsMint, AZLyrics, JioSaavn) and retrieve the COMPLETE, authentic lyrics for the song "${title}"${artist ? ` by ${artist}` : ''}.\n` +
+              `Formatting requirements:\n` +
+              `- Add clear section headers: [Intro], [Verse 1], [Pre-Chorus], [Chorus], [Verse 2], [Bridge], [Outro].\n` +
+              `- Separate every stanza with a blank line.\n` +
+              `- Keep lines crisp and singable (roughly 5-10 words per line).\n` +
+              `- For Hindi, Punjabi, or Urdu songs, ALWAYS write in clean, natural Romanized Hinglish (Latin alphabet) so anyone can sing along effortlessly—never output raw Devanagari, Gurmukhi, or Perso-Arabic script.\n` +
+              `- Output ONLY the lyrics with section headers. Do NOT include explanations, commentary, disclaimers, source links, citation numbers, or intro text.\n` +
+              `- If this is purely instrumental or real lyrics cannot be verified, reply ONLY with "LYRICS_NOT_FOUND".`,
+            config: {
+              tools: [{ googleSearch: {} }],
+            },
+          }),
+        1
+      );
+      searchText = (searchResp.text ?? '').trim();
+    } catch {
+      searchText = '';
+    }
+
+    if (
+      searchText &&
+      !/LYRICS_NOT_FOUND/i.test(searchText) &&
+      searchText.length >= 60 &&
+      searchText.split('\n').length >= 4
+    ) {
+      // Clean any markdown fences, preambles, or grounded citation links/markers
+      const cleaned = searchText
+        .replace(/^```[a-z]*\n?/i, '')
+        .replace(/\n?```$/i, '')
+        .replace(/^(Here are the lyrics|Lyrics for|Complete lyrics for)[^\n]*:\s*\n+/i, '')
+        .replace(/\[(\d+(?:,\s*\d+)*)\](?=\s|$|[.,!?])/g, '')
+        .replace(/\s*\(https?:\/\/[^\s)]+\)/gi, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+
+      const res: AiLyricsResult = {
+        found: true,
+        plainLyrics: cleaned,
+        source: 'Web + Gemini AI',
+      };
+      aiLyricsCache.set(cacheKey, { data: res, expiresAt: Date.now() + 12 * 60 * 60 * 1000 });
+      return res;
+    }
+
+    // Step 2: Structured fallback (strictly no hallucination if uncertain)
+    try {
+      const fallbackResp = await executeGeminiWithFailover((ai) =>
+        ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents:
+            `Provide the real, well-known lyrics for "${title}"${artist ? ` by ${artist}` : ''}.\n` +
+            `Rules:\n` +
+            `- Organize cleanly with [Verse 1], [Chorus], [Bridge], [Outro] headers and blank lines between stanzas.\n` +
+            `- Use clean Hinglish (Roman script) for Hindi/Punjabi/Urdu songs so anyone can read and sing along effortlessly.\n` +
+            `- ONLY return found=true if you are confident in the real lyrics of this specific song. Never invent fake lyrics.`,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                found: { type: Type.BOOLEAN },
+                formattedLyrics: { type: Type.STRING },
+              },
+              required: ['found', 'formattedLyrics'],
+            },
+          },
+        })
+      );
+      const parsed = safeJsonParse<{ found?: boolean; formattedLyrics?: string }>(fallbackResp.text);
+      const text = (parsed.formattedLyrics || '').trim();
+      if (parsed.found && text.length >= 50) {
+        const res: AiLyricsResult = {
+          found: true,
+          plainLyrics: text,
+          source: 'Gemini AI',
+        };
+        aiLyricsCache.set(cacheKey, { data: res, expiresAt: Date.now() + 12 * 60 * 60 * 1000 });
+        return res;
+      }
+    } catch {
+      // fall through
+    }
+
+    const empty: AiLyricsResult = { found: false, plainLyrics: null, source: 'Gemini AI' };
+    aiLyricsCache.set(cacheKey, { data: empty, expiresAt: Date.now() + 30 * 60 * 1000 });
+    return empty;
+  })().finally(() => {
+    aiLyricsInFlight.delete(cacheKey);
+  });
+
+  aiLyricsInFlight.set(cacheKey, job);
+  return job;
+}
+
+export async function enhanceLyricsWithAi(params: {
+  title: string;
+  artist?: string;
+  rawLyrics?: string | null;
+  syncedTexts?: string[];
+  mode: 'polish' | 'hinglish' | 'find';
+}): Promise<AiLyricsResult> {
+  if (params.mode === 'find') {
+    return findAndFormatLyricsWithAi({ title: params.title, artist: params.artist });
+  }
+
+  const title = params.title.trim().slice(0, 180);
+  const artist = (params.artist || '').trim().slice(0, 120);
+  const syncedTexts = Array.isArray(params.syncedTexts) ? params.syncedTexts.slice(0, 160) : [];
+  const rawLyrics = (params.rawLyrics || '').trim().slice(0, 9000);
+
+  if (syncedTexts.length === 0 && !rawLyrics) {
+    return findAndFormatLyricsWithAi({ title, artist });
+  }
+
+  const fingerprint =
+    syncedTexts.length > 0
+      ? `sync:${syncedTexts.length}:${syncedTexts[0] || ''}`
+      : `plain:${rawLyrics.slice(0, 80)}:${rawLyrics.length}`;
+  const cacheKey = `enh:${params.mode}:${title.toLowerCase()}::${fingerprint}`;
+
+  const hit = getCached(aiLyricsCache, cacheKey);
+  if (hit) return hit;
+
+  const existing = aiLyricsInFlight.get(cacheKey);
+  if (existing) return existing;
+
+  const job = (async (): Promise<AiLyricsResult> => {
+    if (syncedTexts.length > 0) {
+      const directive =
+        params.mode === 'hinglish'
+          ? 'Transliterate / rewrite each line cleanly into natural, easy-to-read Romanized Hinglish (phonetic Latin script for Hindi/Punjabi/Urdu lines, keep English lines crisp and natural). Fix messy punctuation or typos.'
+          : 'Clean and polish each lyric line for maximum readability: fix awkward capitalization, remove leftover metadata junk, fix broken spacing or punctuation, and keep the words musical and authentic.';
+
+      const resp = await executeGeminiWithFailover((ai) =>
+        ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents:
+            `Song: "${title}"${artist ? ` by ${artist}` : ''}\n` +
+            `${directive}\n` +
+            `CRITICAL RULE: Return an array of EXACTLY ${syncedTexts.length} strings matching each input line 1-to-1 in order so timestamps stay perfectly aligned.\n` +
+            `Input lines JSON:\n${JSON.stringify(syncedTexts)}`,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                lines: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description: `Exact ${syncedTexts.length} formatted lines matching input order.`,
+                },
+              },
+              required: ['lines'],
+            },
+          },
+        })
+      );
+
+      const parsed = safeJsonParse<{ lines?: string[] }>(resp.text);
+      const lines = Array.isArray(parsed.lines) ? parsed.lines : [];
+      if (lines.length === syncedTexts.length) {
+        const res: AiLyricsResult = {
+          found: true,
+          plainLyrics: lines.join('\n'),
+          cleanedSyncedTexts: lines.map((l, idx) => (typeof l === 'string' && l.trim() ? l.trim() : syncedTexts[idx])),
+          source: params.mode === 'hinglish' ? 'Hinglish · Gemini AI' : 'AI Polished',
+        };
+        aiLyricsCache.set(cacheKey, { data: res, expiresAt: Date.now() + 12 * 60 * 60 * 1000 });
+        return res;
+      }
+    }
+
+    // Plain lyrics stanza formatting / Hinglish conversion
+    const textInput = rawLyrics || syncedTexts.join('\n');
+    const directive =
+      params.mode === 'hinglish'
+        ? 'Convert/rewrite these lyrics into clean, poetic, easy-to-sing Romanized Hinglish (keep any English lines intact), add section headers like [Verse 1], [Chorus], [Bridge], [Outro], and separate stanzas with a blank line.'
+        : 'Format these lyrics so they look super clean and pleasurable to read: add section headers like [Intro], [Verse 1], [Chorus], [Bridge], [Outro], fix capitalization, punctuation, and broken line wraps, and separate stanzas with blank lines. Keep the authentic lyrics intact.';
+
+    const resp = await executeGeminiWithFailover((ai) =>
+      ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: `Song: "${title}"${artist ? ` by ${artist}` : ''}\n${directive}\n\nLyrics:\n${textInput}`,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              formattedLyrics: {
+                type: Type.STRING,
+                description: 'Cleanly formatted lyrics with [Section] headers and stanza spacing.',
+              },
+            },
+            required: ['formattedLyrics'],
+          },
+        },
+      })
+    );
+
+    const parsed = safeJsonParse<{ formattedLyrics?: string }>(resp.text);
+    const formatted = (parsed.formattedLyrics || '').trim();
+    const res: AiLyricsResult = {
+      found: Boolean(formatted),
+      plainLyrics: formatted || textInput,
+      source: params.mode === 'hinglish' ? 'Hinglish · Gemini AI' : 'AI Polished',
+    };
+    aiLyricsCache.set(cacheKey, { data: res, expiresAt: Date.now() + 12 * 60 * 60 * 1000 });
+    return res;
+  })().finally(() => {
+    aiLyricsInFlight.delete(cacheKey);
+  });
+
+  aiLyricsInFlight.set(cacheKey, job);
+  return job;
+}
+

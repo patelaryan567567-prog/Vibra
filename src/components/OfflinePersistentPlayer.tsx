@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ArrowDown,
   ArrowUp,
@@ -8,6 +8,7 @@ import {
   Headphones,
   ListMusic,
   Maximize2,
+  Mic2,
   Pause,
   Play,
   PlusSquare,
@@ -21,10 +22,14 @@ import {
   VolumeX,
   X,
 } from 'lucide-react';
-import { useOfflinePlayer } from '../context/OfflinePlayerContext';
+import { useArtistNavigation } from '../context/ArtistNavigationContext';
+import { useConfirm } from '../context/ConfirmContext';
+import { useOfflinePlayer, useOfflinePlayerTime } from '../context/OfflinePlayerContext';
 import type { OfflineTrack } from '../types/music';
-import { formatSeconds } from '../utils/format';
+import { useAmbientColor } from '../utils/ambientColor';
+import { formatSeconds, parseDurationLabel } from '../utils/format';
 import { formatBytes } from '../utils/offlineMusicDb';
+import { LyricsPanel } from './LyricsPanel';
 
 interface OfflinePersistentPlayerProps {
   onAddToOfflinePlaylist: (track: OfflineTrack) => void;
@@ -36,14 +41,14 @@ function getFormatExtLabel(track: OfflineTrack): string {
 }
 
 export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersistentPlayerProps) {
+  const confirm = useConfirm();
+  const { currentTime, duration } = useOfflinePlayerTime();
   const {
     currentTrack,
     queue,
     currentIndex,
     isPlaying,
     isBuffering,
-    currentTime,
-    duration,
     volume,
     isMuted,
     repeatMode,
@@ -72,6 +77,13 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
     jumpToOfflineQueueIndex,
   } = useOfflinePlayer();
 
+  const { openArtistPage } = useArtistNavigation();
+  const [drawerTab, setDrawerTab] = useState<'queue' | 'lyrics'>('queue');
+  const ambient = useAmbientColor(
+    currentTrack?.artworkDataUrl,
+    currentTrack ? `${currentTrack.artist}::${currentTrack.id}` : 'offline'
+  );
+
   useEffect(() => {
     if (!isExpanded) {
       setMobilePlayerView('player');
@@ -80,7 +92,10 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
 
   if (!currentTrack) return null;
 
-  const effectiveDuration = duration > 0 ? duration : currentTrack.durationSeconds || 0;
+  const effectiveDuration =
+    duration > 0
+      ? duration
+      : currentTrack.durationSeconds || parseDurationLabel(currentTrack.duration);
   const progressPct =
     effectiveDuration > 0 ? Math.min(100, Math.max(0, (currentTime / effectiveDuration) * 100)) : 0;
   const effectiveVolumePct = isMuted ? 0 : Math.min(100, Math.max(0, volume));
@@ -92,7 +107,10 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
       {/* Full-Screen Expanded Offline Player */}
       {isExpanded && (
         <div
-          className="fixed inset-0 z-50 w-full max-w-full overflow-hidden bg-[#090A0F]/98 backdrop-blur-2xl"
+          style={{
+            backgroundImage: `radial-gradient(circle at 24% 22%, ${ambient.glowStrong}, transparent 52%), radial-gradient(circle at 80% 78%, ${ambient.glowSoft}, transparent 56%)`,
+          }}
+          className="fixed inset-0 z-50 w-full max-w-full overflow-hidden bg-[#090A0F]/98 backdrop-blur-2xl transition-[background-image] duration-500"
           role="dialog"
           aria-modal="true"
           aria-label="Offline downloaded music player"
@@ -145,7 +163,7 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
             </div>
 
             {/* Mobile Sub-View Switcher (< 768px) */}
-            <div className="md:hidden grid grid-cols-2 gap-1 p-1 mt-1.5 rounded-xl bg-[#11131A] border border-white/[0.08] shrink-0">
+            <div className="md:hidden grid grid-cols-3 gap-1 p-1 mt-1.5 rounded-xl bg-[#11131A] border border-white/[0.08] shrink-0">
               <button
                 type="button"
                 onClick={() => setMobilePlayerView('player')}
@@ -153,16 +171,32 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
                   mobilePlayerView === 'player' ? 'bg-[#181B26] text-white shadow-sm' : 'text-slate-400 hover:text-white'
                 }`}
               >
-                Now Playing
+                Player
               </button>
               <button
                 type="button"
-                onClick={() => setMobilePlayerView('queue')}
+                onClick={() => {
+                  setMobilePlayerView('lyrics');
+                  setDrawerTab('lyrics');
+                }}
+                className={`py-1.5 px-2 rounded-lg text-xs font-semibold whitespace-nowrap inline-flex items-center justify-center gap-1 transition-colors ${
+                  mobilePlayerView === 'lyrics' ? 'bg-[#181B26] text-white shadow-sm' : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Mic2 className="w-3 h-3" />
+                <span>Lyrics</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMobilePlayerView('queue');
+                  setDrawerTab('queue');
+                }}
                 className={`py-1.5 px-2 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors ${
                   mobilePlayerView === 'queue' ? 'bg-[#181B26] text-white shadow-sm' : 'text-slate-400 hover:text-white'
                 }`}
               >
-                Up Next ({queue.length})
+                Queue ({queue.length})
               </button>
             </div>
 
@@ -219,7 +253,13 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
                     {currentTrack.title}
                   </h2>
                   <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs sm:text-[13px] md:text-sm font-medium text-slate-200 leading-snug">
-                    <span className="text-white/95 font-semibold break-words">{currentTrack.artist}</span>
+                    <button
+                      type="button"
+                      onClick={() => openArtistPage(currentTrack.artist)}
+                      className="text-white/95 hover:text-emerald-300 hover:underline font-semibold break-words text-left transition-colors"
+                    >
+                      {currentTrack.artist}
+                    </button>
                     {currentTrack.album && (
                       <>
                         <span aria-hidden="true" className="text-slate-500">·</span>
@@ -243,8 +283,33 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
                 } md:col-span-5 md:h-full flex-col rounded-2xl bg-[#11131A] border border-white/[0.08] overflow-hidden min-h-0`}
               >
                 <div className="flex items-center justify-between gap-2 px-3 sm:px-4 py-2.5 border-b border-white/[0.07] shrink-0">
-                  <span className="text-xs font-semibold text-white">Up Next ({queue.length})</span>
-                  {queue.length > 0 && (
+                  <div className="hidden md:flex items-center gap-1 p-1 rounded-lg bg-[#090A0F]">
+                    <button
+                      type="button"
+                      onClick={() => setDrawerTab('queue')}
+                      className={`px-3 py-1.5 rounded-md text-xs font-semibold whitespace-nowrap transition-colors ${
+                        drawerTab === 'queue' ? 'bg-[#181B26] text-white' : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      Up Next ({queue.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDrawerTab('lyrics')}
+                      className={`px-3 py-1.5 rounded-md text-xs font-semibold whitespace-nowrap inline-flex items-center gap-1.5 transition-colors ${
+                        drawerTab === 'lyrics' ? 'bg-[#181B26] text-white' : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      <Mic2 className="w-3.5 h-3.5" />
+                      <span>Lyrics</span>
+                    </button>
+                  </div>
+
+                  <span className="md:hidden text-xs font-semibold text-white">
+                    {drawerTab === 'lyrics' ? 'Synced Lyrics' : `Up Next (${queue.length})`}
+                  </span>
+
+                  {drawerTab === 'queue' && queue.length > 0 && (
                     <div className="flex items-center gap-1">
                       {queue.length - (currentIndex + 1) >= 2 && (
                         <button
@@ -260,7 +325,17 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
                       {queue.length > 1 && (
                         <button
                           type="button"
-                          onClick={clearOfflineQueue}
+                          onClick={async () => {
+                            if (
+                              await confirm({
+                                title: 'Clear Offline Queue?',
+                                message: 'Remove all upcoming songs from your offline queue?',
+                                confirmText: 'Clear Queue',
+                              })
+                            ) {
+                              clearOfflineQueue();
+                            }
+                          }}
                           className="text-xs text-slate-300 hover:text-white px-2.5 py-1.5 rounded-lg hover:bg-white/5 transition-colors"
                         >
                           Clear
@@ -270,8 +345,24 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
                   )}
                 </div>
 
-                <div className="flex-1 min-h-0 overflow-y-auto p-2.5 sm:p-3 space-y-1.5">
-                  {queue.map((item, idx) => {
+                <div
+                  className={
+                    drawerTab === 'lyrics'
+                      ? 'flex-1 min-h-0 flex flex-col overflow-hidden p-2.5 sm:p-3.5'
+                      : 'flex-1 min-h-0 overflow-y-auto p-2.5 sm:p-3 space-y-1.5'
+                  }
+                >
+                  {drawerTab === 'lyrics' ? (
+                    <LyricsPanel
+                      title={currentTrack.title}
+                      artist={currentTrack.artist}
+                      durationSeconds={effectiveDuration}
+                      currentTime={currentTime}
+                      onSeekTo={seekTo}
+                      accentHex={ambient.hex}
+                    />
+                  ) : (
+                    queue.map((item, idx) => {
                     const active = idx === currentIndex;
                     return (
                       <div
@@ -346,7 +437,17 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
                           </button>
                           <button
                             type="button"
-                            onClick={() => removeFromOfflineQueue(idx)}
+                            onClick={async () => {
+                              if (
+                                await confirm({
+                                  title: 'Remove from Offline Queue?',
+                                  message: `Remove "${item.title}" from your offline queue?`,
+                                  confirmText: 'Remove',
+                                })
+                              ) {
+                                removeFromOfflineQueue(idx);
+                              }
+                            }}
                             aria-label={`Remove ${item.title} from offline queue`}
                             className="min-h-[32px] min-w-[30px] flex items-center justify-center rounded-lg text-slate-400 hover:text-rose-400 hover:bg-white/5"
                           >
@@ -355,7 +456,8 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
                         </div>
                       </div>
                     );
-                  })}
+                  })
+                  )}
                 </div>
               </div>
             </div>
@@ -364,19 +466,23 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
             <div className="shrink-0 rounded-2xl bg-[#11141F]/95 border border-white/[0.09] px-3.5 py-2.5 sm:px-5 sm:py-3 space-y-2 shadow-2xl">
               {/* Seek Progress Bar */}
               <div className="flex items-center gap-2.5 sm:gap-3">
-                <span className="font-mono-tabular text-xs font-semibold text-emerald-300 w-10 text-right shrink-0">
+                <span className="font-mono-tabular text-xs font-semibold text-emerald-300 min-w-[42px] whitespace-nowrap text-right shrink-0">
                   {formatSeconds(currentTime)}
                 </span>
                 <div className="relative flex-1 h-5 flex items-center group px-1">
                   <div className="w-full h-2 rounded-full bg-white/15 overflow-hidden">
                     <div
-                      className="h-full rounded-full bg-gradient-to-r from-emerald-400 via-[#4F6BFF] to-[#8B5CF6]"
-                      style={{ width: `${progressPct}%` }}
+                      className="h-full rounded-full transition-[background] duration-500"
+                      style={{ width: `${progressPct}%`, background: ambient.accentGradient }}
                     />
                   </div>
                   <div
-                    className="pointer-events-none absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3.5 h-3.5 rounded-full bg-white shadow-[0_0_10px_rgba(16,185,129,0.9)] ring-2 ring-emerald-400 transition-transform group-hover:scale-110 group-active:scale-125"
-                    style={{ left: `calc(4px + (100% - 8px) * ${progressPct / 100})` }}
+                    className="pointer-events-none absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3.5 h-3.5 rounded-full bg-white ring-2 transition-transform group-hover:scale-110 group-active:scale-125"
+                    style={{
+                      left: `calc(4px + (100% - 8px) * ${progressPct / 100})`,
+                      boxShadow: `0 0 12px ${ambient.glowStrong}`,
+                      borderColor: ambient.hex,
+                    }}
                   />
                   <input
                     type="range"
@@ -389,7 +495,7 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
                     className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
                   />
                 </div>
-                <span className="font-mono-tabular text-xs font-medium text-slate-300 w-10 shrink-0">
+                <span className="font-mono-tabular text-xs font-medium text-slate-300 min-w-[42px] whitespace-nowrap shrink-0">
                   {formatSeconds(effectiveDuration)}
                 </span>
               </div>
@@ -551,7 +657,17 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
               {queue.length > 1 && (
                 <button
                   type="button"
-                  onClick={clearOfflineQueue}
+                  onClick={async () => {
+                    if (
+                      await confirm({
+                        title: 'Clear Offline Queue?',
+                        message: 'Remove all upcoming songs from your offline queue?',
+                        confirmText: 'Clear Queue',
+                      })
+                    ) {
+                      clearOfflineQueue();
+                    }
+                  }}
                   className="text-xs text-slate-400 hover:text-white px-2 py-1 rounded-md hover:bg-white/5"
                 >
                   Clear
@@ -606,7 +722,17 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
                   </button>
                   <button
                     type="button"
-                    onClick={() => removeFromOfflineQueue(idx)}
+                    onClick={async () => {
+                      if (
+                        await confirm({
+                          title: 'Remove from Offline Queue?',
+                          message: `Remove "${item.title}" from your offline queue?`,
+                          confirmText: 'Remove',
+                        })
+                      ) {
+                        removeFromOfflineQueue(idx);
+                      }
+                    }}
                     className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400"
                     aria-label="Remove from offline queue"
                   >
@@ -621,17 +747,20 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
 
       {/* Persistent 2-Row Bottom Docked Offline Mini-Player Bar */}
       {!isExpanded && (
-        <div className="fixed bottom-[56px] md:bottom-0 left-0 md:left-[76px] lg:left-56 xl:left-64 right-0 z-40 bg-[#0D1117]/98 backdrop-blur-xl border-t border-emerald-500/25 shadow-[0_-8px_30px_rgba(0,0,0,0.7)]">
+        <div
+          style={{ borderTopColor: ambient.glowStrong }}
+          className="fixed bottom-[56px] md:bottom-0 left-0 md:left-[76px] lg:left-56 xl:left-64 right-0 z-40 bg-[#0D1117]/98 backdrop-blur-xl border-t shadow-[0_-8px_30px_rgba(0,0,0,0.7)] transition-colors duration-500"
+        >
           {/* Row 1: Colored Seek Bar with Timestamps */}
           <div className="px-3 sm:px-4 lg:px-6 pt-1.5 pb-0.5 flex items-center gap-2">
-            <span className="font-mono-tabular text-[11px] font-semibold text-emerald-300 w-8 sm:w-9 text-right shrink-0">
+            <span className="font-mono-tabular text-[11px] font-semibold text-emerald-300 min-w-[38px] sm:min-w-[42px] whitespace-nowrap text-right shrink-0">
               {formatSeconds(currentTime)}
             </span>
             <div className="relative flex-1 h-4 flex items-center group px-1">
               <div className="w-full h-1.5 bg-white/15 rounded-full overflow-hidden">
                 <div
-                  className="h-full bg-gradient-to-r from-emerald-400 via-[#4F6BFF] to-[#8B5CF6] rounded-full"
-                  style={{ width: `${progressPct}%` }}
+                  className="h-full rounded-full"
+                  style={{ width: `${progressPct}%`, background: ambient.accentGradient }}
                 />
               </div>
               <div
@@ -649,7 +778,7 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
               />
             </div>
-            <span className="font-mono-tabular text-[11px] font-medium text-slate-300 w-8 sm:w-9 shrink-0">
+            <span className="font-mono-tabular text-[11px] font-medium text-slate-300 min-w-[38px] sm:min-w-[42px] whitespace-nowrap shrink-0">
               {formatSeconds(effectiveDuration)}
             </span>
           </div>

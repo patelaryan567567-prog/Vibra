@@ -10,7 +10,7 @@ import {
 } from '../constants/categories';
 import { useLibrary } from '../context/LibraryContext';
 import { usePlayer } from '../context/PlayerContext';
-import { ApiError, fetchCategoryTracks } from '../services/api';
+import { ApiError, fetchCategoryTracks, prewarmTrackBatch } from '../services/api';
 import type { CategoryId, IndiaLanguageFilter, NavTab, Track } from '../types/music';
 import { formatRelativeTime, getTimeGreeting } from '../utils/format';
 
@@ -78,6 +78,9 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
           ...prev,
           [id]: { tracks, loading: false, error: null },
         }));
+        if (id === 'trending' && tracks.length > 0) {
+          prewarmTrackBatch(tracks.slice(0, 6));
+        }
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') return;
         const message = err instanceof Error ? err.message : 'Unable to load tracks.';

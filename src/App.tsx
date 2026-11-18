@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Compass,
   HardDrive,
@@ -14,30 +14,58 @@ import { AppSplashIntro } from './components/AppSplashIntro';
 import { DownloadProgressTray } from './components/DownloadProgressTray';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { OfflinePersistentPlayer } from './components/OfflinePersistentPlayer';
-import { OfflinePlaylistModal } from './components/OfflinePlaylistModal';
 import { PersistentPlayer } from './components/PersistentPlayer';
-import { PlaylistModal } from './components/PlaylistModal';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { VibraLogo } from './components/VibraLogo';
+import { ConfirmProvider } from './context/ConfirmContext';
 import { LibraryProvider, useLibrary } from './context/LibraryContext';
+import {
+  ArtistNavigationProvider,
+  type SelectedArtistTarget,
+} from './context/ArtistNavigationContext';
 import { OfflineMusicProvider, useOfflineMusic } from './context/OfflineMusicContext';
 import { OfflinePlayerProvider, useOfflinePlayer } from './context/OfflinePlayerContext';
 import { PlayerProvider, usePlayer } from './context/PlayerContext';
-import { ExplorePage } from './pages/ExplorePage';
-import { FavouritesPage } from './pages/FavouritesPage';
 import { HomePage } from './pages/HomePage';
-import { LibraryPage, type LibrarySectionTab } from './pages/LibraryPage';
-import { SearchPage } from './pages/SearchPage';
+import type { LibrarySectionTab } from './pages/LibraryPage';
 import type { NavTab, OfflineTrack, Track } from './types/music';
+
+const ExplorePage = lazy(() => import('./pages/ExplorePage').then((m) => ({ default: m.ExplorePage })));
+const SearchPage = lazy(() => import('./pages/SearchPage').then((m) => ({ default: m.SearchPage })));
+const LibraryPage = lazy(() => import('./pages/LibraryPage').then((m) => ({ default: m.LibraryPage })));
+const FavouritesPage = lazy(() => import('./pages/FavouritesPage').then((m) => ({ default: m.FavouritesPage })));
+const ArtistPage = lazy(() => import('./pages/ArtistPage').then((m) => ({ default: m.ArtistPage })));
+const PlaylistModal = lazy(() => import('./components/PlaylistModal').then((m) => ({ default: m.PlaylistModal })));
+const OfflinePlaylistModal = lazy(() =>
+  import('./components/OfflinePlaylistModal').then((m) => ({ default: m.OfflinePlaylistModal }))
+);
+
+function PageRouteFallback() {
+  return (
+    <div className="space-y-5 py-2 animate-pulse" aria-hidden="true">
+      <div className="h-8 w-48 rounded-xl bg-white/[0.06]" />
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+        {Array.from({ length: 8 }).map((_, idx) => (
+          <div key={idx} className="rounded-xl bg-[#11131A] border border-white/[0.06] p-3">
+            <div className="aspect-video w-full rounded-lg bg-white/[0.06] mb-3" />
+            <div className="h-4 bg-white/[0.07] rounded w-4/5 mb-2" />
+            <div className="h-3 bg-white/[0.05] rounded w-1/2" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 interface NavSnapshot {
   tab: NavTab;
+  artistName: string;
   expanded: boolean;
-  mobileView: 'player' | 'queue' | 'related';
+  mobileView: 'player' | 'queue' | 'related' | 'lyrics';
   queueOpen: boolean;
   playlistModal: boolean;
   offlineExpanded: boolean;
-  offlineMobileView: 'player' | 'queue';
+  offlineMobileView: 'player' | 'queue' | 'lyrics';
   offlineQueueOpen: boolean;
   offlinePlaylistModal: boolean;
 }
@@ -50,6 +78,7 @@ interface VibraHistoryState extends NavSnapshot {
 function sameSnapshot(a: NavSnapshot, b: NavSnapshot): boolean {
   return (
     a.tab === b.tab &&
+    a.artistName === b.artistName &&
     a.expanded === b.expanded &&
     a.mobileView === b.mobileView &&
     a.queueOpen === b.queueOpen &&
@@ -73,13 +102,11 @@ function VibraShell() {
   const { playlists, favourites, toast } = useLibrary();
   const {
     currentTrack,
-    currentTime,
-    duration,
     playTrack,
     togglePlay,
     nextTrack,
     prevTrack,
-    seekTo,
+    seekBy,
     toggleMute,
     isExpanded,
     setIsExpanded,
@@ -92,12 +119,10 @@ function VibraShell() {
   const { isOnline, offlineTracks } = useOfflineMusic();
   const {
     currentTrack: offlineTrack,
-    currentTime: offlineCurrentTime,
-    duration: offlineDuration,
     togglePlay: toggleOfflinePlay,
     nextTrack: nextOfflineTrack,
     prevTrack: prevOfflineTrack,
-    seekTo: seekOfflineTo,
+    seekBy: seekOfflineBy,
     toggleMute: toggleOfflineMute,
     isExpanded: isOfflineExpanded,
     setIsExpanded: setIsOfflineExpanded,
@@ -108,6 +133,8 @@ function VibraShell() {
   } = useOfflinePlayer();
 
   const [activeTab, setActiveTab] = useState<NavTab>('home');
+  const [previousNonArtistTab, setPreviousNonArtistTab] = useState<NavTab>('home');
+  const [selectedArtist, setSelectedArtist] = useState<SelectedArtistTarget | null>(null);
   const [requestedLibrarySection, setRequestedLibrarySection] = useState<LibrarySectionTab | null>(null);
   const [headerSearch, setHeaderSearch] = useState('');
   const [pendingSearchQuery, setPendingSearchQuery] = useState<string | undefined>(undefined);
@@ -118,8 +145,10 @@ function VibraShell() {
 
   const effectiveExpanded = Boolean(isExpanded && currentTrack);
   const effectiveOfflineExpanded = Boolean(isOfflineExpanded && offlineTrack);
+  const activeArtistName = activeTab === 'artist' ? selectedArtist?.name || '' : '';
   const currentSnapshot: NavSnapshot = {
     tab: activeTab,
+    artistName: activeArtistName,
     expanded: effectiveExpanded,
     mobileView: effectiveExpanded ? mobilePlayerView : 'player',
     queueOpen: isQueueOpen,
@@ -161,6 +190,7 @@ function VibraShell() {
         state && state.vibraApp && state.tab
           ? {
               tab: state.tab,
+              artistName: typeof state.artistName === 'string' ? state.artistName : '',
               expanded: Boolean(state.expanded),
               mobileView: state.mobileView || 'player',
               queueOpen: Boolean(state.queueOpen),
@@ -172,6 +202,7 @@ function VibraShell() {
             }
           : historyStackRef.current[targetDepth] ?? {
               tab: 'home',
+              artistName: '',
               expanded: false,
               mobileView: 'player',
               queueOpen: false,
@@ -197,6 +228,11 @@ function VibraShell() {
       }
       if (!targetSnap.offlinePlaylistModal) {
         setOfflinePlaylistModalTrack(null);
+      }
+      if (targetSnap.tab === 'artist' && targetSnap.artistName) {
+        setSelectedArtist((prev) =>
+          prev && prev.name === targetSnap.artistName ? prev : { name: targetSnap.artistName }
+        );
       }
       setIsQueueOpen(targetSnap.queueOpen);
       setIsExpanded(targetSnap.expanded);
@@ -275,6 +311,7 @@ function VibraShell() {
     window.history.pushState(nextState, '');
   }, [
     activeTab,
+    activeArtistName,
     effectiveExpanded,
     mobilePlayerView,
     isQueueOpen,
@@ -287,7 +324,7 @@ function VibraShell() {
 
   useEffect(() => {
     window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
-  }, [activeTab]);
+  }, [activeTab, activeArtistName]);
 
   // PC & Tablet Hardware Keyboard Shortcuts (Space, Arrows, M, F, /, Escape)
   useEffect(() => {
@@ -351,11 +388,10 @@ function VibraShell() {
           prevOfflineTrack();
         } else if (e.key === 'ArrowRight') {
           e.preventDefault();
-          const effDur = offlineDuration > 0 ? offlineDuration : offlineTrack.durationSeconds || 0;
-          seekOfflineTo(effDur > 0 ? Math.min(effDur, offlineCurrentTime + 5) : offlineCurrentTime + 5);
+          seekOfflineBy(5);
         } else if (e.key === 'ArrowLeft') {
           e.preventDefault();
-          seekOfflineTo(Math.max(0, offlineCurrentTime - 5));
+          seekOfflineBy(-5);
         } else if (e.key.toLowerCase() === 'm') {
           e.preventDefault();
           toggleOfflineMute();
@@ -379,11 +415,10 @@ function VibraShell() {
         prevTrack();
       } else if (e.key === 'ArrowRight') {
         e.preventDefault();
-        const effDur = duration > 0 ? duration : currentTrack.durationSeconds || 0;
-        seekTo(effDur > 0 ? Math.min(effDur, currentTime + 5) : currentTime + 5);
+        seekBy(5);
       } else if (e.key === 'ArrowLeft') {
         e.preventDefault();
-        seekTo(Math.max(0, currentTime - 5));
+        seekBy(-5);
       } else if (e.key.toLowerCase() === 'm') {
         e.preventDefault();
         toggleMute();
@@ -397,28 +432,24 @@ function VibraShell() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [
     currentTrack,
-    currentTime,
-    duration,
     isExpanded,
     isQueueOpen,
     nextTrack,
     playlistModalTrack,
     prevTrack,
-    seekTo,
+    seekBy,
     setIsExpanded,
     setIsQueueOpen,
     toggleMute,
     togglePlay,
     offlineTrack,
-    offlineCurrentTime,
-    offlineDuration,
     isOfflineExpanded,
     isOfflineQueueOpen,
     offlinePlaylistModalTrack,
     toggleOfflinePlay,
     nextOfflineTrack,
     prevOfflineTrack,
-    seekOfflineTo,
+    seekOfflineBy,
     toggleOfflineMute,
     setIsOfflineExpanded,
     setIsOfflineQueueOpen,
@@ -439,6 +470,36 @@ function VibraShell() {
     setHeaderSearch('');
   };
 
+  const openArtistPage = useCallback(
+    (artistName: string, seedTrack?: Track) => {
+      const clean = artistName.trim();
+      if (!clean) return;
+      if (activeTab !== 'artist') {
+        setPreviousNonArtistTab(activeTab);
+      }
+      setSelectedArtist({ name: clean, seedTrack });
+      setActiveTab('artist');
+      setIsExpanded(false);
+      setIsOfflineExpanded(false);
+      setIsQueueOpen(false);
+      setIsOfflineQueueOpen(false);
+    },
+    [activeTab, setIsExpanded, setIsOfflineExpanded, setIsOfflineQueueOpen, setIsQueueOpen]
+  );
+
+  const closeArtistPage = useCallback(() => {
+    setActiveTab(previousNonArtistTab || 'home');
+  }, [previousNonArtistTab]);
+
+  const artistNavValue = useMemo(
+    () => ({
+      selectedArtist,
+      openArtistPage,
+      closeArtistPage,
+    }),
+    [selectedArtist, openArtistPage, closeArtistPage]
+  );
+
   const handleBrandLogoClick = () => {
     if (activeTab === 'home') {
       setSplashTriggerCount((c) => c + 1);
@@ -448,6 +509,7 @@ function VibraShell() {
   };
 
   return (
+    <ArtistNavigationProvider value={artistNavValue}>
     <div className="min-h-screen bg-[#090A0F] text-[#F4F5F8] flex">
       {/* Aesthetic App Opening Splash Animation */}
       <AppSplashIntro forceTriggerCount={splashTriggerCount} />
@@ -624,41 +686,51 @@ function VibraShell() {
             </div>
           )}
 
-          {activeTab === 'home' && (
-            <HomePage
-              onAddToPlaylist={(t) => setPlaylistModalTrack(t)}
-              onNavigate={setActiveTab}
-            />
-          )}
-          {activeTab === 'explore' && (
-            <ExplorePage
-              onAddToPlaylist={(t) => setPlaylistModalTrack(t)}
-              onRunSearchQuery={runSearchQuery}
-            />
-          )}
-          {activeTab === 'search' && (
-            <SearchPage
-              initialQuery={pendingSearchQuery}
-              onConsumeInitialQuery={() => setPendingSearchQuery(undefined)}
-              onAddToPlaylist={(t) => setPlaylistModalTrack(t)}
-            />
-          )}
-          {activeTab === 'library' && (
-            <LibraryPage
-              onAddToPlaylist={(t) => setPlaylistModalTrack(t)}
-              onAddToOfflinePlaylist={(t) => setOfflinePlaylistModalTrack(t)}
-              onRunSearchQuery={runSearchQuery}
-              onNavigate={setActiveTab}
-              requestedSection={requestedLibrarySection}
-              onConsumeRequestedSection={() => setRequestedLibrarySection(null)}
-            />
-          )}
-          {activeTab === 'favourites' && (
-            <FavouritesPage
-              onAddToPlaylist={(t) => setPlaylistModalTrack(t)}
-              onNavigate={setActiveTab}
-            />
-          )}
+          <Suspense fallback={<PageRouteFallback />}>
+            {activeTab === 'home' && (
+              <HomePage
+                onAddToPlaylist={(t) => setPlaylistModalTrack(t)}
+                onNavigate={setActiveTab}
+              />
+            )}
+            {activeTab === 'explore' && (
+              <ExplorePage
+                onAddToPlaylist={(t) => setPlaylistModalTrack(t)}
+                onRunSearchQuery={runSearchQuery}
+              />
+            )}
+            {activeTab === 'search' && (
+              <SearchPage
+                initialQuery={pendingSearchQuery}
+                onConsumeInitialQuery={() => setPendingSearchQuery(undefined)}
+                onAddToPlaylist={(t) => setPlaylistModalTrack(t)}
+              />
+            )}
+            {activeTab === 'library' && (
+              <LibraryPage
+                onAddToPlaylist={(t) => setPlaylistModalTrack(t)}
+                onAddToOfflinePlaylist={(t) => setOfflinePlaylistModalTrack(t)}
+                onRunSearchQuery={runSearchQuery}
+                onNavigate={setActiveTab}
+                requestedSection={requestedLibrarySection}
+                onConsumeRequestedSection={() => setRequestedLibrarySection(null)}
+              />
+            )}
+            {activeTab === 'favourites' && (
+              <FavouritesPage
+                onAddToPlaylist={(t) => setPlaylistModalTrack(t)}
+                onNavigate={setActiveTab}
+              />
+            )}
+            {activeTab === 'artist' && selectedArtist && (
+              <ArtistPage
+                artistName={selectedArtist.name}
+                seedTrack={selectedArtist.seedTrack}
+                onAddToPlaylist={(t) => setPlaylistModalTrack(t)}
+                onBack={closeArtistPage}
+              />
+            )}
+          </Suspense>
         </main>
       </div>
 
@@ -693,13 +765,21 @@ function VibraShell() {
       <OfflinePersistentPlayer onAddToOfflinePlaylist={(t) => setOfflinePlaylistModalTrack(t)} />
 
       {/* Online Playlist Modal */}
-      <PlaylistModal track={playlistModalTrack} onClose={() => setPlaylistModalTrack(null)} />
+      {playlistModalTrack && (
+        <Suspense fallback={null}>
+          <PlaylistModal track={playlistModalTrack} onClose={() => setPlaylistModalTrack(null)} />
+        </Suspense>
+      )}
 
       {/* Offline Downloaded Songs Playlist Modal */}
-      <OfflinePlaylistModal
-        track={offlinePlaylistModalTrack}
-        onClose={() => setOfflinePlaylistModalTrack(null)}
-      />
+      {offlinePlaylistModalTrack && (
+        <Suspense fallback={null}>
+          <OfflinePlaylistModal
+            track={offlinePlaylistModalTrack}
+            onClose={() => setOfflinePlaylistModalTrack(null)}
+          />
+        </Suspense>
+      )}
 
       {/* Live Multi-Track Download Percentage Tray */}
       <DownloadProgressTray />
@@ -715,21 +795,24 @@ function VibraShell() {
         </div>
       )}
     </div>
+    </ArtistNavigationProvider>
   );
 }
 
 export default function App() {
   return (
     <ErrorBoundary>
-      <LibraryProvider>
-        <OfflineMusicProvider>
-          <PlayerProvider>
-            <OfflinePlayerProvider>
-              <VibraShell />
-            </OfflinePlayerProvider>
-          </PlayerProvider>
-        </OfflineMusicProvider>
-      </LibraryProvider>
+      <ConfirmProvider>
+        <LibraryProvider>
+          <OfflineMusicProvider>
+            <PlayerProvider>
+              <OfflinePlayerProvider>
+                <VibraShell />
+              </OfflinePlayerProvider>
+            </PlayerProvider>
+          </OfflineMusicProvider>
+        </LibraryProvider>
+      </ConfirmProvider>
     </ErrorBoundary>
   );
 }

@@ -1,17 +1,18 @@
-import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
-import Hls from 'hls.js';
-import { fetchRelatedTracks } from '../services/api';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import type Hls from 'hls.js';
+import { fetchRelatedTracks, getCachedAudioMode, prewarmTrackBatch } from '../services/api';
 import type { RepeatMode, Track } from '../types/music';
 import {
   acquirePlaybackWakeLock,
   getSilentLoopBlobUrl,
+  pauseKeepAliveBridgeIfForeground,
   pokeBackgroundKeepAlive,
   registerVibraServiceWorker,
   releasePlaybackWakeLock,
   startWebAudioKeepAlive,
   stopWebAudioKeepAlive,
 } from '../utils/backgroundAudio';
-import { formatSeconds } from '../utils/format';
+import { formatSeconds, parseDurationLabel } from '../utils/format';
 import { useLibrary } from './LibraryContext';
 
 interface YTPlayerInstance {
@@ -24,6 +25,7 @@ interface YTPlayerInstance {
   setVolume: (volume: number) => void;
   mute: () => void;
   unMute: () => void;
+  isMuted?: () => boolean;
   getCurrentTime: () => number;
   getDuration: () => number;
   getPlayerState: () => number;
@@ -60,14 +62,17 @@ declare global {
   }
 }
 
+interface PlayerTimeContextValue {
+  currentTime: number;
+  duration: number;
+}
+
 interface PlayerContextValue {
   currentTrack: Track | null;
   queue: Track[];
   currentIndex: number;
   isPlaying: boolean;
   isBuffering: boolean;
-  currentTime: number;
-  duration: number;
   volume: number;
   isMuted: boolean;
   repeatMode: RepeatMode;
@@ -75,7 +80,7 @@ interface PlayerContextValue {
   isRadioMode: boolean;
   isLoadingRadio: boolean;
   isExpanded: boolean;
-  mobilePlayerView: 'player' | 'queue' | 'related';
+  mobilePlayerView: 'player' | 'queue' | 'related' | 'lyrics';
   isVideoMode: boolean;
   isQueueOpen: boolean;
   isBackgroundPlay: boolean;
@@ -98,6 +103,7 @@ interface PlayerContextValue {
   nextTrack: () => void;
   prevTrack: () => void;
   seekTo: (seconds: number) => void;
+  seekBy: (deltaSeconds: number) => void;
   setVolume: (vol: number) => void;
   toggleMute: () => void;
   cycleRepeat: () => void;
@@ -105,13 +111,14 @@ interface PlayerContextValue {
   toggleRadioMode: () => void;
   toggleBackgroundPlay: () => void;
   setIsExpanded: (val: boolean) => void;
-  setMobilePlayerView: (view: 'player' | 'queue' | 'related') => void;
+  setMobilePlayerView: (view: 'player' | 'queue' | 'related' | 'lyrics') => void;
   setIsVideoMode: (val: boolean) => void;
   setIsQueueOpen: (val: boolean) => void;
   jumpToQueueIndex: (index: number) => void;
 }
 
 const PlayerContext = createContext<PlayerContextValue | null>(null);
+const PlayerTimeContext = createContext<PlayerTimeContextValue | null>(null);
 
 const ONLINE_SESSION_KEY = 'vibra_online_session_v1';
 const ACTIVE_PLAYER_KEY = 'vibra_active_player';
@@ -266,7 +273,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   });
   const [isLoadingRadio, setIsLoadingRadio] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
-  const [mobilePlayerView, setMobilePlayerView] = useState<'player' | 'queue' | 'related'>('player');
+  const [mobilePlayerView, setMobilePlayerView] = useState<'player' | 'queue' | 'related' | 'lyrics'>('player');
   const [isVideoMode, setIsVideoMode] = useState(false);
   const [isQueueOpen, setIsQueueOpen] = useState(false);
   const [isBackgroundPlay, setIsBackgroundPlay] = useState<boolean>(() => {
@@ -292,6 +299,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const loadedTrackIdRef = useRef<string | null>(null);
   const loadedAudioTrackIdRef = useRef<string | null>(null);
   const loadedYtVideoIdRef = useRef<string | null>(null);
+  const audioKickDoneForLoadRef = useRef<string | null>(null);
   const resolveAbortRef = useRef<AbortController | null>(null);
   const consecutiveErrorsRef = useRef(0);
   const bgSkipStreakRef = useRef(0);
@@ -314,6 +322,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const currentIndexRef = useRef(currentIndex);
   const currentTimeRef = useRef(currentTime);
   const durationRef = useRef(duration);
+  const expectedDurationRef = useRef(0);
   const repeatModeRef = useRef(repeatMode);
   const isShuffleRef = useRef(isShuffle);
   const isRadioModeRef = useRef(isRadioMode);
@@ -403,7 +412,21 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       setCurrentTime(startSec);
     }
 
+    const syncYtVolume = (p: YTPlayerInstance) => {
+      try {
+        if (isMutedRef.current) {
+          p.mute();
+        } else {
+          p.unMute();
+          p.setVolume(volumeRef.current);
+        }
+      } catch {
+        // ignore
+      }
+    };
+
     if (ytReadyRef.current && ytPlayerRef.current) {
+      syncYtVolume(ytPlayerRef.current);
       const sameVideoLoaded = loadedYtVideoIdRef.current === videoId;
       loadedYtVideoIdRef.current = videoId;
 
@@ -432,6 +455,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         window.setTimeout(() => {
           if (activeEngineRef.current !== 'youtube' || !ytPlayerRef.current) return;
           try {
+            syncYtVolume(ytPlayerRef.current);
             const target = pendingYtSeekSecRef.current;
             if (target > 0.5) {
               const cur = ytPlayerRef.current.getCurrentTime() || 0;
@@ -464,6 +488,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
    */
   const beginSynchronousNativeAudio = useCallback(
     (track: Track, resumeSec = 0) => {
+      // If we already pre-resolved this track and know it's YouTube-only, jump straight to YouTube IFrame in 0ms
+      if (getCachedAudioMode(track.id) === 'youtube') {
+        startYouTubeTrack(track.id, resumeSec);
+        return;
+      }
+
       const audio = audioElRef.current;
       if (!audio) {
         startYouTubeTrack(track.id, resumeSec);
@@ -473,17 +503,29 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       destroyHls();
       activeEngineRef.current = 'audio';
       loadedAudioTrackIdRef.current = track.id;
+      audioKickDoneForLoadRef.current = null;
       pendingSeekSecRef.current = resumeSec > 0.5 ? resumeSec : 0;
-      if (resumeSec > 0.5) {
-        currentTimeRef.current = resumeSec;
-        setCurrentTime(resumeSec);
+      currentTimeRef.current = resumeSec > 0.5 ? resumeSec : 0;
+      setCurrentTime(resumeSec > 0.5 ? resumeSec : 0);
+      const initialDur =
+        track.durationSeconds && track.durationSeconds > 0
+          ? track.durationSeconds
+          : parseDurationLabel(track.duration);
+      if (initialDur > 0) {
+        expectedDurationRef.current = initialDur;
+        durationRef.current = initialDur;
+        setDuration(initialDur);
       }
+
       audio.muted = isMutedRef.current;
       audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
+      audio.playbackRate = 1;
 
-      if (isBackgroundPlayRef.current && shouldPlayRef.current && !userPausedRef.current) {
+      if (isBackgroundPlayRef.current && shouldPlayRef.current && !userPausedRef.current && document.hidden) {
         startWebAudioKeepAlive();
         pokeBackgroundKeepAlive();
+      } else {
+        pauseKeepAliveBridgeIfForeground();
       }
 
       try {
@@ -505,6 +547,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         audio.loop = false;
         if (audio.src !== cachedBlobUrl) {
           audio.src = cachedBlobUrl;
+        } else if (resumeSec <= 0.5) {
+          try {
+            audio.currentTime = 0;
+          } catch {
+            // ignore
+          }
         }
         if (audio.readyState >= 1 && pendingSeekSecRef.current > 0.5) {
           applyPendingAudioSeek(audio);
@@ -516,6 +564,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             void p
               .then(() => {
                 audioUnlockedRef.current = true;
+                audio.muted = isMutedRef.current;
+                audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
                 if (pendingSeekSecRef.current > 0.5) {
                   applyPendingAudioSeek(audio);
                 }
@@ -533,15 +583,21 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       }
 
       // Stream directly via native HTTP 206 `/api/audio/stream` for both foreground and background!
-      // Why? Native browser media streaming buffers chunks incrementally in <2 MB of native memory
-      // instead of allocating 20-40 MB JS Blobs per song, completely preventing background OOM kills!
       isSilentWarmupRef.current = false;
       audio.loop = false;
       audio.muted = isMutedRef.current;
       audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
       const directUrl = buildDirectAudioStreamUrl(track);
-      if (audio.src !== directUrl) {
+      const absoluteDirectUrl =
+        typeof window !== 'undefined' ? new URL(directUrl, window.location.origin).href : directUrl;
+      if (audio.src !== absoluteDirectUrl && audio.src !== directUrl) {
         audio.src = directUrl;
+      } else if (resumeSec <= 0.5) {
+        try {
+          audio.currentTime = 0;
+        } catch {
+          // ignore
+        }
       }
       setIsBuffering(true);
       if (shouldPlayRef.current && !userPausedRef.current) {
@@ -550,6 +606,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           void directPlay
             .then(() => {
               audioUnlockedRef.current = true;
+              audio.muted = isMutedRef.current;
+              audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
               if (pendingSeekSecRef.current > 0.5) {
                 applyPendingAudioSeek(audio);
               }
@@ -575,7 +633,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       if (!audio.src) {
         audio.src = silentUrl;
       }
-      audio.volume = 0;
+      const prevMuted = audio.muted;
+      audio.muted = true;
       const p = audio.play();
       if (p) {
         void p
@@ -584,8 +643,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             if (activeEngineRef.current !== 'audio') {
               audio.pause();
             }
+            audio.muted = prevMuted || isMutedRef.current;
+            audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
           })
-          .catch(() => {});
+          .catch(() => {
+            audio.muted = isMutedRef.current;
+            audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
+          });
       }
     } catch {
       // ignore
@@ -771,46 +835,52 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       if (restoredQueue.length === 0) return;
 
       const restoredIdx = Math.max(0, Math.min(restoredQueue.length - 1, parsed.currentIndex ?? 0));
-      const restoredTime = Math.max(0, parsed.currentTime ?? 0);
       const track = restoredQueue[restoredIdx];
+      const savedPos = getTrackPosition(track.id) || getTrackPosition(`dl_${track.id}`);
+      const restoredTime = Math.max(
+        0,
+        typeof parsed.currentTime === 'number' && parsed.currentTime > 0
+          ? parsed.currentTime
+          : (savedPos?.positionSeconds ?? 0)
+      );
 
       if (parsed.repeatMode) setRepeatMode(parsed.repeatMode);
       if (typeof parsed.isShuffle === 'boolean') setIsShuffle(parsed.isShuffle);
       if (typeof parsed.isRadioMode === 'boolean') setIsRadioMode(parsed.isRadioMode);
 
+      // Always restore the previous song in PAUSED state on app open so the user chooses when to resume
+      shouldPlayRef.current = false;
+      userPausedRef.current = true;
       loadedTrackIdRef.current = track.id;
       loadedAudioTrackIdRef.current = track.id;
       activeEngineRef.current = 'audio';
       pendingSeekSecRef.current = restoredTime;
       currentTimeRef.current = restoredTime;
+      const restoredDur =
+        track.durationSeconds && track.durationSeconds > 0
+          ? track.durationSeconds
+          : parseDurationLabel(track.duration);
+      expectedDurationRef.current = restoredDur;
+      durationRef.current = restoredDur;
+      setIsPlaying(false);
+      setIsBuffering(false);
       setCurrentTime(restoredTime);
-      setDuration(track.durationSeconds || 0);
+      setDuration(restoredDur);
       setQueue(restoredQueue);
       setCurrentIndex(restoredIdx);
 
       const audio = audioElRef.current;
       if (audio) {
+        audio.pause();
+        audio.muted = isMutedRef.current;
+        audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
         audio.src = buildDirectAudioStreamUrl(track);
-        if (parsed.wasPlaying) {
-          shouldPlayRef.current = true;
-          userPausedRef.current = false;
-          const p = audio.play();
-          if (p) {
-            void p
-              .then(() => {
-                audioUnlockedRef.current = true;
-                setIsPlaying(true);
-              })
-              .catch(() => {
-                setIsPlaying(false);
-              });
-          }
-        }
+        audio.load();
       }
     } catch {
       // ignore malformed storage
     }
-  }, []);
+  }, [getTrackPosition]);
 
   const saveOnlineSession = useCallback((overrideTime?: number, overridePlaying?: boolean) => {
     if (isYieldedToOfflineRef.current || queueRef.current.length === 0 || currentIndexRef.current < 0) {
@@ -926,6 +996,16 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
               setIsBuffering(false);
               setPlayerError(null);
               setBackgroundBlockedHint(null);
+              try {
+                if (isMutedRef.current) {
+                  e.target.mute();
+                } else {
+                  e.target.unMute();
+                  e.target.setVolume(volumeRef.current);
+                }
+              } catch {
+                // ignore
+              }
               const dur = e.target.getDuration();
               if (dur > 0) setDuration(dur);
               const targetYtSec = pendingYtSeekSecRef.current;
@@ -1090,7 +1170,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     shouldPlayRef.current = true;
     userPausedRef.current = false;
     shuffleHistoryRef.current.add(currentTrack.id);
-    setDuration(currentTrack.durationSeconds || 0);
+    const trackDur =
+      currentTrack.durationSeconds && currentTrack.durationSeconds > 0
+        ? currentTrack.durationSeconds
+        : parseDurationLabel(currentTrack.duration);
+    expectedDurationRef.current = trackDur;
+    durationRef.current = trackDur;
+    setDuration(trackDur);
     setPlayerError(null);
     setBackgroundBlockedHint(null);
     setIsBuffering(true);
@@ -1102,33 +1188,36 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       void acquirePlaybackWakeLock();
     }
 
-    // Pre-warm ONLY the 1st immediate next track in RAM Blob cache (max 2 Blobs total)
-    // and pre-resolve upcoming tracks +1..+4 on the server (<1 KB RAM) so background memory never spikes!
+    // Pre-resolve upcoming +1..+4 in ONE batch request (<1 KB RAM), and wait until active song
+    // has started (~1.8s) before fetching the next song's full Blob so it never steals initial startup bandwidth!
     const prewarmTimer = window.setTimeout(() => {
-      void (async () => {
-        if (controller.signal.aborted) return;
-        const q = queueRef.current;
-        const idx = currentIndexRef.current;
-        const nextImmediate = q[(idx + 1) % Math.max(1, q.length)];
-        const keepIds = new Set<string>([currentTrack.id]);
-        if (nextImmediate) keepIds.add(nextImmediate.id);
-        pruneOnlineBlobCache(keepIds);
+      if (controller.signal.aborted) return;
+      const q = queueRef.current;
+      const idx = currentIndexRef.current;
+      const nextImmediate = q[(idx + 1) % Math.max(1, q.length)];
+      const keepIds = new Set<string>([currentTrack.id]);
+      if (nextImmediate) keepIds.add(nextImmediate.id);
+      pruneOnlineBlobCache(keepIds);
 
-        // Pre-resolve stream URLs on backend for next 4 tracks
-        for (const offset of [1, 2, 3, 4]) {
-          if (controller.signal.aborted) break;
-          const upcoming = q[idx + offset];
-          if (upcoming && upcoming.id !== currentTrack.id) {
-            await prewarmServerStreamResolve(upcoming);
+      const upcomingList: Track[] = [];
+      for (const offset of [1, 2, 3, 4]) {
+        const upcoming = q[idx + offset];
+        if (upcoming && upcoming.id !== currentTrack.id) {
+          upcomingList.push(upcoming);
+        }
+      }
+      if (upcomingList.length > 0) {
+        prewarmTrackBatch(upcomingList);
+      }
+
+      if (nextImmediate && nextImmediate.id !== currentTrack.id) {
+        window.setTimeout(() => {
+          if (!controller.signal.aborted) {
+            void fetchTrackAudioBlobUrl(nextImmediate, keepIds);
           }
-        }
-
-        // Pre-cache only the 1st immediate next track into RAM Blob cache for 0ms gapless transition
-        if (!controller.signal.aborted && nextImmediate && nextImmediate.id !== currentTrack.id) {
-          await fetchTrackAudioBlobUrl(nextImmediate, keepIds);
-        }
-      })();
-    }, 300);
+        }, 1400);
+      }
+    }, 500);
 
     if (isVideoModeRef.current) {
       stopNativeAudio();
@@ -1396,6 +1485,14 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             } else if (PS && (st === PS.PLAYING || cur > 0.2)) {
               currentTimeRef.current = cur;
               setCurrentTime(cur);
+              if (st === PS.PLAYING && !isMutedRef.current && volumeRef.current > 0 && p.isMuted?.()) {
+                try {
+                  p.unMute();
+                  p.setVolume(volumeRef.current);
+                } catch {
+                  // ignore
+                }
+              }
             }
           }
           if (typeof dur === 'number' && dur > 0) setDuration(dur);
@@ -1709,6 +1806,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
   const togglePlay = useCallback(() => {
     if (!currentTrack) return;
+    const curSec = currentTimeRef.current;
 
     if (activeEngineRef.current === 'audio' && audioElRef.current) {
       const audio = audioElRef.current;
@@ -1719,8 +1817,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         void releasePlaybackWakeLock();
         audio.pause();
         setIsPlaying(false);
-        persistCurrentTrackResume(currentTime);
-        saveOnlineSession(currentTime, false);
+        persistCurrentTrackResume(curSec);
+        saveOnlineSession(curSec, false);
       } else {
         window.dispatchEvent(new CustomEvent('vibra:pause-offline-player'));
         isYieldedToOfflineRef.current = false;
@@ -1736,10 +1834,17 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           void acquirePlaybackWakeLock();
         }
         const savedPos = getTrackPosition(currentTrack.id)?.positionSeconds ?? 0;
-        const effectiveResume = currentTime > 0.5 ? currentTime : savedPos;
-        if (!audio.getAttribute('src') || audio.src.startsWith('data:')) {
+        const effectiveResume = curSec > 0.5 ? curSec : savedPos;
+        if (
+          !audio.getAttribute('src') ||
+          audio.src.startsWith('data:') ||
+          audio.error ||
+          loadedAudioTrackIdRef.current !== currentTrack.id
+        ) {
           beginSynchronousNativeAudio(currentTrack, effectiveResume);
         } else {
+          audio.muted = isMutedRef.current;
+          audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
           if (effectiveResume > 0.5 && Math.abs((audio.currentTime || 0) - effectiveResume) > 2) {
             pendingSeekSecRef.current = effectiveResume;
             applyPendingAudioSeek(audio);
@@ -1777,8 +1882,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       stopWebAudioKeepAlive();
       void releasePlaybackWakeLock();
       p.pauseVideo();
-      persistCurrentTrackResume(currentTime);
-      saveOnlineSession(currentTime, false);
+      persistCurrentTrackResume(curSec);
+      saveOnlineSession(curSec, false);
     } else {
       userPausedRef.current = false;
       shouldPlayRef.current = true;
@@ -1789,13 +1894,16 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         pokeBackgroundKeepAlive();
         void acquirePlaybackWakeLock();
       }
+      if (!isMutedRef.current) {
+        p.unMute();
+        p.setVolume(volumeRef.current);
+      }
       p.playVideo();
-      saveOnlineSession(currentTime, true);
+      saveOnlineSession(curSec, true);
     }
   }, [
     applyPendingAudioSeek,
     beginSynchronousNativeAudio,
-    currentTime,
     currentTrack,
     getTrackPosition,
     isPlaying,
@@ -1861,12 +1969,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       pokeBackgroundKeepAlive();
       void acquirePlaybackWakeLock();
     }
-    if (currentTime > 4) {
+    if (currentTimeRef.current > 4) {
       if (activeEngineRef.current === 'audio' && audioElRef.current) {
         audioElRef.current.currentTime = 0;
       } else {
         ytPlayerRef.current?.seekTo(0, true);
       }
+      currentTimeRef.current = 0;
       setCurrentTime(0);
       if (q[idx]) clearTrackPosition(q[idx].id);
       return;
@@ -1877,7 +1986,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       beginSynchronousNativeAudio(q[targetIdx], 0);
     }
     setCurrentIndex(targetIdx);
-  }, [beginSynchronousNativeAudio, clearTrackPosition, currentTime, persistCurrentTrackResume]);
+  }, [beginSynchronousNativeAudio, clearTrackPosition, persistCurrentTrackResume]);
 
   const seekTo = useCallback(
     (seconds: number) => {
@@ -1898,6 +2007,20 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       }
     },
     [persistCurrentTrackResume]
+  );
+
+  const seekBy = useCallback(
+    (deltaSeconds: number) => {
+      const curTrack = queueRef.current[currentIndexRef.current];
+      const effDur =
+        durationRef.current > 0
+          ? durationRef.current
+          : curTrack?.durationSeconds || expectedDurationRef.current || 0;
+      const rawNext = currentTimeRef.current + deltaSeconds;
+      const clamped = effDur > 0 ? Math.max(0, Math.min(effDur, rawNext)) : Math.max(0, rawNext);
+      seekTo(clamped);
+    },
+    [seekTo]
   );
 
   const setVolume = useCallback(
@@ -2129,59 +2252,114 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     }
   }, [currentTrack, isPlaying, isRadioMode, isBackgroundPlay, isYieldedToOffline, seekTo]);
 
+  const clearBackgroundBlockedHint = useCallback(() => setBackgroundBlockedHint(null), []);
+
+  const effectiveCurrentTrack = isYieldedToOffline ? null : currentTrack;
+
+  const playerContextValue = useMemo<PlayerContextValue>(
+    () => ({
+      currentTrack: effectiveCurrentTrack,
+      queue,
+      currentIndex,
+      isPlaying,
+      isBuffering,
+      volume,
+      isMuted,
+      repeatMode,
+      isShuffle,
+      isRadioMode,
+      isLoadingRadio,
+      isExpanded,
+      mobilePlayerView,
+      isVideoMode,
+      isQueueOpen,
+      isBackgroundPlay,
+      relatedTracks,
+      isLoadingRelated,
+      playerError,
+      backgroundBlockedHint,
+      clearBackgroundBlockedHint,
+      playerHostRef,
+      playTrack,
+      startTrackRadio,
+      addToQueue,
+      playNextInQueue,
+      removeFromQueue,
+      moveQueueItem,
+      shuffleUpcomingQueue,
+      saveQueueAsPlaylist,
+      clearQueue,
+      togglePlay,
+      nextTrack,
+      prevTrack,
+      seekTo,
+      seekBy,
+      setVolume,
+      toggleMute,
+      cycleRepeat,
+      toggleShuffle,
+      toggleRadioMode,
+      toggleBackgroundPlay,
+      setIsExpanded,
+      setMobilePlayerView,
+      setIsVideoMode,
+      setIsQueueOpen,
+      jumpToQueueIndex,
+    }),
+    [
+      effectiveCurrentTrack,
+      queue,
+      currentIndex,
+      isPlaying,
+      isBuffering,
+      volume,
+      isMuted,
+      repeatMode,
+      isShuffle,
+      isRadioMode,
+      isLoadingRadio,
+      isExpanded,
+      mobilePlayerView,
+      isVideoMode,
+      isQueueOpen,
+      isBackgroundPlay,
+      relatedTracks,
+      isLoadingRelated,
+      playerError,
+      backgroundBlockedHint,
+      clearBackgroundBlockedHint,
+      playTrack,
+      startTrackRadio,
+      addToQueue,
+      playNextInQueue,
+      removeFromQueue,
+      moveQueueItem,
+      shuffleUpcomingQueue,
+      saveQueueAsPlaylist,
+      clearQueue,
+      togglePlay,
+      nextTrack,
+      prevTrack,
+      seekTo,
+      seekBy,
+      setVolume,
+      toggleMute,
+      cycleRepeat,
+      toggleShuffle,
+      toggleRadioMode,
+      toggleBackgroundPlay,
+      jumpToQueueIndex,
+    ]
+  );
+
+  const playerTimeValue = useMemo<PlayerTimeContextValue>(
+    () => ({ currentTime, duration }),
+    [currentTime, duration]
+  );
+
   return (
-    <PlayerContext.Provider
-      value={{
-        currentTrack: isYieldedToOffline ? null : currentTrack,
-        queue,
-        currentIndex,
-        isPlaying,
-        isBuffering,
-        currentTime,
-        duration,
-        volume,
-        isMuted,
-        repeatMode,
-        isShuffle,
-        isRadioMode,
-        isLoadingRadio,
-        isExpanded,
-        isVideoMode,
-        isQueueOpen,
-        isBackgroundPlay,
-        relatedTracks,
-        isLoadingRelated,
-        playerError,
-        backgroundBlockedHint,
-        clearBackgroundBlockedHint: () => setBackgroundBlockedHint(null),
-        playerHostRef,
-        playTrack,
-        startTrackRadio,
-        addToQueue,
-        playNextInQueue,
-        removeFromQueue,
-        moveQueueItem,
-        shuffleUpcomingQueue,
-        saveQueueAsPlaylist,
-        clearQueue,
-        togglePlay,
-        nextTrack,
-        prevTrack,
-        seekTo,
-        setVolume,
-        toggleMute,
-        cycleRepeat,
-        toggleShuffle,
-        toggleRadioMode,
-        toggleBackgroundPlay,
-        setIsExpanded,
-        setMobilePlayerView,
-        setIsVideoMode,
-        setIsQueueOpen,
-        jumpToQueueIndex,
-        mobilePlayerView,
-      }}
-    >
+    <PlayerContext.Provider value={playerContextValue}>
+      <PlayerTimeContext.Provider value={playerTimeValue}>
       <audio
         ref={audioElRef}
         preload="auto"
@@ -2192,9 +2370,44 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           audioUnlockedRef.current = true;
           if (isSilentWarmupRef.current) return;
           const a = audioElRef.current;
-          if (a && pendingSeekSecRef.current > 0.5) {
-            applyPendingAudioSeek(a);
+          if (a) {
+            a.muted = isMutedRef.current;
+            a.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
+            a.playbackRate = 1;
+            if (pendingSeekSecRef.current > 0.5) {
+              applyPendingAudioSeek(a);
+            } else if (
+              a.currentTime === 0 &&
+              audioKickDoneForLoadRef.current !== loadedAudioTrackIdRef.current
+            ) {
+              const loadTrackId = loadedAudioTrackIdRef.current;
+              audioKickDoneForLoadRef.current = loadTrackId;
+              // Guard against rare Chromium frame-0 silent decoder stall without interrupting normal starts
+              window.setTimeout(() => {
+                const el = audioElRef.current;
+                if (
+                  !el ||
+                  activeEngineRef.current !== 'audio' ||
+                  loadedAudioTrackIdRef.current !== loadTrackId ||
+                  el.paused ||
+                  el.ended ||
+                  isSilentWarmupRef.current
+                ) {
+                  return;
+                }
+                el.muted = isMutedRef.current;
+                el.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
+                if (Number.isFinite(el.duration) && el.duration > 3 && el.currentTime === 0) {
+                  try {
+                    el.currentTime = 0.05;
+                  } catch {
+                    // ignore
+                  }
+                }
+              }, 650);
+            }
           }
+          pauseKeepAliveBridgeIfForeground();
           consecutiveErrorsRef.current = 0;
           bgSkipStreakRef.current = 0;
           setIsPlaying(true);
@@ -2275,12 +2488,21 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           if (isSilentWarmupRef.current) return;
           const a = e.currentTarget;
           const dur = a.duration;
-          if (Number.isFinite(dur) && dur > 5) {
+          const expected = expectedDurationRef.current;
+          // Guard against progressive fMP4 chunks reporting partial loaded segment duration (e.g. 12s instead of 4:56)
+          const isReliableDur =
+            Number.isFinite(dur) &&
+            dur > 5 &&
+            (expected <= 0 || dur >= expected * 0.55 || a.readyState === 4);
+          if (isReliableDur) {
             durationRef.current = dur;
             setDuration(dur);
             if (pendingSeekSecRef.current > 0.5) {
               applyPendingAudioSeek(a);
             }
+          } else if (expected > 0 && durationRef.current <= 0) {
+            durationRef.current = expected;
+            setDuration(expected);
           }
         }}
         onTimeUpdate={(e) => {
@@ -2295,7 +2517,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             }
           }
           const cur = a.currentTime;
-          const dur = Number.isFinite(a.duration) && a.duration > 5 ? a.duration : currentTrack?.durationSeconds || 0;
+          const expected = expectedDurationRef.current;
+          const dur =
+            Number.isFinite(a.duration) &&
+            a.duration > 5 &&
+            (expected <= 0 || a.duration >= expected * 0.55 || a.readyState === 4)
+              ? a.duration
+              : expected || durationRef.current || 0;
           if (Number.isFinite(cur)) {
             currentTimeRef.current = cur;
             setCurrentTime(cur);
@@ -2347,6 +2575,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           const resumeAt = a.currentTime || 0;
           const track = queueRef.current[currentIndexRef.current];
           stopNativeAudio();
+          // Never auto-switch to YouTube (which autoplays) when the track is currently paused (e.g. restored session)
+          if (!shouldPlayRef.current || userPausedRef.current) {
+            setIsBuffering(false);
+            setIsPlaying(false);
+            return;
+          }
           if (
             document.hidden &&
             isBackgroundPlayRef.current &&
@@ -2371,6 +2605,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         }}
       />
       {children}
+      </PlayerTimeContext.Provider>
     </PlayerContext.Provider>
   );
 }
@@ -2378,5 +2613,11 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 export function usePlayer(): PlayerContextValue {
   const ctx = useContext(PlayerContext);
   if (!ctx) throw new Error('usePlayer must be used within PlayerProvider');
+  return ctx;
+}
+
+export function usePlayerTime(): PlayerTimeContextValue {
+  const ctx = useContext(PlayerTimeContext);
+  if (!ctx) throw new Error('usePlayerTime must be used within PlayerProvider');
   return ctx;
 }

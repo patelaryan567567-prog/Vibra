@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import type { CategoryId, IndiaLanguageFilter, Track } from '../src/types/music.ts';
+import type { ArtistProfileResponse, CategoryId, IndiaLanguageFilter, Track } from '../src/types/music.ts';
 import {
   generateCategoryQueries,
   generateTrendingViralSongs,
@@ -122,6 +122,7 @@ const playlistVideoIdsCache = new TtlCache<string[]>(250, 6 * 60 * 60 * 1000, sc
 const videoChannelIdCache = new TtlCache<string>(1200, 7 * 24 * 60 * 60 * 1000, scheduleDiskCacheSave);
 const videoMetaCache = new TtlCache<string>(1200, 12 * 60 * 60 * 1000, scheduleDiskCacheSave);
 const suggestionsCache = new TtlCache<string[]>(200, 6 * 60 * 60 * 1000);
+const artistCache = new TtlCache<ArtistProfileResponse>(120, 6 * 60 * 60 * 1000);
 
 // Hydrate warm cache across dev restarts / Cloud Run warm containers
 try {
@@ -1783,5 +1784,215 @@ export async function getSearchSuggestions(query: string): Promise<string[]> {
     } catch {
       return [];
     }
+  });
+}
+
+function formatSubscriberCount(rawCount: string | undefined): string | undefined {
+  if (!rawCount) return undefined;
+  const num = parseInt(rawCount, 10);
+  if (Number.isNaN(num) || num <= 0) return undefined;
+  if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(1)}M subscribers`;
+  if (num >= 1_000) return `${(num / 1_000).toFixed(1)}K subscribers`;
+  return `${num} subscribers`;
+}
+
+export async function getArtistProfile(
+  rawArtistName: string,
+  seedVideoId?: string
+): Promise<ArtistProfileResponse> {
+  const artistName = decodeHtmlEntities(rawArtistName || '').trim().slice(0, 100);
+  if (!artistName) {
+    return {
+      artistName: 'Unknown Artist',
+      topTracks: [],
+      musicVideos: [],
+      relatedArtists: [],
+    };
+  }
+
+  ensureYoutubeConfigured();
+
+  const cacheKey = `${artistName.toLowerCase()}::${seedVideoId || ''}`;
+  const cached = artistCache.get(cacheKey) || artistCache.get(`${artistName.toLowerCase()}::`);
+  if (cached && cached.topTracks.length > 0) {
+    return cached;
+  }
+
+  return coalesce(`artist:${cacheKey}`, async () => {
+    let channelId = seedVideoId ? videoChannelIdCache.get(seedVideoId) : undefined;
+    let avatarUrl: string | undefined;
+    let subscriberCount: string | undefined;
+    let channelTitle: string | undefined;
+    let uploadsPlaylistId: string | null = null;
+
+    // 1. Try resolving channel info via seedVideoId -> videoChannelIdCache (or fetch video snippet if needed)
+    if (!channelId && seedVideoId && /^[a-zA-Z0-9_-]{6,20}$/.test(seedVideoId)) {
+      try {
+        await enrichVideoIds([seedVideoId]);
+        channelId = videoChannelIdCache.get(seedVideoId);
+      } catch {
+        // ignore
+      }
+    }
+
+    // 2. Check curated handle index if artist matches well-known handle
+    const matchedHandleEntry = ARTIST_HANDLE_INDEX.find((e) => e.keywords.test(artistName));
+
+    try {
+      if (channelId && channelId.startsWith('UC')) {
+        const chData = await fetchYouTubeJson<{
+          items?: Array<{
+            id?: string;
+            snippet?: { title?: string; thumbnails?: { high?: { url?: string }; medium?: { url?: string } } };
+            statistics?: { subscriberCount?: string; hiddenSubscriberCount?: boolean };
+            contentDetails?: { relatedPlaylists?: { uploads?: string } };
+          }>;
+        }>(
+          (apiKey) =>
+            `${YT_API_BASE}/channels?part=snippet,statistics,contentDetails&id=${encodeURIComponent(
+              channelId!
+            )}&key=${encodeURIComponent(apiKey)}`,
+          'videos'
+        );
+        const ch = chData.items?.[0];
+        if (ch) {
+          channelTitle = ch.snippet?.title ? decodeHtmlEntities(ch.snippet.title) : undefined;
+          avatarUrl = ch.snippet?.thumbnails?.high?.url || ch.snippet?.thumbnails?.medium?.url;
+          if (!ch.statistics?.hiddenSubscriberCount) {
+            subscriberCount = formatSubscriberCount(ch.statistics?.subscriberCount);
+          }
+          uploadsPlaylistId = ch.contentDetails?.relatedPlaylists?.uploads ?? `UU${channelId.slice(2)}`;
+        }
+      } else if (matchedHandleEntry) {
+        const chData = await fetchYouTubeJson<{
+          items?: Array<{
+            id?: string;
+            snippet?: { title?: string; thumbnails?: { high?: { url?: string }; medium?: { url?: string } } };
+            statistics?: { subscriberCount?: string; hiddenSubscriberCount?: boolean };
+            contentDetails?: { relatedPlaylists?: { uploads?: string } };
+          }>;
+        }>(
+          (apiKey) =>
+            `${YT_API_BASE}/channels?part=snippet,statistics,contentDetails&forHandle=${encodeURIComponent(
+              matchedHandleEntry.handle
+            )}&key=${encodeURIComponent(apiKey)}`,
+          'videos'
+        );
+        const ch = chData.items?.[0];
+        if (ch) {
+          channelTitle = ch.snippet?.title ? decodeHtmlEntities(ch.snippet.title) : undefined;
+          avatarUrl = ch.snippet?.thumbnails?.high?.url || ch.snippet?.thumbnails?.medium?.url;
+          if (!ch.statistics?.hiddenSubscriberCount) {
+            subscriberCount = formatSubscriberCount(ch.statistics?.subscriberCount);
+          }
+          uploadsPlaylistId = ch.contentDetails?.relatedPlaylists?.uploads ?? null;
+        }
+      }
+    } catch {
+      // non-fatal channel metadata lookup failure
+    }
+
+    let channelTracks: Track[] = [];
+    if (uploadsPlaylistId) {
+      channelTracks = await fetchPlaylistTracks(uploadsPlaylistId, undefined, 25);
+    }
+
+    let searchedSongs: Track[] = [];
+    let searchedVideos: Track[] = [];
+    if (hasAvailableSearchKey()) {
+      const [songsRes, videosRes] = await Promise.allSettled([
+        searchYouTubeTracks({
+          query: `${artistName} songs`,
+          type: 'songs',
+          maxResults: 20,
+          skipLanguageBias: true,
+        }),
+        searchYouTubeTracks({
+          query: `${artistName} official music video`,
+          type: 'videos',
+          maxResults: 10,
+          skipLanguageBias: true,
+        }),
+      ]);
+      if (songsRes.status === 'fulfilled') searchedSongs = songsRes.value;
+      if (videosRes.status === 'fulfilled') searchedVideos = videosRes.value;
+    }
+
+    // Zero-quota cache sweep for tracks mentioning this artist
+    const artistTokens = artistName
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length >= 2);
+    const cachedMatches: Track[] = [];
+    for (const [, entry] of videoCache.exportValidEntries()) {
+      const hay = `${entry.data.artist} ${entry.data.channelTitle} ${entry.data.title}`.toLowerCase();
+      if (
+        hay.includes(artistName.toLowerCase()) ||
+        (artistTokens.length >= 2 && artistTokens.every((tok) => hay.includes(tok)))
+      ) {
+        cachedMatches.push(entry.data);
+      }
+    }
+
+    const cleanTrackPool = (list: Track[], markVideo = false) => {
+      const seenIds = new Set<string>();
+      const seenKeys = new Set<string>();
+      const out: Track[] = [];
+      for (const item of list) {
+        if (seenIds.has(item.id)) continue;
+        if (isPhonkTrack(item.title, item.channelTitle) || isShortOrSnippetClip(item)) continue;
+        if (COMPILATION_TITLE_RE.test(item.title)) continue;
+        const k = normalizeSongKey(item.title);
+        if (k && seenKeys.has(k)) continue;
+        seenIds.add(item.id);
+        if (k) seenKeys.add(k);
+        out.push(markVideo ? { ...item, isVideo: true } : item);
+      }
+      return out;
+    };
+
+    const topTracks = cleanTrackPool([...searchedSongs, ...channelTracks, ...cachedMatches])
+      .sort((a, b) => scoreTrackQuality(b, artistName) - scoreTrackQuality(a, artistName))
+      .slice(0, 18);
+
+    const musicVideosRaw =
+      searchedVideos.length > 0
+        ? searchedVideos
+        : topTracks.filter((t) => /\b(official\s*(music\s*)?video|full\s*video)\b/i.test(t.title));
+    const musicVideos = cleanTrackPool(musicVideosRaw, true).slice(0, 10);
+
+    if (!avatarUrl && topTracks[0]) {
+      avatarUrl = topTracks[0].thumbnailHigh || topTracks[0].thumbnail;
+    }
+
+    // Derive related artists from featured / co-listed tracks and warm cache
+    const relatedSet = new Set<string>();
+    const artistLower = artistName.toLowerCase();
+    for (const t of [...topTracks, ...musicVideos]) {
+      const candidate = t.artist?.trim();
+      if (
+        candidate &&
+        candidate.toLowerCase() !== artistLower &&
+        !candidate.toLowerCase().includes(artistLower) &&
+        !/^(t-series|zee music|sony music|yrf|speed records|saregama|tips official)$/i.test(candidate)
+      ) {
+        relatedSet.add(candidate);
+      }
+      if (relatedSet.size >= 8) break;
+    }
+
+    const profile: ArtistProfileResponse = {
+      artistName,
+      avatarUrl,
+      subscriberCount,
+      channelTitle,
+      topTracks,
+      musicVideos,
+      relatedArtists: Array.from(relatedSet),
+    };
+
+    artistCache.set(cacheKey, profile);
+    artistCache.set(`${artistName.toLowerCase()}::`, profile);
+    return profile;
   });
 }

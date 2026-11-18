@@ -3,9 +3,10 @@ import { Clock, Disc3, Play, Search, Trash2, TrendingUp, Tv, X } from 'lucide-re
 import { ApiNoticeBanner } from '../components/ApiNoticeBanner';
 import { TrackCard, TrackCardSkeleton, TrackRow } from '../components/TrackCard';
 import { TRENDING_SEARCH_KEYWORDS } from '../constants/categories';
+import { useConfirm } from '../context/ConfirmContext';
 import { useLibrary } from '../context/LibraryContext';
 import { usePlayer } from '../context/PlayerContext';
-import { ApiError, fetchSearchSuggestions, searchYouTube } from '../services/api';
+import { ApiError, fetchSearchSuggestions, prewarmTrackBatch, searchYouTube } from '../services/api';
 import type { Track } from '../types/music';
 
 interface SearchPageProps {
@@ -19,6 +20,7 @@ export function SearchPage({
   onConsumeInitialQuery,
   onAddToPlaylist,
 }: SearchPageProps) {
+  const confirm = useConfirm();
   const { searchHistory, addSearchQuery, removeSearchQuery, clearSearchHistory } = useLibrary();
   const { playTrack } = usePlayer();
 
@@ -63,6 +65,9 @@ export function SearchPage({
       if (controller.signal.aborted) return;
       setResults(data.tracks);
       setNextPageToken(data.nextPageToken);
+      if (targetTab === 'songs' && data.tracks.length > 0) {
+        prewarmTrackBatch(data.tracks.slice(0, 6));
+      }
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       setResults([]);
@@ -288,7 +293,17 @@ export function SearchPage({
               {searchHistory.length > 0 && (
                 <button
                   type="button"
-                  onClick={clearSearchHistory}
+                  onClick={async () => {
+                    if (
+                      await confirm({
+                        title: 'Clear Search History?',
+                        message: `Delete all ${searchHistory.length} recent search entries?`,
+                        confirmText: 'Clear All',
+                      })
+                    ) {
+                      clearSearchHistory();
+                    }
+                  }}
                   className="text-xs text-slate-400 hover:text-white"
                 >
                   Clear all
@@ -317,7 +332,17 @@ export function SearchPage({
                     </button>
                     <button
                       type="button"
-                      onClick={() => removeSearchQuery(item.query)}
+                      onClick={async () => {
+                        if (
+                          await confirm({
+                            title: 'Delete Search Entry?',
+                            message: `Remove "${item.query}" from your recent searches?`,
+                            confirmText: 'Delete',
+                          })
+                        ) {
+                          removeSearchQuery(item.query);
+                        }
+                      }}
                       aria-label={`Remove ${item.query} from history`}
                       className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400"
                     >

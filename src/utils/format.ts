@@ -10,6 +10,17 @@ export function formatSeconds(totalSeconds: number): string {
   return `${mins}:${String(rem).padStart(2, '0')}`;
 }
 
+export function parseDurationLabel(label?: string | null): number {
+  if (!label || typeof label !== 'string') return 0;
+  const trimmed = label.trim();
+  if (!trimmed || !/^\d{1,3}(:\d{2}){1,2}$/.test(trimmed)) return 0;
+  const parts = trimmed.split(':').map(Number);
+  if (parts.some((n) => !Number.isFinite(n) || n < 0)) return 0;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return 0;
+}
+
 export function formatRelativeTime(timestamp: number): string {
   const diffMs = Date.now() - timestamp;
   const diffSec = Math.floor(diffMs / 1000);
