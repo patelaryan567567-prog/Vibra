@@ -168,6 +168,8 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
   const audioUnlockedRef = useRef(false);
   const isSilentWarmupRef = useRef(false);
   const pendingSeekSecRef = useRef<number>(0);
+  const pendingSeekMuteGuardRef = useRef(false);
+  const pendingSeekSetAtRef = useRef(0);
   const loadedTrackIdRef = useRef<string | null>(null);
   const loadedAudioTrackIdRef = useRef<string | null>(null);
   const audioKickDoneForLoadRef = useRef<string | null>(null);
@@ -182,6 +184,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
   const lastPosSaveRef = useRef<number>(0);
   const isYieldedToOnlineRef = useRef(false);
   const sessionRestoredRef = useRef(false);
+  const restoredPausedTrackIdRef = useRef<string | null>(null);
 
   const queueRef = useRef(queue);
   const currentIndexRef = useRef(currentIndex);
@@ -209,6 +212,15 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
     (overrideSec?: number) => {
       const curTrack = queueRef.current[currentIndexRef.current];
       if (!curTrack) return;
+      if (pendingSeekSecRef.current > 0.5) {
+        const safePending = Math.max(pendingSeekSecRef.current, currentTimeRef.current ?? 0);
+        const dur = durationRef.current || curTrack.durationSeconds || 0;
+        saveTrackPosition(curTrack.id, safePending, dur);
+        if (curTrack.sourceVideoId) {
+          saveTrackPosition(curTrack.sourceVideoId, safePending, dur);
+        }
+        return;
+      }
       const sec = overrideSec ?? currentTimeRef.current ?? 0;
       const dur = durationRef.current || curTrack.durationSeconds || 0;
       saveTrackPosition(curTrack.id, sec, dur);
@@ -219,24 +231,55 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
     [saveTrackPosition]
   );
 
-  const applyPendingSeek = useCallback((a: HTMLAudioElement) => {
-    const targetSec = pendingSeekSecRef.current;
-    if (targetSec <= 0.5) return;
-    if (isSilentWarmupRef.current || !a.src || a.src.startsWith('data:')) return;
-    if (Number.isFinite(a.duration) && a.duration > 3) {
-      const clamped = Math.min(targetSec, Math.max(0, a.duration - 0.5));
+  const releaseSeekMuteGuard = useCallback((a?: HTMLAudioElement | null) => {
+    pendingSeekMuteGuardRef.current = false;
+    const targetEl = a ?? audioElRef.current;
+    if (targetEl && !isSilentWarmupRef.current) {
+      targetEl.muted = isMutedRef.current;
+      targetEl.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
+    }
+  }, []);
+
+  const applyPendingSeek = useCallback(
+    (a: HTMLAudioElement) => {
+      const targetSec = pendingSeekSecRef.current;
+      if (targetSec <= 0.5) {
+        if (pendingSeekMuteGuardRef.current) releaseSeekMuteGuard(a);
+        return;
+      }
+      if (isSilentWarmupRef.current || !a.src || a.src.startsWith('data:')) return;
+      if (a.readyState < 1) return;
+
+      const dur = Number.isFinite(a.duration) && a.duration > 3 ? a.duration : 0;
+      if (dur <= 3) return;
+
+      const clamped = Math.min(targetSec, Math.max(0, dur - 0.5));
+      if (Math.abs((a.currentTime || 0) - clamped) <= 1.5) {
+        pendingSeekSecRef.current = 0;
+        pendingSeekSetAtRef.current = 0;
+        currentTimeRef.current = a.currentTime;
+        setCurrentTime(a.currentTime);
+        releaseSeekMuteGuard(a);
+        return;
+      }
+
+      if (a.seeking) return;
+
       try {
         a.currentTime = clamped;
         currentTimeRef.current = clamped;
         setCurrentTime(clamped);
-        if (Math.abs(a.currentTime - clamped) < 1.5) {
+        if (Math.abs((a.currentTime || 0) - clamped) <= 1.5) {
           pendingSeekSecRef.current = 0;
+          pendingSeekSetAtRef.current = 0;
+          releaseSeekMuteGuard(a);
         }
       } catch {
         // wait
       }
-    }
-  }, []);
+    },
+    [releaseSeekMuteGuard]
+  );
 
   const stopAudio = useCallback(() => {
     isSilentWarmupRef.current = false;
@@ -259,11 +302,14 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
 
       loadedAudioTrackIdRef.current = track.id;
       audioKickDoneForLoadRef.current = null;
-      pendingSeekSecRef.current = resumeSec > 0.5 ? resumeSec : 0;
-      currentTimeRef.current = resumeSec > 0.5 ? resumeSec : 0;
-      setCurrentTime(resumeSec > 0.5 ? resumeSec : 0);
+      const hasResumeSeek = resumeSec > 0.5;
+      pendingSeekSecRef.current = hasResumeSeek ? resumeSec : 0;
+      pendingSeekSetAtRef.current = hasResumeSeek ? Date.now() : 0;
+      pendingSeekMuteGuardRef.current = hasResumeSeek;
+      currentTimeRef.current = hasResumeSeek ? resumeSec : 0;
+      setCurrentTime(hasResumeSeek ? resumeSec : 0);
 
-      audio.muted = isMutedRef.current;
+      audio.muted = hasResumeSeek ? true : isMutedRef.current;
       audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
       audio.playbackRate = 1;
 
@@ -282,7 +328,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
           audio.pause();
           audio.src = cachedUrl;
           audio.load();
-        } else if (resumeSec <= 0.5) {
+        } else if (!hasResumeSeek) {
           try {
             audio.currentTime = 0;
           } catch {
@@ -291,6 +337,8 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         }
         if (audio.readyState >= 1 && pendingSeekSecRef.current > 0.5) {
           applyPendingSeek(audio);
+        } else if (!hasResumeSeek) {
+          releaseSeekMuteGuard(audio);
         }
         setIsBuffering(false);
         if (shouldPlayRef.current && !userPausedRef.current) {
@@ -299,14 +347,18 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
             void p
               .then(() => {
                 audioUnlockedRef.current = true;
-                audio.muted = isMutedRef.current;
-                audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
                 if (pendingSeekSecRef.current > 0.5) {
                   applyPendingSeek(audio);
+                } else {
+                  releaseSeekMuteGuard(audio);
                 }
               })
               .catch((err) => {
                 if (err instanceof Error && err.name === 'NotAllowedError') {
+                  shouldPlayRef.current = false;
+                  userPausedRef.current = true;
+                  releaseSeekMuteGuard(audio);
+                  setIsBuffering(false);
                   setIsPlaying(false);
                 }
               });
@@ -356,6 +408,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         if (!blobUrl) {
           isSilentWarmupRef.current = false;
           stopAudio();
+          releaseSeekMuteGuard(audio);
           setIsBuffering(false);
           const curQ = queueRef.current;
           if (curQ.length > 1 && errorSkipStreakRef.current < 10) {
@@ -375,18 +428,21 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         isSilentWarmupRef.current = false;
         audio.pause();
         audio.loop = false;
-        audio.muted = isMutedRef.current;
+        audio.muted = pendingSeekSecRef.current > 0.5 ? true : isMutedRef.current;
         audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
         audio.playbackRate = 1;
         if (audio.src !== blobUrl) {
           audio.src = blobUrl;
           audio.load();
-        } else if (resumeSec <= 0.5) {
+        } else if (pendingSeekSecRef.current <= 0.5) {
           try {
             audio.currentTime = 0;
           } catch {
             // ignore
           }
+        }
+        if (audio.readyState >= 1 && pendingSeekSecRef.current > 0.5) {
+          applyPendingSeek(audio);
         }
 
         if (shouldPlayRef.current && !userPausedRef.current) {
@@ -395,14 +451,17 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
             void p
               .then(() => {
                 audioUnlockedRef.current = true;
-                audio.muted = isMutedRef.current;
-                audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
                 if (pendingSeekSecRef.current > 0.5) {
                   applyPendingSeek(audio);
+                } else {
+                  releaseSeekMuteGuard(audio);
                 }
               })
               .catch((err) => {
                 if (err instanceof Error && err.name === 'NotAllowedError') {
+                  shouldPlayRef.current = false;
+                  userPausedRef.current = true;
+                  releaseSeekMuteGuard(audio);
                   setIsBuffering(false);
                   setIsPlaying(false);
                 }
@@ -413,7 +472,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         }
       });
     },
-    [applyPendingSeek, stopAudio]
+    [applyPendingSeek, releaseSeekMuteGuard, stopAudio]
   );
 
   const pickNextShuffleIndex = useCallback((q: OfflineTrack[], currentIdx: number): number => {
@@ -518,6 +577,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         repeatMode?: RepeatMode;
         isShuffle?: boolean;
         wasPlaying?: boolean;
+        savedAt?: number;
       };
       if (!parsed.queueIds || parsed.queueIds.length === 0) return;
 
@@ -535,13 +595,26 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
             Math.min(restoredQueue.length - 1, parsed.currentIndex ?? 0)
           );
           const restoredTrack = restoredQueue[restoredIdx];
-          const savedPos = getTrackPosition(restoredTrack.id);
-          const restoredTime = Math.max(0, parsed.currentTime ?? savedPos?.positionSeconds ?? 0);
+          const savedPos =
+            getTrackPosition(restoredTrack.id) ||
+            (restoredTrack.sourceVideoId ? getTrackPosition(restoredTrack.sourceVideoId) : null);
+          const sessionTime = typeof parsed.currentTime === 'number' && parsed.currentTime > 0 ? parsed.currentTime : 0;
+          const sessionSavedAt = typeof parsed.savedAt === 'number' ? parsed.savedAt : 0;
+          const posSavedAt = savedPos?.updatedAt ?? 0;
+          const restoredTime = Math.max(
+            0,
+            posSavedAt > sessionSavedAt && savedPos
+              ? savedPos.positionSeconds
+              : sessionTime > 0
+                ? sessionTime
+                : (savedPos?.positionSeconds ?? 0)
+          );
 
           if (parsed.repeatMode) setRepeatMode(parsed.repeatMode);
           if (typeof parsed.isShuffle === 'boolean') setIsShuffle(parsed.isShuffle);
 
           // Always restore the previous offline song in PAUSED state on app open so the user chooses when to resume
+          restoredPausedTrackIdRef.current = restoredTrack.id;
           shouldPlayRef.current = false;
           userPausedRef.current = true;
           loadedTrackIdRef.current = restoredTrack.id;
@@ -620,6 +693,9 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
   // Sync & pre-warm ONLY the immediate next track + record offline song in Recently Played!
   useEffect(() => {
     if (!currentTrack) {
+      if (restoredPausedTrackIdRef.current) {
+        return;
+      }
       loadedTrackIdRef.current = null;
       shouldPlayRef.current = false;
       stopAudio();
@@ -627,6 +703,17 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       void releasePlaybackWakeLock();
       return;
     }
+
+    if (restoredPausedTrackIdRef.current === currentTrack.id) {
+      restoredPausedTrackIdRef.current = null;
+      loadedTrackIdRef.current = currentTrack.id;
+      shouldPlayRef.current = false;
+      userPausedRef.current = true;
+      setIsPlaying(false);
+      setIsBuffering(false);
+      return;
+    }
+    restoredPausedTrackIdRef.current = null;
 
     if (isYieldedToOnlineRef.current) {
       return;
@@ -758,15 +845,24 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       ensurePlaybackAlive();
     };
 
+    const flushPlaybackSnapshot = () => {
+      persistCurrentTrackResume();
+      saveOfflineSession();
+    };
+
     const onWindowFocusOrShow = () => {
       ensurePlaybackAlive();
     };
 
     document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('pagehide', flushPlaybackSnapshot);
+    window.addEventListener('beforeunload', flushPlaybackSnapshot);
     window.addEventListener('focus', onWindowFocusOrShow);
     window.addEventListener('pageshow', onWindowFocusOrShow);
     return () => {
       document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('pagehide', flushPlaybackSnapshot);
+      window.removeEventListener('beforeunload', flushPlaybackSnapshot);
       window.removeEventListener('focus', onWindowFocusOrShow);
       window.removeEventListener('pageshow', onWindowFocusOrShow);
     };
@@ -1040,7 +1136,10 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         pokeBackgroundKeepAlive();
         void acquirePlaybackWakeLock();
       }
-      const savedPos = getTrackPosition(currentTrack.id)?.positionSeconds ?? 0;
+      const savedPos =
+        getTrackPosition(currentTrack.id)?.positionSeconds ??
+        (currentTrack.sourceVideoId ? getTrackPosition(currentTrack.sourceVideoId)?.positionSeconds : undefined) ??
+        0;
       const effectiveResume = curSec > 0.5 ? curSec : savedPos;
       if (
         !audio.getAttribute('src') ||
@@ -1050,11 +1149,15 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       ) {
         beginOfflineTrackAudio(currentTrack, effectiveResume);
       } else {
-        audio.muted = isMutedRef.current;
-        audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
-        if (effectiveResume > 0.5 && Math.abs((audio.currentTime || 0) - effectiveResume) > 2) {
+        const needsSeek = effectiveResume > 0.5 && Math.abs((audio.currentTime || 0) - effectiveResume) > 1.5;
+        if (needsSeek) {
           pendingSeekSecRef.current = effectiveResume;
+          pendingSeekSetAtRef.current = Date.now();
+          pendingSeekMuteGuardRef.current = true;
+          audio.muted = true;
           applyPendingSeek(audio);
+        } else {
+          releaseSeekMuteGuard(audio);
         }
         void audio.play().catch(() => {
           beginOfflineTrackAudio(currentTrack, effectiveResume);
@@ -1068,6 +1171,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
     currentTrack,
     getTrackPosition,
     persistCurrentTrackResume,
+    releaseSeekMuteGuard,
     saveOfflineSession,
   ]);
 
@@ -1131,6 +1235,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
       currentTimeRef.current = seconds;
       setCurrentTime(seconds);
       persistCurrentTrackResume(seconds);
+      saveOfflineSession(seconds);
       const a = audioElRef.current;
       if (!a) return;
       if (isSilentWarmupRef.current || !Number.isFinite(a.duration) || a.duration <= 3) {
@@ -1140,7 +1245,7 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
         a.currentTime = seconds;
       }
     },
-    [persistCurrentTrackResume]
+    [persistCurrentTrackResume, saveOfflineSession]
   );
 
   const seekBy = useCallback(
@@ -1406,38 +1511,40 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
           if (isSilentWarmupRef.current) return;
           const a = audioElRef.current;
           if (a) {
-            a.muted = isMutedRef.current;
-            a.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
             a.playbackRate = 1;
             if (pendingSeekSecRef.current > 0.5) {
+              a.muted = true;
               applyPendingSeek(a);
-            } else if (
-              a.currentTime < 0.35 &&
-              audioKickDoneForLoadRef.current !== loadedAudioTrackIdRef.current
-            ) {
-              const loadTrackId = loadedAudioTrackIdRef.current;
-              audioKickDoneForLoadRef.current = loadTrackId;
-              window.setTimeout(() => {
-                const el = audioElRef.current;
-                if (
-                  !el ||
-                  loadedAudioTrackIdRef.current !== loadTrackId ||
-                  el.paused ||
-                  el.ended ||
-                  isSilentWarmupRef.current
-                ) {
-                  return;
-                }
-                el.muted = isMutedRef.current;
-                el.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
-                if (Number.isFinite(el.duration) && el.duration > 3 && el.currentTime < 0.08) {
-                  try {
-                    el.currentTime = 0.08;
-                  } catch {
-                    // ignore
+            } else {
+              releaseSeekMuteGuard(a);
+              if (
+                a.currentTime < 0.35 &&
+                audioKickDoneForLoadRef.current !== loadedAudioTrackIdRef.current
+              ) {
+                const loadTrackId = loadedAudioTrackIdRef.current;
+                audioKickDoneForLoadRef.current = loadTrackId;
+                window.setTimeout(() => {
+                  const el = audioElRef.current;
+                  if (
+                    !el ||
+                    loadedAudioTrackIdRef.current !== loadTrackId ||
+                    el.paused ||
+                    el.ended ||
+                    isSilentWarmupRef.current ||
+                    pendingSeekSecRef.current > 0.5
+                  ) {
+                    return;
                   }
-                }
-              }, 220);
+                  releaseSeekMuteGuard(el);
+                  if (Number.isFinite(el.duration) && el.duration > 3 && el.currentTime < 0.08) {
+                    try {
+                      el.currentTime = 0.08;
+                    } catch {
+                      // ignore
+                    }
+                  }
+                }, 220);
+              }
             }
           }
           pauseKeepAliveBridgeIfForeground();
@@ -1451,12 +1558,31 @@ export function OfflinePlayerProvider({ children }: { children: React.ReactNode 
             void acquirePlaybackWakeLock();
           }
         }}
+        onSeeked={(e) => {
+          if (isSilentWarmupRef.current) return;
+          const a = e.currentTarget;
+          if (a.src.startsWith('data:')) return;
+          const pending = pendingSeekSecRef.current;
+          if (pending > 0.5) {
+            if (Math.abs((a.currentTime || 0) - pending) <= 2.0) {
+              pendingSeekSecRef.current = 0;
+              pendingSeekSetAtRef.current = 0;
+              currentTimeRef.current = a.currentTime;
+              setCurrentTime(a.currentTime);
+              releaseSeekMuteGuard(a);
+            } else {
+              applyPendingSeek(a);
+            }
+          } else if (pendingSeekMuteGuardRef.current) {
+            releaseSeekMuteGuard(a);
+          }
+        }}
         onPause={() => {
           if (isSilentWarmupRef.current) return;
           const a = audioElRef.current;
           if (!a || a.src.startsWith('data:')) return;
           if (!a.ended) {
-            persistCurrentTrackResume(a.currentTime);
+            persistCurrentTrackResume(pendingSeekSecRef.current > 0.5 ? undefined : a.currentTime);
             if (
               !isYieldedToOnlineRef.current &&
               isBackgroundPlayRef.current &&

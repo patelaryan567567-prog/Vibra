@@ -156,13 +156,16 @@ function pruneOnlineBlobCache(keepIds: Set<string>) {
   }
 }
 
-function buildDirectAudioStreamUrl(track: Track): string {
+function buildDirectAudioStreamUrl(track: Track, wantsSeek = false): string {
   const qs = new URLSearchParams({
     videoId: track.id,
     title: track.title,
     artist: track.artist,
     duration: String(track.durationSeconds || 0),
   });
+  if (wantsSeek) {
+    qs.set('seek', '1');
+  }
   return `/api/audio/stream?${qs.toString()}`;
 }
 
@@ -294,6 +297,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const audioUnlockedRef = useRef(false);
   const isSilentWarmupRef = useRef(false);
   const pendingSeekSecRef = useRef<number>(0);
+  const pendingSeekMuteGuardRef = useRef(false);
+  const pendingSeekSetAtRef = useRef(0);
   const pendingYtSeekSecRef = useRef<number>(0);
   const pendingTrackIdRef = useRef<string | null>(null);
   const loadedTrackIdRef = useRef<string | null>(null);
@@ -315,6 +320,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const lastSessionSaveRef = useRef<number>(0);
   const lastPosSaveRef = useRef<number>(0);
   const sessionRestoredRef = useRef(false);
+  const restoredPausedTrackIdRef = useRef<string | null>(null);
   const isYieldedToOfflineRef = useRef(false);
   const [isYieldedToOffline, setIsYieldedToOffline] = useState(false);
 
@@ -351,6 +357,14 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     (overrideSec?: number) => {
       const curTrack = queueRef.current[currentIndexRef.current];
       if (!curTrack) return;
+      // Never let a premature 0..4s audio clock overwrite an uncompleted resume seek target
+      if (pendingSeekSecRef.current > 0.5) {
+        const safePending = Math.max(pendingSeekSecRef.current, currentTimeRef.current ?? 0);
+        const dur = durationRef.current || curTrack.durationSeconds || 0;
+        saveTrackPosition(curTrack.id, safePending, dur);
+        saveTrackPosition(`dl_${curTrack.id}`, safePending, dur);
+        return;
+      }
       const sec = overrideSec ?? currentTimeRef.current ?? 0;
       const dur = durationRef.current || curTrack.durationSeconds || 0;
       saveTrackPosition(curTrack.id, sec, dur);
@@ -359,24 +373,77 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     [saveTrackPosition]
   );
 
-  const applyPendingAudioSeek = useCallback((a: HTMLAudioElement) => {
-    const targetSec = pendingSeekSecRef.current;
-    if (targetSec <= 0.5) return;
-    if (isSilentWarmupRef.current || !a.src || a.src.startsWith('data:')) return;
-    if (Number.isFinite(a.duration) && a.duration > 3) {
-      const clamped = Math.min(targetSec, Math.max(0, a.duration - 0.5));
+  const releaseSeekMuteGuard = useCallback((a?: HTMLAudioElement | null) => {
+    pendingSeekMuteGuardRef.current = false;
+    const targetEl = a ?? audioElRef.current;
+    if (targetEl && !isSilentWarmupRef.current) {
+      targetEl.muted = isMutedRef.current;
+      targetEl.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
+    }
+  }, []);
+
+  const applyPendingAudioSeek = useCallback(
+    (a: HTMLAudioElement) => {
+      const targetSec = pendingSeekSecRef.current;
+      if (targetSec <= 0.5) {
+        if (pendingSeekMuteGuardRef.current) releaseSeekMuteGuard(a);
+        return;
+      }
+      if (isSilentWarmupRef.current || !a.src || a.src.startsWith('data:')) return;
+      if (a.readyState < 1) return;
+
+      const dur = Number.isFinite(a.duration) && a.duration > 3 ? a.duration : 0;
+      if (dur <= 3) return;
+
+      const clamped = Math.min(targetSec, Math.max(0, dur - 0.5));
+      if (Math.abs((a.currentTime || 0) - clamped) <= 1.8) {
+        pendingSeekSecRef.current = 0;
+        pendingSeekSetAtRef.current = 0;
+        currentTimeRef.current = a.currentTime;
+        setCurrentTime(a.currentTime);
+        releaseSeekMuteGuard(a);
+        return;
+      }
+
+      // Check seekable range so Chromium doesn't silently clamp a.currentTime back to 0:00
+      let canSeekNow = true;
+      if (a.seekable && a.seekable.length > 0) {
+        canSeekNow = false;
+        for (let i = 0; i < a.seekable.length; i++) {
+          if (clamped >= a.seekable.start(i) - 0.5 && clamped <= a.seekable.end(i) + 0.5) {
+            canSeekNow = true;
+            break;
+          }
+        }
+      }
+
+      if (!canSeekNow) {
+        // Safety fallback: if stream still isn't seekable after 5s, unmute instead of staying silent
+        if (pendingSeekSetAtRef.current > 0 && Date.now() - pendingSeekSetAtRef.current > 5000) {
+          pendingSeekSecRef.current = 0;
+          pendingSeekSetAtRef.current = 0;
+          releaseSeekMuteGuard(a);
+        }
+        return;
+      }
+
+      if (a.seeking) return;
+
       try {
         a.currentTime = clamped;
         currentTimeRef.current = clamped;
         setCurrentTime(clamped);
-        if (Math.abs(a.currentTime - clamped) < 1.5) {
+        if (Math.abs((a.currentTime || 0) - clamped) <= 1.8) {
           pendingSeekSecRef.current = 0;
+          pendingSeekSetAtRef.current = 0;
+          releaseSeekMuteGuard(a);
         }
       } catch {
         // wait for next readiness event
       }
-    }
-  }, []);
+    },
+    [releaseSeekMuteGuard]
+  );
 
   const destroyHls = useCallback(() => {
     if (hlsRef.current) {
@@ -504,9 +571,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       activeEngineRef.current = 'audio';
       loadedAudioTrackIdRef.current = track.id;
       audioKickDoneForLoadRef.current = null;
-      pendingSeekSecRef.current = resumeSec > 0.5 ? resumeSec : 0;
-      currentTimeRef.current = resumeSec > 0.5 ? resumeSec : 0;
-      setCurrentTime(resumeSec > 0.5 ? resumeSec : 0);
+      const hasResumeSeek = resumeSec > 0.5;
+      pendingSeekSecRef.current = hasResumeSeek ? resumeSec : 0;
+      pendingSeekSetAtRef.current = hasResumeSeek ? Date.now() : 0;
+      pendingSeekMuteGuardRef.current = hasResumeSeek;
+      currentTimeRef.current = hasResumeSeek ? resumeSec : 0;
+      setCurrentTime(hasResumeSeek ? resumeSec : 0);
       const initialDur =
         track.durationSeconds && track.durationSeconds > 0
           ? track.durationSeconds
@@ -517,7 +587,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         setDuration(initialDur);
       }
 
-      audio.muted = isMutedRef.current;
+      // Hold audio muted while jumping directly to resumeSec so 0:00 never blasts briefly
+      audio.muted = hasResumeSeek ? true : isMutedRef.current;
       audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
       audio.playbackRate = 1;
 
@@ -547,7 +618,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         audio.loop = false;
         if (audio.src !== cachedBlobUrl) {
           audio.src = cachedBlobUrl;
-        } else if (resumeSec <= 0.5) {
+        } else if (!hasResumeSeek) {
           try {
             audio.currentTime = 0;
           } catch {
@@ -556,6 +627,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         }
         if (audio.readyState >= 1 && pendingSeekSecRef.current > 0.5) {
           applyPendingAudioSeek(audio);
+        } else if (!hasResumeSeek) {
+          releaseSeekMuteGuard(audio);
         }
         setIsBuffering(false);
         if (shouldPlayRef.current && !userPausedRef.current) {
@@ -564,16 +637,20 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             void p
               .then(() => {
                 audioUnlockedRef.current = true;
-                audio.muted = isMutedRef.current;
-                audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
                 if (pendingSeekSecRef.current > 0.5) {
                   applyPendingAudioSeek(audio);
+                } else {
+                  releaseSeekMuteGuard(audio);
                 }
               })
               .catch((err) => {
                 if (err instanceof Error && err.name === 'AbortError') return;
                 if (err instanceof Error && err.name === 'NotAllowedError') {
+                  shouldPlayRef.current = false;
+                  userPausedRef.current = true;
+                  releaseSeekMuteGuard(audio);
                   setIsPlaying(false);
+                  setIsBuffering(false);
                   return;
                 }
               });
@@ -585,43 +662,63 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       // Stream directly via native HTTP 206 `/api/audio/stream` for both foreground and background!
       isSilentWarmupRef.current = false;
       audio.loop = false;
-      audio.muted = isMutedRef.current;
+      audio.muted = hasResumeSeek ? true : isMutedRef.current;
       audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
-      const directUrl = buildDirectAudioStreamUrl(track);
+      const directUrl = buildDirectAudioStreamUrl(track, hasResumeSeek);
+      const baseDirectUrl = buildDirectAudioStreamUrl(track, false);
       const absoluteDirectUrl =
         typeof window !== 'undefined' ? new URL(directUrl, window.location.origin).href : directUrl;
-      if (audio.src !== absoluteDirectUrl && audio.src !== directUrl) {
+      const absoluteBaseUrl =
+        typeof window !== 'undefined' ? new URL(baseDirectUrl, window.location.origin).href : baseDirectUrl;
+      const sameTrackStreamLoaded =
+        audio.src === absoluteDirectUrl ||
+        audio.src === directUrl ||
+        audio.src === absoluteBaseUrl ||
+        audio.src === baseDirectUrl;
+
+      if (!sameTrackStreamLoaded) {
         audio.src = directUrl;
-      } else if (resumeSec <= 0.5) {
+        setIsBuffering(true);
+      } else if (!hasResumeSeek) {
         try {
           audio.currentTime = 0;
         } catch {
           // ignore
         }
+        setIsBuffering(audio.readyState < 2);
+      } else if (audio.readyState >= 1) {
+        applyPendingAudioSeek(audio);
+        setIsBuffering(false);
+      } else {
+        setIsBuffering(true);
       }
-      setIsBuffering(true);
+
       if (shouldPlayRef.current && !userPausedRef.current) {
         const directPlay = audio.play();
         if (directPlay) {
           void directPlay
             .then(() => {
               audioUnlockedRef.current = true;
-              audio.muted = isMutedRef.current;
-              audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
               if (pendingSeekSecRef.current > 0.5) {
                 applyPendingAudioSeek(audio);
+              } else {
+                releaseSeekMuteGuard(audio);
               }
             })
             .catch((err) => {
               if (err instanceof Error && err.name === 'AbortError') return;
               if (err instanceof Error && err.name === 'NotAllowedError') {
+                shouldPlayRef.current = false;
+                userPausedRef.current = true;
+                releaseSeekMuteGuard(audio);
                 setIsPlaying(false);
+                setIsBuffering(false);
               }
             });
         }
       }
     },
-    [applyPendingAudioSeek, destroyHls, startYouTubeTrack]
+    [applyPendingAudioSeek, destroyHls, releaseSeekMuteGuard, startYouTubeTrack]
   );
 
   const unlockAudioFromGesture = useCallback(() => {
@@ -828,6 +925,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         isShuffle?: boolean;
         isRadioMode?: boolean;
         wasPlaying?: boolean;
+        savedAt?: number;
       };
       if (!parsed.queue || !Array.isArray(parsed.queue) || parsed.queue.length === 0) return;
 
@@ -837,11 +935,16 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       const restoredIdx = Math.max(0, Math.min(restoredQueue.length - 1, parsed.currentIndex ?? 0));
       const track = restoredQueue[restoredIdx];
       const savedPos = getTrackPosition(track.id) || getTrackPosition(`dl_${track.id}`);
+      const sessionTime = typeof parsed.currentTime === 'number' && parsed.currentTime > 0 ? parsed.currentTime : 0;
+      const sessionSavedAt = typeof parsed.savedAt === 'number' ? parsed.savedAt : 0;
+      const posSavedAt = savedPos?.updatedAt ?? 0;
       const restoredTime = Math.max(
         0,
-        typeof parsed.currentTime === 'number' && parsed.currentTime > 0
-          ? parsed.currentTime
-          : (savedPos?.positionSeconds ?? 0)
+        posSavedAt > sessionSavedAt && savedPos
+          ? savedPos.positionSeconds
+          : sessionTime > 0
+            ? sessionTime
+            : (savedPos?.positionSeconds ?? 0)
       );
 
       if (parsed.repeatMode) setRepeatMode(parsed.repeatMode);
@@ -849,10 +952,11 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       if (typeof parsed.isRadioMode === 'boolean') setIsRadioMode(parsed.isRadioMode);
 
       // Always restore the previous song in PAUSED state on app open so the user chooses when to resume
+      restoredPausedTrackIdRef.current = track.id;
       shouldPlayRef.current = false;
       userPausedRef.current = true;
       loadedTrackIdRef.current = track.id;
-      loadedAudioTrackIdRef.current = track.id;
+      loadedAudioTrackIdRef.current = null;
       activeEngineRef.current = 'audio';
       pendingSeekSecRef.current = restoredTime;
       currentTimeRef.current = restoredTime;
@@ -869,14 +973,15 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       setQueue(restoredQueue);
       setCurrentIndex(restoredIdx);
 
+      // Pause any active audio without downloading stream bytes until the user chooses to resume
       const audio = audioElRef.current;
       if (audio) {
         audio.pause();
         audio.muted = isMutedRef.current;
         audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
-        audio.src = buildDirectAudioStreamUrl(track);
-        audio.load();
       }
+      // Lightweight server-side stream resolution prewarm (<1 KB) so Play resumes instantly when tapped
+      prewarmTrackBatch([track]);
     } catch {
       // ignore malformed storage
     }
@@ -1127,6 +1232,9 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   // Sync state & pre-warm upcoming tracks when currentTrack changes (with strict RAM cap!)
   useEffect(() => {
     if (!currentTrack) {
+      if (restoredPausedTrackIdRef.current) {
+        return;
+      }
       resolveAbortRef.current?.abort();
       loadedTrackIdRef.current = null;
       activeEngineRef.current = 'none';
@@ -1141,6 +1249,16 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       void releasePlaybackWakeLock();
       return;
     }
+    if (restoredPausedTrackIdRef.current === currentTrack.id) {
+      restoredPausedTrackIdRef.current = null;
+      loadedTrackIdRef.current = currentTrack.id;
+      shouldPlayRef.current = false;
+      userPausedRef.current = true;
+      setIsPlaying(false);
+      setIsBuffering(false);
+      return;
+    }
+    restoredPausedTrackIdRef.current = null;
     if (isYieldedToOfflineRef.current) {
       return;
     }
@@ -1409,15 +1527,24 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       ensureOnlinePlaybackAlive();
     };
 
+    const flushPlaybackSnapshot = () => {
+      persistCurrentTrackResume();
+      saveOnlineSession();
+    };
+
     const onWindowFocusOrShow = () => {
       ensureOnlinePlaybackAlive();
     };
 
     document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('pagehide', flushPlaybackSnapshot);
+    window.addEventListener('beforeunload', flushPlaybackSnapshot);
     window.addEventListener('focus', onWindowFocusOrShow);
     window.addEventListener('pageshow', onWindowFocusOrShow);
     return () => {
       document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('pagehide', flushPlaybackSnapshot);
+      window.removeEventListener('beforeunload', flushPlaybackSnapshot);
       window.removeEventListener('focus', onWindowFocusOrShow);
       window.removeEventListener('pageshow', onWindowFocusOrShow);
     };
@@ -1833,7 +1960,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           pokeBackgroundKeepAlive();
           void acquirePlaybackWakeLock();
         }
-        const savedPos = getTrackPosition(currentTrack.id)?.positionSeconds ?? 0;
+        const savedPos =
+          getTrackPosition(currentTrack.id)?.positionSeconds ??
+          getTrackPosition(`dl_${currentTrack.id}`)?.positionSeconds ??
+          0;
         const effectiveResume = curSec > 0.5 ? curSec : savedPos;
         if (
           !audio.getAttribute('src') ||
@@ -1843,11 +1973,15 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         ) {
           beginSynchronousNativeAudio(currentTrack, effectiveResume);
         } else {
-          audio.muted = isMutedRef.current;
-          audio.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
-          if (effectiveResume > 0.5 && Math.abs((audio.currentTime || 0) - effectiveResume) > 2) {
+          const needsSeek = effectiveResume > 0.5 && Math.abs((audio.currentTime || 0) - effectiveResume) > 1.8;
+          if (needsSeek) {
             pendingSeekSecRef.current = effectiveResume;
+            pendingSeekSetAtRef.current = Date.now();
+            pendingSeekMuteGuardRef.current = true;
+            audio.muted = true;
             applyPendingAudioSeek(audio);
+          } else {
+            releaseSeekMuteGuard(audio);
           }
           void audio.play().catch(() => {
             beginSynchronousNativeAudio(currentTrack, effectiveResume);
@@ -1894,12 +2028,28 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         pokeBackgroundKeepAlive();
         void acquirePlaybackWakeLock();
       }
+      const savedYtPos =
+        getTrackPosition(currentTrack.id)?.positionSeconds ??
+        getTrackPosition(`dl_${currentTrack.id}`)?.positionSeconds ??
+        0;
+      const effectiveYtResume = curSec > 0.5 ? curSec : savedYtPos;
+      if (effectiveYtResume > 0.5) {
+        try {
+          const curYt = p.getCurrentTime() || 0;
+          if (Math.abs(curYt - effectiveYtResume) > 2.2) {
+            pendingYtSeekSecRef.current = effectiveYtResume;
+            p.seekTo(effectiveYtResume, true);
+          }
+        } catch {
+          // ignore
+        }
+      }
       if (!isMutedRef.current) {
         p.unMute();
         p.setVolume(volumeRef.current);
       }
       p.playVideo();
-      saveOnlineSession(curSec, true);
+      saveOnlineSession(effectiveYtResume, true);
     }
   }, [
     applyPendingAudioSeek,
@@ -1908,6 +2058,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     getTrackPosition,
     isPlaying,
     persistCurrentTrackResume,
+    releaseSeekMuteGuard,
     saveOnlineSession,
     unlockAudioFromGesture,
   ]);
@@ -1993,6 +2144,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       currentTimeRef.current = seconds;
       setCurrentTime(seconds);
       persistCurrentTrackResume(seconds);
+      saveOnlineSession(seconds);
       if (activeEngineRef.current === 'audio' && audioElRef.current) {
         const a = audioElRef.current;
         if (isSilentWarmupRef.current || !Number.isFinite(a.duration) || a.duration <= 3) {
@@ -2006,7 +2158,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         ytPlayerRef.current?.seekTo(seconds, true);
       }
     },
-    [persistCurrentTrackResume]
+    [persistCurrentTrackResume, saveOnlineSession]
   );
 
   const seekBy = useCallback(
@@ -2371,40 +2523,43 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           if (isSilentWarmupRef.current) return;
           const a = audioElRef.current;
           if (a) {
-            a.muted = isMutedRef.current;
-            a.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
             a.playbackRate = 1;
             if (pendingSeekSecRef.current > 0.5) {
+              // Keep muted until the resume seek lands so 0:00 never blasts briefly
+              a.muted = true;
               applyPendingAudioSeek(a);
-            } else if (
-              a.currentTime === 0 &&
-              audioKickDoneForLoadRef.current !== loadedAudioTrackIdRef.current
-            ) {
-              const loadTrackId = loadedAudioTrackIdRef.current;
-              audioKickDoneForLoadRef.current = loadTrackId;
-              // Guard against rare Chromium frame-0 silent decoder stall without interrupting normal starts
-              window.setTimeout(() => {
-                const el = audioElRef.current;
-                if (
-                  !el ||
-                  activeEngineRef.current !== 'audio' ||
-                  loadedAudioTrackIdRef.current !== loadTrackId ||
-                  el.paused ||
-                  el.ended ||
-                  isSilentWarmupRef.current
-                ) {
-                  return;
-                }
-                el.muted = isMutedRef.current;
-                el.volume = isMutedRef.current ? 0 : volumeRef.current / 100;
-                if (Number.isFinite(el.duration) && el.duration > 3 && el.currentTime === 0) {
-                  try {
-                    el.currentTime = 0.05;
-                  } catch {
-                    // ignore
+            } else {
+              releaseSeekMuteGuard(a);
+              if (
+                a.currentTime === 0 &&
+                audioKickDoneForLoadRef.current !== loadedAudioTrackIdRef.current
+              ) {
+                const loadTrackId = loadedAudioTrackIdRef.current;
+                audioKickDoneForLoadRef.current = loadTrackId;
+                // Guard against rare Chromium frame-0 silent decoder stall without interrupting normal starts
+                window.setTimeout(() => {
+                  const el = audioElRef.current;
+                  if (
+                    !el ||
+                    activeEngineRef.current !== 'audio' ||
+                    loadedAudioTrackIdRef.current !== loadTrackId ||
+                    el.paused ||
+                    el.ended ||
+                    isSilentWarmupRef.current ||
+                    pendingSeekSecRef.current > 0.5
+                  ) {
+                    return;
                   }
-                }
-              }, 650);
+                  releaseSeekMuteGuard(el);
+                  if (Number.isFinite(el.duration) && el.duration > 3 && el.currentTime === 0) {
+                    try {
+                      el.currentTime = 0.05;
+                    } catch {
+                      // ignore
+                    }
+                  }
+                }, 650);
+              }
             }
           }
           pauseKeepAliveBridgeIfForeground();
@@ -2420,13 +2575,33 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             void acquirePlaybackWakeLock();
           }
         }}
+        onSeeked={(e) => {
+          if (activeEngineRef.current !== 'audio') return;
+          if (isSilentWarmupRef.current) return;
+          const a = e.currentTarget;
+          if (a.src.startsWith('data:')) return;
+          const pending = pendingSeekSecRef.current;
+          if (pending > 0.5) {
+            if (Math.abs((a.currentTime || 0) - pending) <= 2.5) {
+              pendingSeekSecRef.current = 0;
+              pendingSeekSetAtRef.current = 0;
+              currentTimeRef.current = a.currentTime;
+              setCurrentTime(a.currentTime);
+              releaseSeekMuteGuard(a);
+            } else {
+              applyPendingAudioSeek(a);
+            }
+          } else if (pendingSeekMuteGuardRef.current) {
+            releaseSeekMuteGuard(a);
+          }
+        }}
         onPause={() => {
           if (activeEngineRef.current !== 'audio') return;
           if (isSilentWarmupRef.current) return;
           const a = audioElRef.current;
           if (!a || a.src.startsWith('data:')) return;
           if (!a.ended) {
-            persistCurrentTrackResume(a.currentTime);
+            persistCurrentTrackResume(pendingSeekSecRef.current > 0.5 ? undefined : a.currentTime);
             // Whenever shouldPlayRef is true and userPausedRef is false, ANY pause event
             // (whether in background for 20 minutes OR when waking/unlocking the screen!)
             // is an involuntary OS interruption and must be auto-resumed immediately.
@@ -2460,6 +2635,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         onWaiting={() => {
           if (activeEngineRef.current !== 'audio') return;
           if (isSilentWarmupRef.current) return;
+          if (!shouldPlayRef.current || userPausedRef.current) return;
           const a = audioElRef.current;
           if (a?.src?.startsWith('data:')) return;
           setIsBuffering(true);
@@ -2572,7 +2748,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           if (isSilentWarmupRef.current) return;
           const a = audioElRef.current;
           if (!a || !a.getAttribute('src') || a.src.startsWith('data:')) return;
-          const resumeAt = a.currentTime || 0;
+          const resumeAt = Math.max(
+            a.currentTime || 0,
+            pendingSeekSecRef.current || 0,
+            currentTimeRef.current || 0
+          );
+          releaseSeekMuteGuard(a);
           const track = queueRef.current[currentIndexRef.current];
           stopNativeAudio();
           // Never auto-switch to YouTube (which autoplays) when the track is currently paused (e.g. restored session)

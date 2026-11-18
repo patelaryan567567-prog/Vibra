@@ -1267,11 +1267,13 @@ export async function proxyAudioStream(req: Request, res: Response, videoId: str
       : `${entry.result.matchedTitle || 'vibra-track'}`;
   const cleanFileBase = rawFileBase.replace(/[^\w\s.-]/g, '').trim().slice(0, 80) || 'vibra-track';
 
-  // Case A: SoundCloud fMP4 (progressive stream on initial byte-0 play; instant 206 Range once assembled!)
+  // Case A: SoundCloud fMP4 (progressive stream on initial byte-0 play; instant 206 Range once assembled or when resuming/seeking!)
   if (entry.upstreamKind === 'soundcloud-hls-fmp4') {
     const rangeHeader = req.headers.range;
+    const wantsSeekable = req.query.seek === '1' || req.query.resume === '1';
     const isInitialZeroStream =
       !wantsDownload &&
+      !wantsSeekable &&
       !entry.assembledBuffer &&
       (!rangeHeader || rangeHeader === 'bytes=0-');
 
