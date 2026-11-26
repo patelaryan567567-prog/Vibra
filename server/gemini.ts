@@ -41,23 +41,38 @@ function setCached<T>(map: Map<string, CacheEntry<T>>, key: string, data: T, max
 }
 
 const GEMINI_RATE_LIMIT_COOLDOWN_MS = 45 * 1000;
+const GEMINI_OVERLOAD_COOLDOWN_MS = 12 * 1000;
 const GEMINI_INVALID_KEY_COOLDOWN_MS = 60 * 60 * 1000;
+const DEFAULT_GEMINI_ATTEMPT_TIMEOUT_MS = 11_000;
+
+interface GeminiSlotDiag {
+  lastStatus: number | null;
+  reason?: string;
+  detail?: string;
+}
+
 const exhaustedGeminiKeyUntil = new Map<string, number>();
+const geminiSlotDiagnostics = new Map<number, GeminiSlotDiag>();
 let activeGeminiKeyIndex = 0;
+let roundRobinGeminiCursor = 0;
 
 function isGeminiPlaceholder(raw: string): boolean {
-  return !raw || /^MY_GEMINI_API_KEY(_\d+)?$/i.test(raw);
+  return !raw || /^MY_GEMINI_API_KEY(?:_?\d+)?$/i.test(raw);
 }
 
 export function getGeminiApiKeys(): string[] {
   const numberedEnvKeys = Object.keys(process.env)
-    .filter((name) => /^GEMINI_API_KEY(_\d+)?$/i.test(name))
-    .sort((a, b) => {
-      const numA = parseInt(a.match(/_KEY_(\d+)$/i)?.[1] ?? '1', 10);
-      const numB = parseInt(b.match(/_KEY_(\d+)$/i)?.[1] ?? '1', 10);
-      return numA - numB;
+    .map((name) => {
+      const m = name.match(/^GEMINI_(?:API_)?KEY(?:_?(\d+))?$/i);
+      if (!m) return null;
+      return {
+        name,
+        order: m[1] ? parseInt(m[1], 10) : 0,
+      };
     })
-    .map((name) => process.env[name]);
+    .filter((entry): entry is { name: string; order: number } => Boolean(entry))
+    .sort((a, b) => a.order - b.order || a.name.localeCompare(b.name))
+    .map((entry) => process.env[entry.name]);
 
   const candidates = [...numberedEnvKeys, process.env.GEMINI_API_KEYS];
   const unique = new Set<string>();
@@ -77,28 +92,57 @@ export function hasConfiguredGeminiKeys(): boolean {
   return getGeminiApiKeys().length > 0;
 }
 
+export function hasAvailableGeminiKey(): boolean {
+  const keys = getGeminiApiKeys();
+  if (keys.length === 0) return false;
+  const now = Date.now();
+  return keys.some((k) => (exhaustedGeminiKeyUntil.get(k) ?? 0) <= now);
+}
+
 export function getGeminiKeyStatus(): {
   totalKeys: number;
   activeKeySlot: number;
   exhaustedKeysCount: number;
+  slotDiagnostics: Array<{
+    slot: number;
+    lastStatus: number | null;
+    reason?: string;
+    detail?: string;
+    cooldownRemainingSec: number;
+  }>;
 } {
   const keys = getGeminiApiKeys();
   const now = Date.now();
   let exhaustedKeysCount = 0;
-  for (const key of keys) {
-    if ((exhaustedGeminiKeyUntil.get(key) ?? 0) > now) exhaustedKeysCount++;
-  }
+  const slotDiagnostics = keys.map((key, idx) => {
+    const until = exhaustedGeminiKeyUntil.get(key) ?? 0;
+    const remainingSec = until > now ? Math.ceil((until - now) / 1000) : 0;
+    if (remainingSec > 0) exhaustedKeysCount++;
+    const diag = geminiSlotDiagnostics.get(idx + 1);
+    return {
+      slot: idx + 1,
+      lastStatus: diag?.lastStatus ?? null,
+      reason: diag?.reason,
+      detail: diag?.detail,
+      cooldownRemainingSec: remainingSec,
+    };
+  });
   return {
     totalKeys: keys.length,
     activeKeySlot: keys.length > 0 ? (activeGeminiKeyIndex % keys.length) + 1 : 0,
     exhaustedKeysCount,
+    slotDiagnostics,
   };
 }
 
-function createAiClient(apiKey: string): GoogleGenAI {
+function createAiClient(apiKey: string, timeoutMs = DEFAULT_GEMINI_ATTEMPT_TIMEOUT_MS): GoogleGenAI {
+  // Gemini API enforces a minimum server-side deadline of 10s (returns 400 INVALID_ARGUMENT if <10s).
+  // Keep httpOptions.timeout >= 12s while local runWithTimeout handles tighter request deadlines.
+  const serverDeadlineMs = Math.max(12_000, timeoutMs);
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
+      timeout: serverDeadlineMs,
       headers: {
         'User-Agent': 'aistudio-build',
       },
@@ -107,42 +151,63 @@ function createAiClient(apiKey: string): GoogleGenAI {
 }
 
 function extractStatus(err: unknown): number {
-  if (typeof err === 'object' && err !== null && 'status' in err) {
-    const status = Number((err as { status?: unknown }).status);
-    if (!Number.isNaN(status) && status >= 400) return status;
+  if (typeof err === 'object' && err !== null) {
+    const obj = err as { status?: unknown; code?: unknown; name?: unknown; error?: { code?: unknown } };
+    if (obj.name === 'AbortError' || obj.code === 'GEMINI_TIMEOUT') return 504;
+    const direct = Number(obj.status ?? obj.error?.code ?? obj.code);
+    if (!Number.isNaN(direct) && direct >= 400) return direct;
   }
-  const msg = err instanceof Error ? err.message : '';
-  if (/\b429\b|RESOURCE_EXHAUSTED|quota/i.test(msg)) return 429;
-  if (/\b503\b|UNAVAILABLE/i.test(msg)) return 503;
-  if (/\b401\b|\b403\b|API_KEY_INVALID/i.test(msg)) return 403;
+  const msg = `${err instanceof Error ? err.message : ''} ${typeof err === 'string' ? err : ''}`;
+  if (/timed?\s*out|abort/i.test(msg)) return 504;
+  if (/\b429\b|RESOURCE_EXHAUSTED|quota|rate[_\s-]*limit|too\s+many\s+requests/i.test(msg)) return 429;
+  if (/\b503\b|UNAVAILABLE|overloaded|high\s+demand/i.test(msg)) return 503;
+  if (/\b502\b|BAD_GATEWAY/i.test(msg)) return 502;
+  if (/\b504\b|DEADLINE_EXCEEDED/i.test(msg)) return 504;
+  if (/\b401\b|\b403\b|API_KEY_INVALID|API key not valid|API key expired|PERMISSION_DENIED|UNAUTHENTICATED/i.test(msg)) return 403;
   return 500;
 }
 
-function isRetryableTransientStatus(status: number): boolean {
-  return status === 500 || status === 502 || status === 503 || status === 504;
+function extractShortReason(err: unknown, status: number): string {
+  const msg = `${err instanceof Error ? err.message : ''} ${typeof err === 'string' ? err : ''}`;
+  if (status === 504) return 'TIMEOUT';
+  if (/RESOURCE_EXHAUSTED|quota/i.test(msg)) return 'QUOTA_EXHAUSTED';
+  if (status === 429) return 'RATE_LIMIT';
+  if (/PERMISSION_DENIED|UNAUTHENTICATED/i.test(msg) || status === 403 || status === 401) {
+    if (/API_KEY_INVALID|API key not valid/i.test(msg)) return 'INVALID_KEY';
+    if (/API key expired/i.test(msg)) return 'EXPIRED_KEY';
+    return 'PERMISSION_DENIED';
+  }
+  if (/UNAVAILABLE|high\s+demand|overloaded/i.test(msg)) return 'MODEL_OVERLOADED';
+  return `HTTP_${status}`;
 }
 
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
-  let lastErr: unknown;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      const status = extractStatus(err);
-      if (!isRetryableTransientStatus(status) || attempt === maxRetries) {
-        throw err;
+function redactKeyDetail(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err ?? '');
+  return raw.replace(/AIza[A-Za-z0-9_-]{10,}/g, '[REDACTED]').slice(0, 220);
+}
+
+function runWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  if (!timeoutMs || timeoutMs <= 0) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new GeminiApiError(`Gemini request timed out after ${timeoutMs}ms`, 504, 'GEMINI_TIMEOUT'));
+    }, timeoutMs);
+    promise.then(
+      (val) => {
+        clearTimeout(timer);
+        resolve(val);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
       }
-      const delay = 500 * Math.pow(2, attempt) + Math.floor(Math.random() * 250);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-    }
-  }
-  throw lastErr;
+    );
+  });
 }
 
 async function executeGeminiWithFailover<T>(
   fn: (ai: GoogleGenAI) => Promise<T>,
-  transientRetries = 1
+  attemptTimeoutMs = DEFAULT_GEMINI_ATTEMPT_TIMEOUT_MS
 ): Promise<T> {
   const keys = getGeminiApiKeys();
   if (keys.length === 0) {
@@ -154,41 +219,73 @@ async function executeGeminiWithFailover<T>(
   }
 
   const now = Date.now();
-  const startIdx = activeGeminiKeyIndex % keys.length;
-  const candidateIndices: number[] = [];
+  // Round-robin across available keys so concurrent requests share rate-limit headroom evenly
+  const startIdx = roundRobinGeminiCursor % keys.length;
+  roundRobinGeminiCursor = (roundRobinGeminiCursor + 1) % keys.length;
+
+  const readyIndices: number[] = [];
+  const transientCooldownIndices: number[] = [];
+  const invalidCooldownIndices: number[] = [];
 
   for (let offset = 0; offset < keys.length; offset++) {
     const idx = (startIdx + offset) % keys.length;
-    if ((exhaustedGeminiKeyUntil.get(keys[idx]) ?? 0) <= now) {
-      candidateIndices.push(idx);
+    const until = exhaustedGeminiKeyUntil.get(keys[idx]) ?? 0;
+    if (until <= now) {
+      readyIndices.push(idx);
+    } else {
+      const diag = geminiSlotDiagnostics.get(idx + 1);
+      if (diag?.lastStatus === 403 || diag?.lastStatus === 401) {
+        invalidCooldownIndices.push(idx);
+      } else {
+        transientCooldownIndices.push(idx);
+      }
     }
   }
 
-  if (candidateIndices.length === 0) {
-    // If all keys are only in short rate-limit cooldown, try the oldest/first key rather than hard-failing forever
-    candidateIndices.push(startIdx);
+  let candidateIndices: number[];
+  if (readyIndices.length > 0) {
+    // Try all ready keys first, plus any transient-cooldown keys sorted by soonest expiry
+    const soonestTransient = transientCooldownIndices.sort(
+      (a, b) => (exhaustedGeminiKeyUntil.get(keys[a]) ?? 0) - (exhaustedGeminiKeyUntil.get(keys[b]) ?? 0)
+    );
+    candidateIndices = [...readyIndices, ...soonestTransient];
+  } else if (transientCooldownIndices.length > 0) {
+    candidateIndices = transientCooldownIndices.sort(
+      (a, b) => (exhaustedGeminiKeyUntil.get(keys[a]) ?? 0) - (exhaustedGeminiKeyUntil.get(keys[b]) ?? 0)
+    );
+  } else {
+    candidateIndices = invalidCooldownIndices.sort(
+      (a, b) => (exhaustedGeminiKeyUntil.get(keys[a]) ?? 0) - (exhaustedGeminiKeyUntil.get(keys[b]) ?? 0)
+    );
   }
 
   let lastErr: unknown;
+  let lastTransientStatus: number | null = null;
+  let lastStatus = 500;
+
   for (let pos = 0; pos < candidateIndices.length; pos++) {
     const keyIdx = candidateIndices[pos];
     const key = keys[keyIdx];
-    const ai = createAiClient(key);
+    const ai = createAiClient(key, attemptTimeoutMs);
 
     try {
-      const res = await withRetry(() => fn(ai), transientRetries);
+      const res = await runWithTimeout(fn(ai), attemptTimeoutMs);
       activeGeminiKeyIndex = keyIdx;
+      exhaustedGeminiKeyUntil.delete(key);
+      geminiSlotDiagnostics.set(keyIdx + 1, { lastStatus: 200, reason: 'OK' });
       return res;
     } catch (err) {
       lastErr = err;
       let status = extractStatus(err);
 
-      // If this is a temporary 429 on the final/only key, wait 1.2s and retry once before failing
-      if (status === 429 && pos === candidateIndices.length - 1) {
-        await new Promise((resolve) => setTimeout(resolve, 1200));
+      // Single quick retry only if there is 1 key and it hit a transient 429/503
+      if ((status === 429 || status === 503) && candidateIndices.length === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 900));
         try {
-          const retryRes = await fn(ai);
+          const retryRes = await runWithTimeout(fn(ai), attemptTimeoutMs);
           activeGeminiKeyIndex = keyIdx;
+          exhaustedGeminiKeyUntil.delete(key);
+          geminiSlotDiagnostics.set(keyIdx + 1, { lastStatus: 200, reason: 'OK' });
           return retryRes;
         } catch (retryErr) {
           lastErr = retryErr;
@@ -196,38 +293,58 @@ async function executeGeminiWithFailover<T>(
         }
       }
 
-      const isKeyOrQuotaError = status === 429 || status === 403 || status === 401;
-
-      if (isKeyOrQuotaError) {
-        const cooldownMs =
-          status === 429 ? GEMINI_RATE_LIMIT_COOLDOWN_MS : GEMINI_INVALID_KEY_COOLDOWN_MS;
-        exhaustedGeminiKeyUntil.set(key, Date.now() + cooldownMs);
-        activeGeminiKeyIndex = (keyIdx + 1) % keys.length;
-
-        if (pos < candidateIndices.length - 1) {
-          console.warn(
-            `[Gemini] API key #${keyIdx + 1} hit HTTP ${status}; switching to key #${candidateIndices[pos + 1] + 1}.`
-          );
-          continue;
-        }
+      lastStatus = status;
+      if (status === 429 || status === 503 || status === 504 || status === 502) {
+        lastTransientStatus = status;
       }
 
-      if (err instanceof GeminiApiError) throw err;
-      const friendly =
-        status === 429
-          ? 'Gemini AI is currently busy (rate limit). Please try again in a few seconds.'
-          : status === 403
-            ? 'The configured GEMINI_API_KEY is invalid or lacks permission.'
-            : err instanceof Error
-              ? err.message
-              : 'Gemini AI request failed.';
-      throw new GeminiApiError(friendly, status);
+      const reason = extractShortReason(lastErr, status);
+      geminiSlotDiagnostics.set(keyIdx + 1, {
+        lastStatus: status,
+        reason,
+        detail: redactKeyDetail(lastErr),
+      });
+
+      // HTTP 400 is a client/schema error, not an API key failure—do not exhaust keys or retry across all keys
+      if (status === 400) {
+        break;
+      }
+
+      if (status === 429) {
+        exhaustedGeminiKeyUntil.set(key, Date.now() + GEMINI_RATE_LIMIT_COOLDOWN_MS);
+      } else if (status === 503 || status === 504 || status === 502) {
+        exhaustedGeminiKeyUntil.set(key, Date.now() + GEMINI_OVERLOAD_COOLDOWN_MS);
+      } else if (status === 403 || status === 401) {
+        exhaustedGeminiKeyUntil.set(key, Date.now() + GEMINI_INVALID_KEY_COOLDOWN_MS);
+      }
+
+      activeGeminiKeyIndex = (keyIdx + 1) % keys.length;
+
+      if (pos < candidateIndices.length - 1) {
+        console.warn(
+          `[Gemini] API key #${keyIdx + 1} failed (${reason}); rotating to key #${candidateIndices[pos + 1] + 1}.`
+        );
+        continue;
+      }
     }
   }
 
-  throw lastErr instanceof GeminiApiError
-    ? lastErr
-    : new GeminiApiError('Gemini AI request failed.', 500);
+  // Prefer reporting transient rate-limit/overload if any key failed transiently instead of masking with a bad fallback key
+  const effectiveStatus = lastTransientStatus ?? lastStatus;
+  if (lastErr instanceof GeminiApiError && lastErr.status === effectiveStatus) {
+    throw lastErr;
+  }
+  const friendly =
+    effectiveStatus === 429
+      ? 'Gemini AI is currently busy (rate limit). Please try again in a few seconds.'
+      : effectiveStatus === 503 || effectiveStatus === 504
+        ? 'Gemini AI is temporarily overloaded. Please try again in a few seconds.'
+        : effectiveStatus === 403 || effectiveStatus === 401
+          ? 'The configured GEMINI_API_KEY is invalid or lacks permission.'
+          : lastErr instanceof Error
+            ? lastErr.message
+            : 'Gemini AI request failed.';
+  throw new GeminiApiError(friendly, effectiveStatus);
 }
 
 function safeJsonParse<T>(raw: string | undefined): T {
@@ -427,7 +544,7 @@ export async function generateTrendingViralSongs(
               tools: [{ googleSearch: {} }],
             },
           }),
-        1
+        11_000
       );
       songs = parseSongListResponse(groundedResponse.text);
     } catch (err) {
@@ -594,17 +711,26 @@ const aiLyricsInFlight = new Map<string, Promise<AiLyricsResult>>();
 export async function findAndFormatLyricsWithAi(params: {
   title: string;
   artist?: string;
+  rawContext?: string;
+  timeoutMs?: number;
 }): Promise<AiLyricsResult> {
   const title = params.title.trim().slice(0, 180);
   const artist = (params.artist || '').trim().slice(0, 120);
+  const rawContext = (params.rawContext || '').trim().slice(0, 240);
+  const timeoutMs = params.timeoutMs ?? 9_000;
   if (!title) return { found: false, plainLyrics: null, source: 'Gemini AI' };
 
-  const cacheKey = `find:${title.toLowerCase()}::${artist.toLowerCase()}`;
+  const cacheKey = `find:v2:${title.toLowerCase()}::${artist.toLowerCase()}::${rawContext.toLowerCase()}`;
   const hit = getCached(aiLyricsCache, cacheKey);
   if (hit) return hit;
 
   const existing = aiLyricsInFlight.get(cacheKey);
   if (existing) return existing;
+
+  const contextHint =
+    rawContext && rawContext.toLowerCase() !== title.toLowerCase()
+      ? `\nYouTube/track reference metadata for disambiguation: "${rawContext}". Use this to identify the exact movie/album/singer and avoid picking a different song from the same movie or another artist's song with a similar title.`
+      : '';
 
   const job = (async (): Promise<AiLyricsResult> => {
     // Step 1: Use Google Search grounding to fetch exact lyrics from lyrics websites and format cleanly
@@ -615,19 +741,20 @@ export async function findAndFormatLyricsWithAi(params: {
           ai.models.generateContent({
             model: 'gemini-4-hydrogen',
             contents:
-              `Search live lyrics websites (like Genius, Musixmatch, LyricsMint, AZLyrics, JioSaavn) and retrieve the COMPLETE, authentic lyrics for the song "${title}"${artist ? ` by ${artist}` : ''}.\n` +
-              `Formatting requirements:\n` +
+              `Search live lyrics websites (like Genius, Musixmatch, LyricsMint, AZLyrics, JioSaavn) and retrieve the COMPLETE, authentic lyrics for the exact song "${title}"${artist ? ` by ${artist}` : ''}.${contextHint}\n` +
+              `Accuracy & formatting requirements:\n` +
+              `- CRITICAL: Verify the retrieved lyrics belong strictly to "${title}"${artist ? ` (${artist})` : ''} and NOT a different song from the same film or another track with a similar name.\n` +
               `- Add clear section headers: [Intro], [Verse 1], [Pre-Chorus], [Chorus], [Verse 2], [Bridge], [Outro].\n` +
               `- Separate every stanza with a blank line.\n` +
               `- Keep lines crisp and singable (roughly 5-10 words per line).\n` +
               `- For Hindi, Punjabi, or Urdu songs, ALWAYS write in clean, natural Romanized Hinglish (Latin alphabet) so anyone can sing along effortlessly—never output raw Devanagari, Gurmukhi, or Perso-Arabic script.\n` +
               `- Output ONLY the lyrics with section headers. Do NOT include explanations, commentary, disclaimers, source links, citation numbers, or intro text.\n` +
-              `- If this is purely instrumental or real lyrics cannot be verified, reply ONLY with "LYRICS_NOT_FOUND".`,
+              `- If this is purely instrumental or exact lyrics for this specific song cannot be verified, reply ONLY with "LYRICS_NOT_FOUND".`,
             config: {
               tools: [{ googleSearch: {} }],
             },
           }),
-        1
+        timeoutMs
       );
       searchText = (searchResp.text ?? '').trim();
     } catch {
@@ -659,48 +786,9 @@ export async function findAndFormatLyricsWithAi(params: {
       return res;
     }
 
-    // Step 2: Structured fallback (strictly no hallucination if uncertain)
-    try {
-      const fallbackResp = await executeGeminiWithFailover((ai) =>
-        ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents:
-            `Provide the real, well-known lyrics for "${title}"${artist ? ` by ${artist}` : ''}.\n` +
-            `Rules:\n` +
-            `- Organize cleanly with [Verse 1], [Chorus], [Bridge], [Outro] headers and blank lines between stanzas.\n` +
-            `- Use clean Hinglish (Roman script) for Hindi/Punjabi/Urdu songs so anyone can read and sing along effortlessly.\n` +
-            `- ONLY return found=true if you are confident in the real lyrics of this specific song. Never invent fake lyrics.`,
-          config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                found: { type: Type.BOOLEAN },
-                formattedLyrics: { type: Type.STRING },
-              },
-              required: ['found', 'formattedLyrics'],
-            },
-          },
-        })
-      );
-      const parsed = safeJsonParse<{ found?: boolean; formattedLyrics?: string }>(fallbackResp.text);
-      const text = (parsed.formattedLyrics || '').trim();
-      if (parsed.found && text.length >= 50) {
-        const res: AiLyricsResult = {
-          found: true,
-          plainLyrics: text,
-          source: 'Gemini AI',
-        };
-        aiLyricsCache.set(cacheKey, { data: res, expiresAt: Date.now() + 12 * 60 * 60 * 1000 });
-        return res;
-      }
-    } catch {
-      // fall through
-    }
-
+    // Never fabricate or guess lyrics from ungrounded model memory (prevents wrong-song hallucinations)
     const empty: AiLyricsResult = { found: false, plainLyrics: null, source: 'Gemini AI' };
-    aiLyricsCache.set(cacheKey, { data: empty, expiresAt: Date.now() + 30 * 60 * 1000 });
+    aiLyricsCache.set(cacheKey, { data: empty, expiresAt: Date.now() + 10 * 60 * 1000 });
     return empty;
   })().finally(() => {
     aiLyricsInFlight.delete(cacheKey);
@@ -716,18 +804,24 @@ export async function enhanceLyricsWithAi(params: {
   rawLyrics?: string | null;
   syncedTexts?: string[];
   mode: 'polish' | 'hinglish' | 'find';
+  timeoutMs?: number;
 }): Promise<AiLyricsResult> {
   if (params.mode === 'find') {
-    return findAndFormatLyricsWithAi({ title: params.title, artist: params.artist });
+    return findAndFormatLyricsWithAi({
+      title: params.title,
+      artist: params.artist,
+      timeoutMs: params.timeoutMs,
+    });
   }
 
   const title = params.title.trim().slice(0, 180);
   const artist = (params.artist || '').trim().slice(0, 120);
   const syncedTexts = Array.isArray(params.syncedTexts) ? params.syncedTexts.slice(0, 160) : [];
   const rawLyrics = (params.rawLyrics || '').trim().slice(0, 9000);
+  const timeoutMs = params.timeoutMs ?? 8_000;
 
   if (syncedTexts.length === 0 && !rawLyrics) {
-    return findAndFormatLyricsWithAi({ title, artist });
+    return findAndFormatLyricsWithAi({ title, artist, timeoutMs });
   }
 
   const fingerprint =
@@ -749,30 +843,32 @@ export async function enhanceLyricsWithAi(params: {
           ? 'Transliterate / rewrite each line cleanly into natural, easy-to-read Romanized Hinglish (phonetic Latin script for Hindi/Punjabi/Urdu lines, keep English lines crisp and natural). Fix messy punctuation or typos.'
           : 'Clean and polish each lyric line for maximum readability: fix awkward capitalization, remove leftover metadata junk, fix broken spacing or punctuation, and keep the words musical and authentic.';
 
-      const resp = await executeGeminiWithFailover((ai) =>
-        ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents:
-            `Song: "${title}"${artist ? ` by ${artist}` : ''}\n` +
-            `${directive}\n` +
-            `CRITICAL RULE: Return an array of EXACTLY ${syncedTexts.length} strings matching each input line 1-to-1 in order so timestamps stay perfectly aligned.\n` +
-            `Input lines JSON:\n${JSON.stringify(syncedTexts)}`,
-          config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                lines: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: `Exact ${syncedTexts.length} formatted lines matching input order.`,
+      const resp = await executeGeminiWithFailover(
+        (ai) =>
+          ai.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents:
+              `Song: "${title}"${artist ? ` by ${artist}` : ''}\n` +
+              `${directive}\n` +
+              `CRITICAL RULE: Return an array of EXACTLY ${syncedTexts.length} strings matching each input line 1-to-1 in order so timestamps stay perfectly aligned.\n` +
+              `Input lines JSON:\n${JSON.stringify(syncedTexts)}`,
+            config: {
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  lines: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: `Exact ${syncedTexts.length} formatted lines matching input order.`,
+                  },
                 },
+                required: ['lines'],
               },
-              required: ['lines'],
             },
-          },
-        })
+          }),
+        timeoutMs
       );
 
       const parsed = safeJsonParse<{ lines?: string[] }>(resp.text);
@@ -796,25 +892,27 @@ export async function enhanceLyricsWithAi(params: {
         ? 'Convert/rewrite these lyrics into clean, poetic, easy-to-sing Romanized Hinglish (keep any English lines intact), add section headers like [Verse 1], [Chorus], [Bridge], [Outro], and separate stanzas with a blank line.'
         : 'Format these lyrics so they look super clean and pleasurable to read: add section headers like [Intro], [Verse 1], [Chorus], [Bridge], [Outro], fix capitalization, punctuation, and broken line wraps, and separate stanzas with blank lines. Keep the authentic lyrics intact.';
 
-    const resp = await executeGeminiWithFailover((ai) =>
-      ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: `Song: "${title}"${artist ? ` by ${artist}` : ''}\n${directive}\n\nLyrics:\n${textInput}`,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              formattedLyrics: {
-                type: Type.STRING,
-                description: 'Cleanly formatted lyrics with [Section] headers and stanza spacing.',
+    const resp = await executeGeminiWithFailover(
+      (ai) =>
+        ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: `Song: "${title}"${artist ? ` by ${artist}` : ''}\n${directive}\n\nLyrics:\n${textInput}`,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                formattedLyrics: {
+                  type: Type.STRING,
+                  description: 'Cleanly formatted lyrics with [Section] headers and stanza spacing.',
+                },
               },
+              required: ['formattedLyrics'],
             },
-            required: ['formattedLyrics'],
           },
-        },
-      })
+        }),
+      timeoutMs
     );
 
     const parsed = safeJsonParse<{ formattedLyrics?: string }>(resp.text);

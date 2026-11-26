@@ -6,6 +6,7 @@ import {
   Home,
   Library,
   ListMusic,
+  Mic2,
   Search,
   Sparkles,
   WifiOff,
@@ -17,6 +18,7 @@ import { OfflinePersistentPlayer } from './components/OfflinePersistentPlayer';
 import { PersistentPlayer } from './components/PersistentPlayer';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { VibraLogo } from './components/VibraLogo';
+import { isJioKeypadDevice, JioKeypadShell } from './components/JioKeypadShell';
 import { ConfirmProvider } from './context/ConfirmContext';
 import { LibraryProvider, useLibrary } from './context/LibraryContext';
 import {
@@ -557,6 +559,22 @@ function VibraShell() {
               </button>
             );
           })}
+
+          <button
+            type="button"
+            onClick={() => openArtistPage(selectedArtist?.name || 'Arijit Singh')}
+            title="Popular Singers & Categorized Catalogs"
+            className={`w-full py-2.5 lg:py-0 lg:h-11 px-1.5 lg:px-3.5 rounded-xl flex flex-col lg:flex-row items-center justify-center lg:justify-between gap-1 lg:gap-0 text-xs lg:text-sm font-medium transition-colors whitespace-nowrap ${
+              activeTab === 'artist'
+                ? 'bg-[#4F6BFF]/15 text-white border border-[#4F6BFF]/30'
+                : 'text-slate-400 hover:text-white hover:bg-white/[0.04] border border-transparent'
+            }`}
+          >
+            <span className="flex flex-col lg:flex-row items-center gap-1 lg:gap-3">
+              <Mic2 className={`w-4 h-4 ${activeTab === 'artist' ? 'text-[#7A90FF]' : ''}`} />
+              <span className="text-[10px] lg:text-sm">Singers</span>
+            </span>
+          </button>
         </nav>
 
         {/* Desktop Sidebar Playlists (lg: 1024px+) */}
@@ -648,6 +666,19 @@ function VibraShell() {
 
             <button
               type="button"
+              onClick={() => openArtistPage(selectedArtist?.name || 'Arijit Singh')}
+              className={`h-9 sm:h-10 px-3 sm:px-3.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
+                activeTab === 'artist'
+                  ? 'bg-[#4F6BFF]/20 border-[#4F6BFF]/50 text-white'
+                  : 'bg-[#11131A] hover:bg-[#181B26] border-white/10 text-slate-200 hover:text-white'
+              }`}
+            >
+              <Mic2 className="w-3.5 h-3.5 text-[#7A90FF]" />
+              <span>Singers</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => setActiveTab('explore')}
               className="h-9 sm:h-10 px-3 sm:px-4 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-xs font-semibold inline-flex items-center gap-1.5 sm:gap-2 whitespace-nowrap shrink-0 transition-colors"
             >
@@ -722,10 +753,10 @@ function VibraShell() {
                 onNavigate={setActiveTab}
               />
             )}
-            {activeTab === 'artist' && selectedArtist && (
+            {activeTab === 'artist' && (
               <ArtistPage
-                artistName={selectedArtist.name}
-                seedTrack={selectedArtist.seedTrack}
+                artistName={selectedArtist?.name || 'Arijit Singh'}
+                seedTrack={selectedArtist?.seedTrack}
                 onAddToPlaylist={(t) => setPlaylistModalTrack(t)}
                 onBack={closeArtistPage}
               />
@@ -800,6 +831,25 @@ function VibraShell() {
 }
 
 export default function App() {
+  const [jioMode, setJioMode] = useState<boolean>(() => isJioKeypadDevice());
+
+  useEffect(() => {
+    const handleResize = () => {
+      const detected = isJioKeypadDevice();
+      setJioMode((prev) => (detected !== prev ? detected : prev));
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  if (jioMode) {
+    return (
+      <ErrorBoundary>
+        <JioKeypadShell onExitJioMode={() => setJioMode(false)} />
+      </ErrorBoundary>
+    );
+  }
+
   return (
     <ErrorBoundary>
       <ConfirmProvider>

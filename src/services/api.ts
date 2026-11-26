@@ -29,6 +29,31 @@ interface ClientCacheEntry<T> {
 const memCache = new Map<string, ClientCacheEntry<unknown>>();
 const CLIENT_CACHE_PREFIX = 'vibra_api_cache:';
 
+// Purge legacy cached lyrics from sessionStorage so stale/wrong lyrics never resurface
+try {
+  if (typeof sessionStorage !== 'undefined') {
+    for (let i = sessionStorage.length - 1; i >= 0; i--) {
+      const k = sessionStorage.key(i);
+      if (
+        k &&
+        k.startsWith(CLIENT_CACHE_PREFIX) &&
+        (k.includes(':lyrics:') ||
+          k.includes(':lyrics_v2:') ||
+          k.includes(':lyrics_v3:') ||
+          k.includes(':lyrics_v4:') ||
+          k.includes(':lyrics_enh:') ||
+          k.includes(':lyrics_enh_v2:') ||
+          k.includes(':lyrics_enh_v3:') ||
+          k.includes(':lyrics_enh_v4:'))
+      ) {
+        sessionStorage.removeItem(k);
+      }
+    }
+  }
+} catch {
+  // ignore storage access issues
+}
+
 function getClientCache<T>(key: string): T | undefined {
   const now = Date.now();
   const mem = memCache.get(key) as ClientCacheEntry<T> | undefined;
@@ -165,11 +190,14 @@ export async function fetchRelatedTracks(
   excludeIds: string[] = [],
   signal?: AbortSignal
 ): Promise<Track[]> {
-  const cacheKey = `related:${track.id}`;
+  const excludeSet = new Set(excludeIds);
+  const cacheKey = `related_v2:${track.id}`;
   const hit = getClientCache<Track[]>(cacheKey);
   if (hit && hit.length > 0) {
-    const excludeSet = new Set(excludeIds);
-    return hit.filter((t) => !excludeSet.has(t.id));
+    const filtered = hit.filter((t) => !excludeSet.has(t.id));
+    if (filtered.length >= 10) {
+      return filtered;
+    }
   }
 
   const sp = new URLSearchParams({
@@ -178,14 +206,14 @@ export async function fetchRelatedTracks(
     artist: track.artist,
   });
   if (excludeIds.length > 0) {
-    sp.set('excludeIds', excludeIds.slice(0, 40).join(','));
+    sp.set('excludeIds', excludeIds.slice(-100).join(','));
   }
   const res = await fetch(`/api/youtube/related?${sp.toString()}`, { signal });
   const data = await handleResponse<{ tracks: Track[] }>(res);
   if (data.tracks.length > 0) {
-    setClientCache(cacheKey, data.tracks, 60 * 60 * 1000);
+    setClientCache(cacheKey, data.tracks, 30 * 60 * 1000);
   }
-  return data.tracks;
+  return data.tracks.filter((t) => !excludeSet.has(t.id));
 }
 
 export async function discoverWithAi(prompt: string, signal?: AbortSignal): Promise<AiDiscoveryResponse> {
@@ -336,7 +364,7 @@ export async function fetchTrackLyrics(params: {
   const forceAi = Boolean(params.forceAi);
   if (!title) return { found: false, syncedLines: [], plainLyrics: null };
 
-  const cacheKey = `lyrics:${forceAi ? 'ai' : 'std'}:${title.toLowerCase()}:${artist.toLowerCase()}:${dur}`;
+  const cacheKey = `lyrics_v5:${forceAi ? 'ai' : 'std'}:${title.toLowerCase()}:${artist.toLowerCase()}:${dur}`;
   const hit = getClientCache<LyricsResponse>(cacheKey);
   if (hit && hit.found) return hit;
 
@@ -365,7 +393,7 @@ export async function enhanceTrackLyrics(params: {
   const artist = (params.artist || '').trim();
   if (!title) return { found: false, syncedLines: [], plainLyrics: null };
 
-  const cacheKey = `lyrics_enh:${params.mode}:${title.toLowerCase()}:${artist.toLowerCase()}:${params.syncedLines?.length || 0}:${params.rawLyrics?.length || 0}`;
+  const cacheKey = `lyrics_enh_v5:${params.mode}:${title.toLowerCase()}:${artist.toLowerCase()}:${params.syncedLines?.length || 0}:${params.rawLyrics?.length || 0}`;
   const hit = getClientCache<LyricsResponse>(cacheKey);
   if (hit && hit.found) return hit;
 
@@ -397,9 +425,9 @@ export async function fetchArtistProfile(params: {
   if (!artist) {
     return { artistName: 'Unknown Artist', topTracks: [], musicVideos: [], relatedArtists: [] };
   }
-  const cacheKey = `artist:${artist.toLowerCase()}:${params.seedVideoId || ''}`;
+  const cacheKey = `artist_v3:${artist.toLowerCase()}:${params.seedVideoId || ''}`;
   const hit = getClientCache<ArtistProfileResponse>(cacheKey);
-  if (hit && hit.topTracks.length > 0) return hit;
+  if (hit && hit.topTracks.length >= 25) return hit;
 
   const sp = new URLSearchParams({ artist });
   if (params.seedVideoId && !params.seedVideoId.startsWith('dl_') && !params.seedVideoId.startsWith('local_') && !params.seedVideoId.startsWith('src_')) {
@@ -412,4 +440,33 @@ export async function fetchArtistProfile(params: {
   }
   return data;
 }
+
+export async function fetchArtistCategorySongs(params: {
+  artist: string;
+  category: string;
+  page?: number;
+  signal?: AbortSignal;
+}): Promise<{ tracks: Track[]; hasMore: boolean }> {
+  const artist = params.artist.trim();
+  if (!artist) return { tracks: [], hasMore: false };
+  const category = (params.category || 'all').toLowerCase();
+  const page = Math.max(1, params.page ?? 1);
+
+  const cacheKey = `artist_songs_v1:${artist.toLowerCase()}:${category}:${page}`;
+  const hit = getClientCache<{ tracks: Track[]; hasMore: boolean }>(cacheKey);
+  if (hit && hit.tracks.length > 0) return hit;
+
+  const sp = new URLSearchParams({
+    artist,
+    category,
+    page: String(page),
+  });
+  const res = await fetch(`/api/youtube/artist/songs?${sp.toString()}`, { signal: params.signal });
+  const data = await handleResponse<{ tracks: Track[]; hasMore: boolean }>(res);
+  if (data.tracks.length > 0) {
+    setClientCache(cacheKey, data, 30 * 60 * 1000);
+  }
+  return data;
+}
+
 

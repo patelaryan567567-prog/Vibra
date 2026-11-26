@@ -12,7 +12,7 @@ import {
   startWebAudioKeepAlive,
   stopWebAudioKeepAlive,
 } from '../utils/backgroundAudio';
-import { formatSeconds, parseDurationLabel } from '../utils/format';
+import { parseDurationLabel } from '../utils/format';
 import { useLibrary } from './LibraryContext';
 
 interface YTPlayerInstance {
@@ -310,6 +310,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const bgSkipStreakRef = useRef(0);
   const radioFetchingRef = useRef(false);
   const shuffleHistoryRef = useRef<Set<string>>(new Set());
+  const sessionSeenIdsRef = useRef<Set<string>>(new Set());
   const shouldPlayRef = useRef(false);
   const userPausedRef = useRef(false);
   const hiddenAtRef = useRef(0);
@@ -759,19 +760,48 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       radioFetchingRef.current = true;
       setIsLoadingRadio(true);
 
+      const normTitleKey = (title: string) =>
+        title
+          .toLowerCase()
+          .replace(/\(.*?\)|\[.*?\]/g, ' ')
+          .replace(/[^a-z0-9\s]/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+
       try {
-        const currentQueueIds = queueRef.current.map((t) => t.id);
+        for (const t of queueRef.current) {
+          sessionSeenIdsRef.current.add(t.id);
+        }
+        const excludeAllIds = Array.from(sessionSeenIdsRef.current);
+        const existingIdSet = new Set(excludeAllIds);
+        const existingTitleKeys = new Set(
+          queueRef.current.map((t) => normTitleKey(t.title)).filter(Boolean)
+        );
+
         const localCandidates = relatedTracksRef.current.filter(
-          (t) => !currentQueueIds.includes(t.id)
+          (t) => !existingIdSet.has(t.id) && !existingTitleKeys.has(normTitleKey(t.title))
         );
 
         let freshTracks = localCandidates;
-        if (freshTracks.length < 3) {
-          freshTracks = await fetchRelatedTracks(seedTrack, currentQueueIds);
+        if (freshTracks.length < 8) {
+          const remoteTracks = await fetchRelatedTracks(seedTrack, excludeAllIds);
+          freshTracks = [...localCandidates, ...remoteTracks];
         }
 
-        const existingIds = new Set(queueRef.current.map((t) => t.id));
-        const uniqueAdditions = freshTracks.filter((t) => !existingIds.has(t.id)).slice(0, 14);
+        const uniqueAdditions: Track[] = [];
+        const batchIds = new Set<string>(existingIdSet);
+        const batchTitles = new Set<string>(existingTitleKeys);
+
+        for (const cand of freshTracks) {
+          if (!cand?.id || batchIds.has(cand.id)) continue;
+          const tk = normTitleKey(cand.title);
+          if (tk && batchTitles.has(tk)) continue;
+          batchIds.add(cand.id);
+          if (tk) batchTitles.add(tk);
+          sessionSeenIdsRef.current.add(cand.id);
+          uniqueAdditions.push(cand);
+          if (uniqueAdditions.length >= 18) break;
+        }
 
         if (uniqueAdditions.length > 0) {
           let insertStartIndex = queueRef.current.length;
@@ -782,7 +812,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             return [...prev, ...cleanNew];
           });
           // Lightweight server-side stream pre-resolution for newly added tracks
-          for (const added of uniqueAdditions.slice(0, 3)) {
+          for (const added of uniqueAdditions.slice(0, 4)) {
             void prewarmServerStreamResolve(added);
           }
           if (advanceToNewTrack) {
@@ -794,7 +824,6 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           }
         } else if (advanceToNewTrack) {
           // Endless fallback: if network is offline or no new radio tracks found, loop back to queue[0]
-          // instead of stopping playback in the background!
           const q = queueRef.current;
           if (q.length > 0 && q[0]) {
             if (!isVideoModeRef.current) {
@@ -821,32 +850,38 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     [beginSynchronousNativeAudio]
   );
 
-  const pickNextShuffleIndex = useCallback((q: Track[], currentIdx: number): number => {
-    if (q.length <= 1) return currentIdx;
-    const unplayedIndices: number[] = [];
-    for (let i = 0; i < q.length; i++) {
-      if (i !== currentIdx && !shuffleHistoryRef.current.has(q[i].id)) {
-        unplayedIndices.push(i);
-      }
-    }
-    if (unplayedIndices.length === 0) {
-      shuffleHistoryRef.current.clear();
-      if (q[currentIdx]) shuffleHistoryRef.current.add(q[currentIdx].id);
+  const pickNextShuffleIndex = useCallback(
+    (q: Track[], currentIdx: number): number => {
+      if (q.length <= 1) return currentIdx;
+      const unplayedIndices: number[] = [];
       for (let i = 0; i < q.length; i++) {
-        if (i !== currentIdx) unplayedIndices.push(i);
+        if (i !== currentIdx && !shuffleHistoryRef.current.has(q[i].id)) {
+          unplayedIndices.push(i);
+        }
       }
-    }
-    const chosen = unplayedIndices[Math.floor(Math.random() * unplayedIndices.length)];
-    if (q[chosen]) shuffleHistoryRef.current.add(q[chosen].id);
-    return chosen;
-  }, []);
+      // Proactively expand the queue when shuffle has <= 3 unplayed tracks left so it never loops the same 10-12 songs
+      if (unplayedIndices.length <= 3 && q[currentIdx]) {
+        void replenishRadioQueue(q[currentIdx], false);
+      }
+      if (unplayedIndices.length === 0) {
+        shuffleHistoryRef.current.clear();
+        if (q[currentIdx]) shuffleHistoryRef.current.add(q[currentIdx].id);
+        for (let i = 0; i < q.length; i++) {
+          if (i !== currentIdx) unplayedIndices.push(i);
+        }
+      }
+      const chosen = unplayedIndices[Math.floor(Math.random() * unplayedIndices.length)];
+      if (q[chosen]) shuffleHistoryRef.current.add(q[chosen].id);
+      return chosen;
+    },
+    [replenishRadioQueue]
+  );
 
   const handleTrackEnd = useCallback(() => {
     const q = queueRef.current;
     const idx = currentIndexRef.current;
     const rep = repeatModeRef.current;
     const shuf = isShuffleRef.current;
-    const radio = isRadioModeRef.current;
 
     if (q.length === 0) return;
 
@@ -858,6 +893,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     endedHandledForLoadRef.current = activeLoadKey;
 
     if (finishedTrack) {
+      sessionSeenIdsRef.current.add(finishedTrack.id);
       clearTrackPosition(finishedTrack.id);
       clearTrackPosition(`dl_${finishedTrack.id}`);
     }
@@ -882,6 +918,11 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     }
 
     if (shuf && q.length > 1) {
+      const unplayedCount = q.filter((t, i) => i !== idx && !shuffleHistoryRef.current.has(t.id)).length;
+      if (unplayedCount === 0 && q[idx]) {
+        void replenishRadioQueue(q[idx], true);
+        return;
+      }
       const nextIdx = pickNextShuffleIndex(q, idx);
       if (q[nextIdx] && !isVideoModeRef.current) {
         beginSynchronousNativeAudio(q[nextIdx], 0);
@@ -896,12 +937,15 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         beginSynchronousNativeAudio(nextTrackItem, 0);
       }
       setCurrentIndex(idx + 1);
-    } else if (radio && q[idx]) {
+      // If approaching end of queue, fetch fresh songs immediately so queue never loops at 10-12 songs
+      if (q.length - 1 - (idx + 1) < 5 && nextTrackItem) {
+        void replenishRadioQueue(nextTrackItem, false);
+      }
+    } else if (q[idx]) {
+      // Always replenish and play song #13, #14, #15... instead of looping back to index 0!
       void replenishRadioQueue(q[idx], true);
-    } else {
-      // Endless playback: wrap around to index 0 even if repeatMode is 'off'
-      // so background playback never stops after finishing the queue!
-      if (q[0] && !isVideoModeRef.current) {
+    } else if (q[0]) {
+      if (!isVideoModeRef.current) {
         beginSynchronousNativeAudio(q[0], 0);
       }
       setCurrentIndex(0);
@@ -1378,7 +1422,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     }
   }, [isVideoMode, currentTrack, beginSynchronousNativeAudio, startYouTubeTrack, stopNativeAudio]);
 
-  // Lazy-fetch related tracks when user expands the player OR Radio has < 10 upcoming tracks
+  // Lazy-fetch related tracks when user expands the player OR queue has < 10 upcoming tracks
   useEffect(() => {
     if (!currentTrack) {
       relatedFetchedForIdRef.current = null;
@@ -1386,13 +1430,17 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
+    sessionSeenIdsRef.current.add(currentTrack.id);
+    for (const t of queueRef.current) {
+      sessionSeenIdsRef.current.add(t.id);
+    }
+
     if (relatedFetchedForIdRef.current !== currentTrack.id) {
       setRelatedTracks([]);
     }
 
     const remainingCount = queue.length - 1 - currentIndex;
-    const needsRelatedNow =
-      isExpanded || (isRadioMode && remainingCount < 10);
+    const needsRelatedNow = isExpanded || remainingCount < 10;
     if (!needsRelatedNow || relatedFetchedForIdRef.current === currentTrack.id) {
       return;
     }
@@ -1401,7 +1449,9 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     const timer = window.setTimeout(() => {
       relatedFetchedForIdRef.current = currentTrack.id;
       setIsLoadingRelated(true);
-      const exclude = queueRef.current.map((t) => t.id);
+      const exclude = Array.from(
+        new Set([...queueRef.current.map((t) => t.id), ...sessionSeenIdsRef.current])
+      );
 
       fetchRelatedTracks(currentTrack, exclude, controller.signal)
         .then((tracks) => {
@@ -1420,7 +1470,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             setIsLoadingRelated(false);
           }
         });
-    }, 600);
+    }, 450);
 
     return () => {
       window.clearTimeout(timer);
@@ -1428,22 +1478,32 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     };
   }, [currentTrack?.id, isExpanded, isRadioMode, currentIndex, queue.length]);
 
-  // Proactively pre-fill Infinite Radio to keep at least 12-15 upcoming songs ready so background playback never runs dry
+  // Proactively pre-fill queue whenever < 6 upcoming tracks remain so playback never loops a 10-12 song batch
   useEffect(() => {
-    if (!isRadioMode || !currentTrack) return;
+    if (!currentTrack || currentIndex < 0) return;
     const remainingCount = queue.length - 1 - currentIndex;
-    if (currentIndex >= 0 && remainingCount < 10 && relatedTracks.length > 0 && !radioFetchingRef.current) {
+    if (remainingCount >= 8 || radioFetchingRef.current) return;
+
+    if (relatedTracks.length > 0) {
       const existing = new Set(queue.map((t) => t.id));
-      const candidates = relatedTracks.filter((t) => !existing.has(t.id)).slice(0, 12);
+      const candidates = relatedTracks.filter((t) => !existing.has(t.id)).slice(0, 16);
       if (candidates.length > 0) {
+        for (const c of candidates) {
+          sessionSeenIdsRef.current.add(c.id);
+        }
         setQueue((prev) => {
           const seen = new Set(prev.map((t) => t.id));
           const add = candidates.filter((t) => !seen.has(t.id));
           return add.length > 0 ? [...prev, ...add] : prev;
         });
+        return;
       }
     }
-  }, [isRadioMode, currentTrack, currentIndex, queue.length, relatedTracks, queue]);
+
+    if (remainingCount < 5) {
+      void replenishRadioQueue(currentTrack, false);
+    }
+  }, [currentTrack, currentIndex, queue.length, relatedTracks, queue, replenishRadioQueue]);
 
   // Background & Screen-Wake Continuity (handles BOTH screen off AND screen on/unlock + auto-handoff from Video to Audio!)
   useEffect(() => {
@@ -1698,17 +1758,18 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       }
 
       let resumeSec = 0;
-      if (typeof startAtSeconds === 'number') {
+      if (typeof startAtSeconds === 'number' && startAtSeconds > 0) {
         resumeSec = Math.max(0, startAtSeconds);
-        if (resumeSec === 0) {
-          clearTrackPosition(track.id);
-          clearTrackPosition(`dl_${track.id}`);
-        }
       } else {
-        const saved = getTrackPosition(track.id) || getTrackPosition(`dl_${track.id}`);
-        if (saved && saved.positionSeconds >= 3) {
-          resumeSec = saved.positionSeconds;
-          showToast(`Resuming "${track.title}" from ${formatSeconds(resumeSec)}`);
+        // Fresh track click always starts from 0:00 — never jump 1 minute into a song from a stale position!
+        clearTrackPosition(track.id);
+        clearTrackPosition(`dl_${track.id}`);
+      }
+
+      sessionSeenIdsRef.current.add(track.id);
+      if (newQueue) {
+        for (const t of newQueue) {
+          sessionSeenIdsRef.current.add(t.id);
         }
       }
 
@@ -1751,10 +1812,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     [
       beginSynchronousNativeAudio,
       clearTrackPosition,
-      getTrackPosition,
       persistCurrentTrackResume,
       recordPlayed,
-      showToast,
       startYouTubeTrack,
       stopNativeAudio,
     ]
@@ -1778,10 +1837,11 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         pokeBackgroundKeepAlive();
         void acquirePlaybackWakeLock();
       }
-      const saved = getTrackPosition(track.id) || getTrackPosition(`dl_${track.id}`);
-      const resumeSec = saved && saved.positionSeconds >= 3 ? saved.positionSeconds : 0;
+      clearTrackPosition(track.id);
+      clearTrackPosition(`dl_${track.id}`);
+      sessionSeenIdsRef.current.add(track.id);
       if (!isVideoModeRef.current) {
-        beginSynchronousNativeAudio(track, resumeSec);
+        beginSynchronousNativeAudio(track, 0);
       }
       setIsRadioMode(true);
       localStorage.setItem('vibra_radio_mode', 'true');
@@ -1790,7 +1850,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       showToast(`Infinite Radio started from "${track.title}"`);
       void replenishRadioQueue(track, false);
     },
-    [beginSynchronousNativeAudio, getTrackPosition, persistCurrentTrackResume, replenishRadioQueue, showToast]
+    [beginSynchronousNativeAudio, clearTrackPosition, persistCurrentTrackResume, replenishRadioQueue, showToast]
   );
 
   const addToQueue = useCallback(
@@ -2081,6 +2141,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       void acquirePlaybackWakeLock();
     }
     if (isShuffleRef.current && q.length > 1) {
+      const unplayedCount = q.filter((t, i) => i !== idx && !shuffleHistoryRef.current.has(t.id)).length;
+      if (unplayedCount === 0 && q[idx]) {
+        unlockAudioFromGesture();
+        void replenishRadioQueue(q[idx], true);
+        return;
+      }
       const nextIdx = pickNextShuffleIndex(q, idx);
       if (q[nextIdx] && !isVideoModeRef.current) {
         beginSynchronousNativeAudio(q[nextIdx], 0);
@@ -2093,11 +2159,14 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         beginSynchronousNativeAudio(q[idx + 1], 0);
       }
       setCurrentIndex(idx + 1);
-    } else if (isRadioModeRef.current && q[idx]) {
+      if (q.length - 1 - (idx + 1) < 5 && q[idx + 1]) {
+        void replenishRadioQueue(q[idx + 1], false);
+      }
+    } else if (q[idx]) {
       unlockAudioFromGesture();
       void replenishRadioQueue(q[idx], true);
-    } else {
-      if (q[0] && !isVideoModeRef.current) {
+    } else if (q[0]) {
+      if (!isVideoModeRef.current) {
         beginSynchronousNativeAudio(q[0], 0);
       }
       setCurrentIndex(0);
@@ -2748,11 +2817,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           if (isSilentWarmupRef.current) return;
           const a = audioElRef.current;
           if (!a || !a.getAttribute('src') || a.src.startsWith('data:')) return;
-          const resumeAt = Math.max(
-            a.currentTime || 0,
-            pendingSeekSecRef.current || 0,
-            currentTimeRef.current || 0
-          );
+          const actualAudioTime = a.currentTime || 0;
+          const resumeAt =
+            actualAudioTime >= 2
+              ? actualAudioTime
+              : pendingSeekSecRef.current > 0.5
+                ? pendingSeekSecRef.current
+                : 0;
           releaseSeekMuteGuard(a);
           const track = queueRef.current[currentIndexRef.current];
           stopNativeAudio();
@@ -2772,12 +2843,16 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           ) {
             bgSkipStreakRef.current += 1;
             const q = queueRef.current;
-            const nextIdx = (currentIndexRef.current + 1) % q.length;
-            const nextTrackItem = q[nextIdx];
-            if (nextTrackItem && !isVideoModeRef.current) {
-              beginSynchronousNativeAudio(nextTrackItem, 0);
+            const curIdx = currentIndexRef.current;
+            if (curIdx + 1 < q.length) {
+              const nextTrackItem = q[curIdx + 1];
+              if (nextTrackItem && !isVideoModeRef.current) {
+                beginSynchronousNativeAudio(nextTrackItem, 0);
+              }
+              setCurrentIndex(curIdx + 1);
+            } else if (q[curIdx]) {
+              void replenishRadioQueue(q[curIdx], true);
             }
-            setCurrentIndex(nextIdx);
             return;
           }
           if (track) {

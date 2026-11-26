@@ -306,7 +306,7 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
                   </div>
 
                   <span className="md:hidden text-xs font-semibold text-white">
-                    {drawerTab === 'lyrics' ? 'Synced Lyrics' : `Up Next (${queue.length})`}
+                    {drawerTab === 'lyrics' ? 'Lyrics' : `Up Next (${queue.length})`}
                   </span>
 
                   {drawerTab === 'queue' && queue.length > 0 && (
@@ -354,9 +354,10 @@ export function OfflinePersistentPlayer({ onAddToOfflinePlaylist }: OfflinePersi
                 >
                   {drawerTab === 'lyrics' ? (
                     <LyricsPanel
+                      key={currentTrack.id}
                       title={currentTrack.title}
                       artist={currentTrack.artist}
-                      durationSeconds={effectiveDuration}
+                      durationSeconds={Math.round(currentTrack.durationSeconds || effectiveDuration)}
                       currentTime={currentTime}
                       onSeekTo={seekTo}
                       accentHex={ambient.hex}

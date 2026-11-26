@@ -30,6 +30,8 @@ interface InternalResolvedEntry {
   upstreamMimeType?: string;
   upstreamUrl?: string;
   upstreamHeaders?: Record<string, string>;
+  saavnEncUrl?: string;
+  saavnSongId?: string;
   scTranscodingUrl?: string;
   scManifest?: { hasInitMap: boolean; allUrls: string[] };
   scManifestPromise?: Promise<{ hasInitMap: boolean; allUrls: string[] } | null>;
@@ -40,7 +42,7 @@ interface InternalResolvedEntry {
 
 const RESOLVE_TTL_MS = 25 * 60 * 1000;
 const NEGATIVE_TTL_MS = 8 * 60 * 1000;
-const MAX_RESOLVED_CACHE = 450;
+const MAX_RESOLVED_CACHE = 800;
 const resolvedCache = new Map<string, InternalResolvedEntry>();
 const inFlightResolves = new Map<string, Promise<InternalResolvedEntry>>();
 
@@ -49,10 +51,10 @@ let cachedScClientIdExpires = 0;
 let inFlightScClientId: Promise<string | null> | null = null;
 
 const BLOCKED_VARIANT_RE =
-  /\b(slowed|reverb|reverbed|lofi|lo-fi|karaoke|instrumental|8d|16d|16-?bit|emulation|female\s*reply|male\s*reply|cover\s*version|tribute|ringtone|whatsapp\s*status|house\s*mix|dj\s*mix|mashup|parody|acoustic\s*cover|nightcore|sped\s*up)\b/i;
+  /\b(slowed|reverb|reverbed|lofi|lo-fi|karaoke|instrumental|8d|16d|16-?bit|emulation|female\s*reply|male\s*reply|cover\s*version|tribute|ringtone|whatsapp\s*status|house\s*mix|dj\s*mix|mashup|parody|acoustic\s*cover|nightcore|sped\s*up|bootleg|ukg\s*flip|flip)\b/i;
 
 const HARD_JUNK_RE =
-  /\b(karaoke|instrumental|16-?bit|emulation|ringtone|whatsapp\s*status|parody|female\s*reply|male\s*reply)\b/i;
+  /\b(karaoke|instrumental|16-?bit|emulation|ringtone|whatsapp\s*status|parody|female\s*reply|male\s*reply|ukg\s*flip|flip|bootleg|slowed|reverb|reverbed|nightcore|sped\s*up|mashup|dj\s*mix|house\s*mix)\b/i;
 
 const MASHUP_X_RE = /\b[a-z0-9]{2,}\s+x\s+[a-z0-9]{2,}\b/i;
 
@@ -117,32 +119,47 @@ function parseYouTubeMetadata(rawTitle: string, rawArtist: string): {
   artistTokens: string[];
   cleanedTitle: string;
 } {
-  const pipeSegments = decodeEntities(rawTitle)
+  const allPipeSegments = decodeEntities(rawTitle)
     .split('|')
     .map((s) => s.trim())
+    .filter(Boolean);
+
+  const isShowPrefix = (seg: string) =>
+    /^(coke\s*studio(\s*pakistan|\s*india|\s*season\s*\d+|\s*s\d+)?|t-?series\s*mixtape|mtv\s*unplugged|bollywood\s*classics)$/i.test(
+      seg.replace(/\(.*?\)|\[.*?\]/g, '').trim()
+    );
+
+  const primaryPipeSeg =
+    allPipeSegments.length > 1 && isShowPrefix(allPipeSegments[0])
+      ? allPipeSegments[1]
+      : allPipeSegments[0] || rawTitle;
+
+  const extraCreditSegments = allPipeSegments
+    .slice(allPipeSegments.length > 1 && isShowPrefix(allPipeSegments[0]) ? 2 : 1)
     .filter(
-      (s, idx) =>
-        idx === 0 ||
+      (s) =>
         !/\b(official|music\s*video|lyric|audio|visuali[sz]er|8k|4k|hd|full\s*song|new\s*punjabi|punjabi\s*superhit|superhit|wedding\s*song|prod\.?\s*by|trending|#)\b/i.test(
           s
         )
     );
 
-  const cleanedTitle = pipeSegments
-    .join(' - ')
-    .replace(
-      /\(.*?(official|music\s*video|lyric|audio|visuali[sz]er|8k|4k|hd|full\s*song|latest\s*punjabi|story\s*version|song).*?\)/gi,
-      ' '
-    )
-    .replace(/\[.*?(official|music\s*video|lyric|audio|visuali[sz]er|8k|4k|hd|full\s*song).*?\]/gi, ' ')
-    .replace(/\bprod\.?\s*by\b.*$/gi, ' ')
-    .replace(
-      /\b(official\s*(music\s*)?(video|audio|visuali[sz]er)|full\s*(video|song|audio)|lyric(al)?\s*video|8k\s*video|4k\s*video|music\s*video)\b/gi,
-      ' '
-    )
-    .replace(/#\S+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const stripJunkTags = (str: string) =>
+    str
+      .replace(
+        /\(.*?(official|music\s*video|lyric|audio|visuali[sz]er|8k|4k|hd|full\s*song|latest\s*punjabi|story\s*version|song).*?\)/gi,
+        ' '
+      )
+      .replace(/\[.*?(official|music\s*video|lyric|audio|visuali[sz]er|8k|4k|hd|full\s*song).*?\]/gi, ' ')
+      .replace(/\bprod\.?\s*by\b.*$/gi, ' ')
+      .replace(
+        /\b(official\s*(music\s*)?(video|audio|visuali[sz]er)|full\s*(video|song|audio)|lyric(al)?\s*video|8k\s*video|4k\s*video|music\s*video)\b/gi,
+        ' '
+      )
+      .replace(/#\S+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const cleanedTitle = stripJunkTags(primaryPipeSeg);
 
   const cleanedArtist = decodeEntities(rawArtist)
     .replace(
@@ -155,40 +172,58 @@ function parseYouTubeMetadata(rawTitle: string, rawArtist: string): {
     .trim();
 
   let extractedSongPart = cleanedTitle;
-  let extractedArtistPart = cleanedArtist;
+  let extractedArtistPart = [cleanedArtist, ...extraCreditSegments].filter(Boolean).join(' ').trim();
 
   if (cleanedTitle.includes(' - ')) {
     const [left, right] = cleanedTitle.split(' - ', 2).map((s) => s.trim());
     if (cleanedArtist && left.toLowerCase().includes(cleanedArtist.toLowerCase())) {
-      extractedArtistPart = left;
+      extractedArtistPart = `${left} ${extractedArtistPart}`.trim();
       extractedSongPart = right;
     } else if (cleanedArtist && right.toLowerCase().includes(cleanedArtist.toLowerCase())) {
       extractedSongPart = left;
-      extractedArtistPart = right;
+      extractedArtistPart = `${right} ${extractedArtistPart}`.trim();
     } else {
       const leftWords = tokenizeMeaningful(left);
       const rightWords = tokenizeMeaningful(right);
-      if (leftWords.length >= 1 && leftWords.length <= 3 && rightWords.length >= 2) {
-        // Common pattern: "ISHQ - Faheem Abdullah, Rauhan Malik" or "Udaarian - Satinder Sartaaj"
+      const rightLooksLikeFeatOrMultiArtist = /,|\b(ft|feat|featuring)\b|&/i.test(right);
+      const leftLooksLikeFeatOrMultiArtist = /,|\b(ft|feat|featuring)\b|&/i.test(left);
+
+      if (leftLooksLikeFeatOrMultiArtist && !rightLooksLikeFeatOrMultiArtist && rightWords.length <= 5) {
+        extractedArtistPart = `${left} ${extractedArtistPart}`.trim();
+        extractedSongPart = right;
+      } else if (
+        rightLooksLikeFeatOrMultiArtist ||
+        (leftWords.length >= 1 && leftWords.length <= 5 && rightWords.length >= 1 && rightWords.length <= 4)
+      ) {
         extractedSongPart = left;
-        extractedArtistPart = `${right} ${cleanedArtist}`.trim();
+        extractedArtistPart = `${right} ${extractedArtistPart}`.trim();
       } else {
         extractedSongPart = right.length >= 2 ? right : cleanedTitle;
-        if (!extractedArtistPart && left.length >= 2) extractedArtistPart = left;
+        if (left.length >= 2) extractedArtistPart = `${left} ${extractedArtistPart}`.trim();
       }
     }
-  } else if (cleanedTitle.includes(':')) {
-    const [left, right] = cleanedTitle.split(':', 2).map((s) => s.trim());
-    if (right.length >= 3) {
+  }
+
+  // Always check if extractedSongPart still has "Artist/Movie: Song Title" colon prefix
+  if (/^[A-Za-z0-9\s.'&-]{2,28}:\s+/.test(extractedSongPart)) {
+    const colonIdx = extractedSongPart.indexOf(':');
+    const left = extractedSongPart.slice(0, colonIdx).trim();
+    const right = extractedSongPart.slice(colonIdx + 1).trim();
+    if (right.length >= 2) {
       extractedSongPart = right;
-      if (!extractedArtistPart && left.length >= 2) extractedArtistPart = left;
+      if (left.length >= 2) {
+        extractedArtistPart = `${left} ${extractedArtistPart}`.trim();
+      }
     }
   }
 
   const artistTokenList = Array.from(new Set(tokenizeMeaningful(`${extractedArtistPart} ${cleanedArtist}`)));
   const artistTokenSet = new Set(artistTokenList);
 
-  const songWithoutFeat = extractedSongPart.replace(/\b(ft|feat|featuring)\.?\s+.*$/i, '').trim();
+  const songWithoutFeat = extractedSongPart
+    .replace(/\(.*?\)|\[.*?\]/g, ' ')
+    .replace(/\b(ft|feat|featuring)\.?\s+.*$/i, '')
+    .trim();
   const rawSongTokens = tokenizeMeaningful(songWithoutFeat || extractedSongPart);
   const strippedSongTokens = rawSongTokens.filter((t) => !artistTokenSet.has(t));
   const songCoreTokens =
@@ -199,23 +234,25 @@ function parseYouTubeMetadata(rawTitle: string, rawArtist: string): {
         : tokenizeMeaningful(cleanedTitle);
 
   const queries: string[] = [];
-  const songOnly = songCoreTokens.join(' ');
-  const artistOnly = artistTokenList.slice(0, 3).join(' ');
+  const songOnly = songCoreTokens.slice(0, 5).join(' ');
+  const primaryArtistOnly = tokenizeMeaningful(cleanedArtist || extractedArtistPart)
+    .slice(0, 3)
+    .join(' ');
 
-  if (songOnly && artistOnly) {
-    queries.push(`${songOnly} ${artistOnly}`.trim());
+  if (songOnly && primaryArtistOnly) {
+    queries.push(`${songOnly} ${primaryArtistOnly}`.trim());
   }
-  if (songCoreTokens.length > 1 && artistOnly) {
-    queries.push(`${songCoreTokens[0]} ${artistOnly}`.trim());
+  if (songOnly) {
+    queries.push(songOnly);
+  }
+  if (songCoreTokens.length > 1 && primaryArtistOnly) {
+    queries.push(`${songCoreTokens[0]} ${songCoreTokens[1]} ${primaryArtistOnly}`.trim());
   }
   const baseQuery =
-    extractedArtistPart && !cleanedTitle.toLowerCase().includes(extractedArtistPart.toLowerCase())
-      ? `${extractedSongPart} ${extractedArtistPart}`.trim()
+    cleanedArtist && !cleanedTitle.toLowerCase().includes(cleanedArtist.toLowerCase())
+      ? `${extractedSongPart} ${cleanedArtist}`.trim()
       : cleanedTitle.replace(/\s*-\s*/g, ' ').trim();
   if (baseQuery) queries.push(baseQuery);
-  if (extractedSongPart && extractedSongPart !== baseQuery) {
-    queries.push(extractedSongPart);
-  }
 
   return {
     searchQueries: Array.from(new Set(queries)).filter(Boolean).slice(0, 4),
@@ -264,6 +301,7 @@ function scoreAudioCandidate(params: {
 
   const candTokens = tokenizeMeaningful(cleanCandTitle || candTitle);
   const candArtistTokens = tokenizeMeaningful(candArtists);
+  const candArtistTokenSet = new Set(candArtistTokens);
   if (candTokens.length === 0 || params.songCoreTokens.length === 0) return -1000;
 
   const fullYtHaystackTokens = new Set([
@@ -273,9 +311,13 @@ function scoreAudioCandidate(params: {
     ...params.artistTokens,
   ]);
 
-  const candCombinedTokens = new Set([...candTokens, ...candArtistTokens]);
+  const candTokenSet = new Set(candTokens);
 
-  // Verify artist attribution (either YouTube artist token is in candidate, or candidate's primary artist is explicitly in YouTube title/artist)
+  // Exclude candidate artist tokens from songCoreTokens in case the YT title included the singer's name
+  const effectiveSongCore = params.songCoreTokens.filter((t) => !candArtistTokenSet.has(t));
+  const coreTargets = effectiveSongCore.length > 0 ? effectiveSongCore : params.songCoreTokens;
+
+  // Verify artist attribution
   const candCombinedText = `${candArtists} ${candTitleLower}`;
   const artistHitCount =
     params.artistTokens.filter((t) => candCombinedText.includes(t)).length +
@@ -283,22 +325,24 @@ function scoreAudioCandidate(params: {
   const artistMatched =
     params.artistTokens.length === 0 && candArtistTokens.length === 0 ? true : artistHitCount > 0;
 
-  // Check how many of the song's core title words appear in candidate title or artist
-  const coreOverlap = params.songCoreTokens.filter(
-    (t) => candCombinedTokens.has(t) || candTitleLower.includes(t)
+  // Match song core tokens against candidate TITLE tokens
+  const coreOverlap = coreTargets.filter(
+    (t) => candTokenSet.has(t) || candTitleLower.includes(t)
   ).length;
-  const rawCoreCoverage = coreOverlap / params.songCoreTokens.length;
+  const rawCoreCoverage = coreOverlap / coreTargets.length;
 
-  // Also check if the candidate's own song title tokens are 100% present in the YouTube title (handles "Mahiya ft. Avneet Kaur" where "Mahiya" is 1 word)
+  // Require proportional length match so a 1-word song like "Ishq" never steals "Ishq Wala Love"
   const candTitleInYtCount = candTokens.filter((t) => fullYtHaystackTokens.has(t)).length;
   const candTitleInYtRatio = candTitleInYtCount / candTokens.length;
+  const lengthRatioOk =
+    candTokens.length >= Math.max(1, coreTargets.length - 1);
 
   const coreCoverage =
-    candTitleInYtRatio >= 0.85 && artistMatched
+    candTitleInYtRatio >= 0.85 && artistMatched && lengthRatioOk
       ? Math.max(rawCoreCoverage, 0.9)
       : rawCoreCoverage;
 
-  if (coreOverlap === 0 || coreCoverage < 0.5) {
+  if (coreOverlap === 0 || coreCoverage < 0.7) {
     return -500;
   }
 
@@ -328,32 +372,33 @@ function scoreAudioCandidate(params: {
       !fullYtHaystackTokens.has(t) &&
       !(params.allowExtendedVariants && EXTENDED_DESCRIPTOR_TOKENS.has(t))
   );
-  const maxUnmatchedRatio = params.allowExtendedVariants ? 0.55 : 0.34;
+  const maxUnmatchedRatio = params.allowExtendedVariants ? 0.45 : 0.3;
   if (unmatchedCandTokens.length > 0 && unmatchedCandTokens.length / candTokens.length > maxUnmatchedRatio) {
     return -500;
   }
 
-  // Duration sanity check (YouTube music videos often have a 30s-100s story intro/outro vs studio audio)
+  // Duration sanity check (YouTube narrative music videos often have a 60s-140s intro/outro vs studio audio)
   let durScore = 0;
   if (params.ytDuration > 0 && params.candDuration > 0) {
     const diff = Math.abs(params.ytDuration - params.candDuration);
-    const maxDiff = params.ytDuration > 280 ? 150 : 105;
+    const maxDiff = params.ytDuration > 240 ? 185 : 115;
     if (diff > maxDiff) return -500;
-    if (diff <= 15) durScore = 35;
-    else if (diff <= 35) durScore = 22;
-    else if (diff <= 65) durScore = 12;
-    else durScore = 4;
+    if (diff <= 12) durScore = 35;
+    else if (diff <= 28) durScore = 24;
+    else if (diff <= 65) durScore = 15;
+    else durScore = 6;
   }
 
   if (!artistMatched) {
-    if (unmatchedCandTokens.length > 0 || coreCoverage < 0.9 || candTokens.length < 3 || durScore < 20) {
+    // Only allow unmatched artist when the full 3+ word title matches 100% AND duration is within 12s
+    if (unmatchedCandTokens.length > 0 || coreCoverage < 1 || candTokens.length < 3 || durScore < 30) {
       return -200;
     }
   }
 
   let score = Math.round(coreCoverage * 60) + (artistMatched ? 40 : 0) + durScore;
   if (candTitleLower === params.cleanedYtTitle.toLowerCase()) score += 20;
-  if (params.allowExtendedVariants) score -= 12;
+  if (params.allowExtendedVariants) score -= 14;
   return score;
 }
 
@@ -435,7 +480,7 @@ async function resolveViaJioSaavn(
         allowExtendedVariants,
       });
 
-      const threshold = allowExtendedVariants ? 60 : 66;
+      const threshold = allowExtendedVariants ? 80 : 72;
       if (score < threshold) continue;
 
       if (!encUrl && item.id) {
@@ -659,7 +704,7 @@ async function resolveViaSoundCloud(
         allowExtendedVariants,
       });
 
-      if (score < 68) continue;
+      if (score < (allowExtendedVariants ? 82 : 72)) continue;
 
       // Prefer progressive MP3 or fMP4 HLS (aac_160k / audio/mp4) which our server assembles into a native MP4 stream
       const chosen =
@@ -994,10 +1039,10 @@ async function resolveViaAudius(
       songCoreTokens: parsed.songCoreTokens,
       artistTokens: parsed.artistTokens,
       cleanedYtTitle: parsed.cleanedTitle,
-      allowExtendedVariants: true,
+      allowExtendedVariants: false,
     });
 
-    if (score < 64) continue;
+    if (score < 74) continue;
     const streamUrl =
       item.stream?.url || `https://api.audius.co/v1/tracks/${encodeURIComponent(item.id)}/stream?app_name=VIBRA`;
 
@@ -1108,9 +1153,9 @@ async function resolveViaArchiveOrg(
         songCoreTokens: parsed.songCoreTokens,
         artistTokens: parsed.artistTokens,
         cleanedYtTitle: parsed.cleanedTitle,
-        allowExtendedVariants: true,
+        allowExtendedVariants: false,
       });
-      return preScore >= 68;
+      return preScore >= 74;
     });
 
     if (matchedDocs.length > 0) {
@@ -1147,6 +1192,62 @@ async function resolveViaArchiveOrg(
   return null;
 }
 
+async function ensureSaavnUpstreamUrl(
+  entry: InternalResolvedEntry,
+  fallbackSaavnId?: string
+): Promise<string | null> {
+  if (entry.upstreamUrl) return entry.upstreamUrl;
+
+  let encUrl = entry.saavnEncUrl || '';
+  const songId = entry.saavnSongId || fallbackSaavnId || '';
+
+  if (!encUrl && songId) {
+    try {
+      const detRes = await fetch(
+        `https://www.jiosaavn.com/api.php?__call=song.getDetails&_format=json&_marker=0&cc=in&pids=${encodeURIComponent(
+          songId
+        )}`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(2600) }
+      );
+      if (detRes.ok) {
+        const det = (await detRes.json()) as { songs?: SaavnSearchResultItem[]; [k: string]: unknown };
+        const sObj = (det.songs?.[0] ?? det[songId]) as SaavnSearchResultItem | undefined;
+        encUrl = sObj?.more_info?.encrypted_media_url || sObj?.encrypted_media_url || '';
+        if (encUrl) entry.saavnEncUrl = encUrl;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!encUrl) return null;
+
+  try {
+    const authRes = await fetch(
+      `https://www.jiosaavn.com/api.php?__call=song.generateAuthToken&url=${encodeURIComponent(
+        encUrl
+      )}&bitrate=160&api_version=4&_format=json&ctx=web6dot0&_marker=0`,
+      { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(2600) }
+    );
+    if (!authRes.ok) return null;
+    const authJson = (await authRes.json()) as { auth_url?: string };
+    if (!authJson.auth_url) return null;
+
+    entry.upstreamUrl = authJson.auth_url;
+    entry.upstreamKind = 'direct-url';
+    entry.upstreamHeaders = {
+      Referer: 'https://www.jiosaavn.com/',
+      Origin: 'https://www.jiosaavn.com',
+      'User-Agent':
+        'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36',
+    };
+    entry.expiresAt = Date.now() + RESOLVE_TTL_MS;
+    return entry.upstreamUrl;
+  } catch {
+    return null;
+  }
+}
+
 export async function resolveBackgroundAudioStream(
   videoId: string,
   title: string,
@@ -1155,7 +1256,34 @@ export async function resolveBackgroundAudioStream(
 ): Promise<ResolvedAudioStream> {
   const existing = resolvedCache.get(videoId);
   if (existing && existing.expiresAt > Date.now()) {
+    if (existing.result.provider === 'jiosaavn' && !existing.upstreamUrl) {
+      const saavnId = videoId.startsWith('src_js_') ? videoId.slice(7) : existing.saavnSongId;
+      await ensureSaavnUpstreamUrl(existing, saavnId);
+    }
     return existing.result;
+  }
+
+  // Direct JioSaavn ID recovery if cache was evicted
+  if (videoId.startsWith('src_js_')) {
+    const rawSaavnId = videoId.slice(7);
+    const recoveredEntry: InternalResolvedEntry = {
+      result: {
+        mode: 'proxy',
+        provider: 'jiosaavn',
+        streamUrl: `/api/audio/stream?videoId=${encodeURIComponent(videoId)}`,
+        matchedTitle: title || 'JioSaavn Track',
+        matchedArtist: artist || 'Artist',
+        durationSeconds: durationSeconds || undefined,
+      },
+      saavnSongId: rawSaavnId,
+      upstreamKind: 'direct-url',
+      expiresAt: Date.now() + RESOLVE_TTL_MS,
+    };
+    const signedUrl = await ensureSaavnUpstreamUrl(recoveredEntry, rawSaavnId);
+    if (signedUrl) {
+      resolvedCache.set(videoId, recoveredEntry);
+      return recoveredEntry.result;
+    }
   }
 
   const pending = inFlightResolves.get(videoId);
@@ -1165,44 +1293,47 @@ export async function resolveBackgroundAudioStream(
   }
 
   const job = (async (): Promise<InternalResolvedEntry> => {
-    // Launch JioSaavn, SoundCloud, and Audius IN PARALLEL instead of sequentially!
-    // If JioSaavn resolves first (~350-550ms), return immediately; otherwise SoundCloud/Audius are already ready!
-    const saavnPromise = resolveViaJioSaavn(videoId, title, artist, durationSeconds).catch(() => null);
-    const scPromise = resolveViaSoundCloud(videoId, title, artist, durationSeconds).catch(() => null);
-    const audiusPromise = resolveViaAudius(videoId, title, artist, durationSeconds).catch(() => null);
+    const resolveChain = (async (): Promise<InternalResolvedEntry | null> => {
+      // Launch JioSaavn, SoundCloud, and Audius IN PARALLEL instead of sequentially!
+      const saavnPromise = resolveViaJioSaavn(videoId, title, artist, durationSeconds).catch(() => null);
+      const scPromise = resolveViaSoundCloud(videoId, title, artist, durationSeconds).catch(() => null);
+      const audiusPromise = resolveViaAudius(videoId, title, artist, durationSeconds).catch(() => null);
 
-    const saavnEntry = await saavnPromise;
-    if (saavnEntry) {
-      resolvedCache.set(videoId, saavnEntry);
-      return saavnEntry;
-    }
+      const saavnEntry = await saavnPromise;
+      if (saavnEntry) return saavnEntry;
 
-    const scEntry = await scPromise;
-    if (scEntry) {
-      resolvedCache.set(videoId, scEntry);
-      if (scEntry.upstreamKind === 'soundcloud-hls-fmp4') {
-        // Pre-fetch manifest right away so progressive streaming begins immediately
-        void fetchSoundCloudManifest(scEntry);
+      const scEntry = await scPromise;
+      if (scEntry) {
+        if (scEntry.upstreamKind === 'soundcloud-hls-fmp4') {
+          void fetchSoundCloudManifest(scEntry);
+        }
+        return scEntry;
       }
-      return scEntry;
+
+      const audiusEntry = await audiusPromise;
+      if (audiusEntry) return audiusEntry;
+
+      const archiveEntry = await resolveViaArchiveOrg(videoId, title, artist, durationSeconds).catch(
+        () => null
+      );
+      if (archiveEntry) return archiveEntry;
+
+      return null;
+    })();
+
+    // Strict 3.5-second budget so audio resolution never stalls song startup for 30-60s
+    const timeoutGuard = new Promise<InternalResolvedEntry | null>((resolve) => {
+      const t = setTimeout(() => resolve(null), 3500);
+      t.unref?.();
+    });
+
+    const winner = await Promise.race([resolveChain, timeoutGuard]);
+    if (winner) {
+      resolvedCache.set(videoId, winner);
+      return winner;
     }
 
-    const audiusEntry = await audiusPromise;
-    if (audiusEntry) {
-      resolvedCache.set(videoId, audiusEntry);
-      return audiusEntry;
-    }
-
-    // Fast fallback race for public-domain Archive.org
-    const archiveEntry = await resolveViaArchiveOrg(videoId, title, artist, durationSeconds).catch(
-      () => null
-    );
-    if (archiveEntry) {
-      resolvedCache.set(videoId, archiveEntry);
-      return archiveEntry;
-    }
-
-    // No verified audio match -> client falls back to official YouTube IFrame
+    // No verified audio match within budget -> client falls back to official YouTube IFrame immediately
     const ytFallback: InternalResolvedEntry = {
       result: { mode: 'youtube' },
       expiresAt: Date.now() + NEGATIVE_TTL_MS,
@@ -1243,16 +1374,344 @@ export async function prewarmAudioStreamsBatch(
   return Object.fromEntries(settled);
 }
 
+export async function fetchSaavnArtistCatalog(
+  artistName: string,
+  options?: { category?: string; page?: number; limit?: number }
+): Promise<MultiSourceTrackResult[]> {
+  const cleanArtist = artistName.trim();
+  if (!cleanArtist) return [];
+
+  const category = (options?.category || 'all').toLowerCase();
+  const page = Math.max(1, options?.page ?? 1);
+  const limit = Math.min(Math.max(options?.limit ?? 48, 8), 80);
+
+  const artistTokens = tokenizeMeaningful(cleanArtist);
+
+  const fetchSaavnPage = async (q: string, p: number, count = 40): Promise<Array<SaavnSearchResultItem & { image?: string }>> => {
+    try {
+      const url = `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&cc=in&p=${p}&n=${count}&q=${encodeURIComponent(
+        q
+      )}`;
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(3500),
+      });
+      if (!res.ok) return [];
+      const data = (await res.json()) as {
+        results?: Array<SaavnSearchResultItem & { image?: string }>;
+      };
+      return data.results ?? [];
+    } catch {
+      return [];
+    }
+  };
+
+  let queriesToRun: Array<{ q: string; p: number }> = [];
+  if (category === 'all' && page === 1) {
+    queriesToRun = [
+      { q: cleanArtist, p: 1 },
+      { q: cleanArtist, p: 2 },
+      { q: `${cleanArtist} romantic songs`, p: 1 },
+      { q: `${cleanArtist} sad songs`, p: 1 },
+    ];
+  } else if (category === 'all') {
+    queriesToRun = [
+      { q: cleanArtist, p: page * 2 - 1 },
+      { q: cleanArtist, p: page * 2 },
+    ];
+  } else if (category === 'romantic') {
+    queriesToRun = [
+      { q: `${cleanArtist} romantic love songs`, p: page },
+      { q: `${cleanArtist} ishq dil`, p: page },
+    ];
+  } else if (category === 'sad') {
+    queriesToRun = [
+      { q: `${cleanArtist} sad heartbreak songs`, p: page },
+      { q: `${cleanArtist} emotional dard`, p: page },
+    ];
+  } else if (category === 'chill') {
+    queriesToRun = [
+      { q: `${cleanArtist} unplugged acoustic chill`, p: page },
+      { q: `${cleanArtist} sufi melody`, p: page },
+    ];
+  } else if (category === 'energetic') {
+    queriesToRun = [
+      { q: `${cleanArtist} party dance hits`, p: page },
+      { q: `${cleanArtist} upbeat beat`, p: page },
+    ];
+  } else if (category === 'classics') {
+    queriesToRun = [
+      { q: `${cleanArtist} evergreen classic hits`, p: page },
+      { q: `${cleanArtist} best 90s old songs`, p: page },
+    ];
+  } else {
+    queriesToRun = [
+      { q: `${cleanArtist} top hits`, p: page },
+      { q: cleanArtist, p: page },
+    ];
+  }
+
+  const batches = await Promise.all(queriesToRun.map(({ q, p }) => fetchSaavnPage(q, p, 40)));
+  const rawItems: Array<SaavnSearchResultItem & { image?: string }> = [];
+  for (const batch of batches) {
+    rawItems.push(...batch);
+  }
+
+  const seenIds = new Set<string>();
+  const seenTitleKeys = new Set<string>();
+  const results: MultiSourceTrackResult[] = [];
+
+  for (const item of rawItems) {
+    if (!item.id) continue;
+    const cleanId = String(item.id).replace(/[^a-zA-Z0-9_-]/g, '');
+    if (!cleanId || seenIds.has(cleanId)) continue;
+
+    const title = decodeEntities(item.song || item.title || '').trim();
+    if (!title || HARD_JUNK_RE.test(title)) continue;
+
+    const artistsStr = decodeEntities(
+      [item.primary_artists, item.singers, item.music].filter(Boolean).join(', ')
+    ).trim();
+    const combinedLower = `${artistsStr} ${title}`.toLowerCase();
+
+    // Verify artist match so unrelated songs never pollute an artist's discography
+    const matchedTokens = artistTokens.filter((tok) => combinedLower.includes(tok));
+    if (artistTokens.length > 0 && matchedTokens.length === 0) continue;
+    if (artistTokens.length >= 2 && matchedTokens.length < Math.min(2, artistTokens.length)) continue;
+
+    const dur = Number(item.duration || item.more_info?.duration || 0);
+    if (dur > 0 && dur < 65) continue;
+
+    const titleKey = title
+      .toLowerCase()
+      .replace(/\(.*?\)|\[.*?\]/g, ' ')
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (titleKey && seenTitleKeys.has(titleKey)) continue;
+
+    seenIds.add(cleanId);
+    if (titleKey) seenTitleKeys.add(titleKey);
+
+    const trackId = `src_js_${cleanId}`;
+    const encUrl = item.encrypted_media_url || item.more_info?.encrypted_media_url || '';
+    const thumb = (item.image || '').replace('150x150', '500x500').replace('http://', 'https://');
+    const displayArtist = artistsStr ? artistsStr.split(',')[0].trim() || cleanArtist : cleanArtist;
+
+    const existing = resolvedCache.get(trackId);
+    if (!existing || existing.expiresAt <= Date.now()) {
+      resolvedCache.set(trackId, {
+        result: {
+          mode: 'proxy',
+          provider: 'jiosaavn',
+          streamUrl: `/api/audio/stream?videoId=${encodeURIComponent(trackId)}`,
+          matchedTitle: title,
+          matchedArtist: artistsStr || cleanArtist,
+          durationSeconds: dur || undefined,
+        },
+        saavnEncUrl: encUrl || undefined,
+        saavnSongId: cleanId,
+        upstreamKind: 'direct-url',
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      });
+    }
+
+    results.push({
+      id: trackId,
+      title,
+      artist: displayArtist,
+      duration: formatDurLabel(dur),
+      durationSeconds: dur,
+      thumbnail: thumb,
+      thumbnailHigh: thumb,
+      provider: 'jiosaavn',
+      sourceLabel: 'JioSaavn 320kbps',
+    });
+
+    if (results.length >= limit) break;
+  }
+
+  return results;
+}
+
+const POPULAR_COMPANION_SINGERS = [
+  'Arijit Singh',
+  'Shreya Ghoshal',
+  'Jubin Nautiyal',
+  'Diljit Dosanjh',
+  'Karan Aujla',
+  'Atif Aslam',
+  'Sonu Nigam',
+  'Armaan Malik',
+  'Vishal Mishra',
+  'Darshan Raval',
+  'Badshah',
+  'Yo Yo Honey Singh',
+  'Sidhu Moose Wala',
+  'Alka Yagnik',
+  'Anuv Jain',
+  'KK',
+];
+
+export async function fetchSaavnRelatedTracks(
+  artistName: string,
+  title: string,
+  excludeIds: Set<string>,
+  limit = 20
+): Promise<MultiSourceTrackResult[]> {
+  const cleanArtist = decodeEntities(artistName || '')
+    .replace(/\b(t-?series|zee\s*music|sony\s*music|yrf|speed\s*records|saregama|official|topic)\b/gi, ' ')
+    .replace(/[-|,]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const cleanTitle = decodeEntities(title || '')
+    .replace(/\(.*?\)|\[.*?\]/g, ' ')
+    .replace(/[^a-zA-Z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Pick 2 rotating companion singers so radio never runs dry even after 50+ songs
+  const hashSeed = (cleanTitle.length + cleanArtist.length + excludeIds.size) % POPULAR_COMPANION_SINGERS.length;
+  const companionA = POPULAR_COMPANION_SINGERS[hashSeed];
+  const companionB = POPULAR_COMPANION_SINGERS[(hashSeed + 5) % POPULAR_COMPANION_SINGERS.length];
+
+  const queries = [
+    cleanArtist ? `${cleanArtist} top songs` : 'Arijit Singh top songs',
+    cleanTitle ? `${cleanTitle.split(' ').slice(0, 3).join(' ')} song` : `${companionA} hits`,
+    `${companionA} best songs`,
+    `${companionB} hit songs`,
+  ];
+
+  const pageOffset = Math.floor(excludeIds.size / 14) + 1;
+
+  const fetchBatch = async (q: string, p: number) => {
+    try {
+      const url = `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&cc=in&p=${p}&n=20&q=${encodeURIComponent(
+        q
+      )}`;
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!res.ok) return [];
+      const data = (await res.json()) as {
+        results?: Array<SaavnSearchResultItem & { image?: string }>;
+      };
+      return data.results ?? [];
+    } catch {
+      return [];
+    }
+  };
+
+  const batches = await Promise.all([
+    fetchBatch(queries[0], pageOffset),
+    fetchBatch(queries[1], 1),
+    fetchBatch(queries[2], (pageOffset % 3) + 1),
+    fetchBatch(queries[3], 1),
+  ]);
+
+  const seedTitleNorm = cleanTitle.toLowerCase();
+  const seenIds = new Set<string>(excludeIds);
+  const seenTitles = new Set<string>();
+  if (seedTitleNorm) seenTitles.add(seedTitleNorm);
+
+  const out: MultiSourceTrackResult[] = [];
+  const maxLen = Math.max(0, ...batches.map((b) => b.length));
+
+  for (let i = 0; i < maxLen; i++) {
+    for (const batch of batches) {
+      const item = batch[i];
+      if (!item?.id) continue;
+      const cleanId = String(item.id).replace(/[^a-zA-Z0-9_-]/g, '');
+      const trackId = `src_js_${cleanId}`;
+      if (!cleanId || seenIds.has(trackId) || seenIds.has(cleanId)) continue;
+
+      const songTitle = decodeEntities(item.song || item.title || '').trim();
+      if (!songTitle || HARD_JUNK_RE.test(songTitle)) continue;
+
+      const normTitle = songTitle
+        .toLowerCase()
+        .replace(/\(.*?\)|\[.*?\]/g, ' ')
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!normTitle || seenTitles.has(normTitle)) continue;
+      if (seedTitleNorm && (normTitle.includes(seedTitleNorm) || seedTitleNorm.includes(normTitle))) {
+        continue;
+      }
+
+      const dur = Number(item.duration || item.more_info?.duration || 0);
+      if (dur > 0 && dur < 65) continue;
+
+      const artistsStr = decodeEntities(
+        [item.primary_artists, item.singers, item.music].filter(Boolean).join(', ')
+      ).trim();
+      const displayArtist = artistsStr ? artistsStr.split(',')[0].trim() : cleanArtist || companionA;
+      const encUrl = item.encrypted_media_url || item.more_info?.encrypted_media_url || '';
+      const thumb = (item.image || '').replace('150x150', '500x500').replace('http://', 'https://');
+
+      seenIds.add(trackId);
+      seenTitles.add(normTitle);
+
+      if (!resolvedCache.has(trackId)) {
+        resolvedCache.set(trackId, {
+          result: {
+            mode: 'proxy',
+            provider: 'jiosaavn',
+            streamUrl: `/api/audio/stream?videoId=${encodeURIComponent(trackId)}`,
+            matchedTitle: songTitle,
+            matchedArtist: artistsStr || displayArtist,
+            durationSeconds: dur || undefined,
+          },
+          saavnEncUrl: encUrl || undefined,
+          saavnSongId: cleanId,
+          upstreamKind: 'direct-url',
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        });
+      }
+
+      out.push({
+        id: trackId,
+        title: songTitle,
+        artist: displayArtist,
+        duration: formatDurLabel(dur),
+        durationSeconds: dur,
+        thumbnail: thumb,
+        thumbnailHigh: thumb,
+        provider: 'jiosaavn',
+        sourceLabel: 'JioSaavn 320kbps',
+      });
+
+      if (out.length >= limit) return out;
+    }
+  }
+
+  return out;
+}
+
 export async function proxyAudioStream(req: Request, res: Response, videoId: string): Promise<void> {
   let entry = resolvedCache.get(videoId);
 
-  // If not yet resolved (or expired) and query has title metadata, resolve on-the-fly so synchronous <audio src="/api/audio/stream?..."> works in 1 step!
-  if ((!entry || entry.expiresAt <= Date.now() || !entry.upstreamUrl) && typeof req.query.title === 'string') {
-    const title = req.query.title.slice(0, 180);
+  if (entry && entry.result.provider === 'jiosaavn' && !entry.upstreamUrl) {
+    const saavnId = videoId.startsWith('src_js_') ? videoId.slice(7) : entry.saavnSongId;
+    await ensureSaavnUpstreamUrl(entry, saavnId);
+  }
+
+  // If not yet resolved (or expired) and query has title metadata (or is a direct src_js_ ID), resolve on-the-fly!
+  if (
+    (!entry || entry.expiresAt <= Date.now() || !entry.upstreamUrl) &&
+    (typeof req.query.title === 'string' || videoId.startsWith('src_js_'))
+  ) {
+    const title = typeof req.query.title === 'string' ? req.query.title.slice(0, 180) : '';
     const artist = typeof req.query.artist === 'string' ? req.query.artist.slice(0, 120) : '';
     const dur = Number(req.query.duration);
     await resolveBackgroundAudioStream(videoId, title, artist, Number.isFinite(dur) && dur > 0 ? dur : 0);
     entry = resolvedCache.get(videoId);
+    if (entry && entry.result.provider === 'jiosaavn' && !entry.upstreamUrl) {
+      const saavnId = videoId.startsWith('src_js_') ? videoId.slice(7) : entry.saavnSongId;
+      await ensureSaavnUpstreamUrl(entry, saavnId);
+    }
   }
 
   if (!entry || entry.expiresAt <= Date.now() || !entry.upstreamUrl) {
@@ -1830,3 +2289,121 @@ export async function proxyDirectAudioUrl(req: Request, res: Response, rawUrl: s
     }
   }
 }
+
+const artistPosterCache = new Map<string, string>();
+
+const CURATED_ARTIST_POSTERS: Record<string, string> = {
+  'arijit singh': 'https://c.saavncdn.com/artists/Arijit_Singh_004_20241118063717_500x500.jpg',
+  'yo yo honey singh': 'https://c.saavncdn.com/artists/Yo_Yo_Honey_Singh_004_20260811095253_500x500.jpg',
+  'honey singh': 'https://c.saavncdn.com/artists/Yo_Yo_Honey_Singh_004_20260811095253_500x500.jpg',
+  'sidhu moose wala': 'https://c.saavncdn.com/artists/Sidhu_Moose_Wala_004_20250617183705_500x500.jpg',
+  'sidhu moosewala': 'https://c.saavncdn.com/artists/Sidhu_Moose_Wala_004_20250617183705_500x500.jpg',
+  'sonu nigam': 'https://c.saavncdn.com/artists/Sonu_Nigam_003_20260813182013_500x500.jpg',
+  'diljit dosanjh': 'https://c.saavncdn.com/artists/Diljit_Dosanjh_005_20231025073054_500x500.jpg',
+  'armaan malik': 'https://c.saavncdn.com/artists/Armaan_Malik_006_20260813132832_500x500.jpg',
+  'jubin nautiyal': 'https://c.saavncdn.com/artists/Jubin_Nautiyal_003_20231130204020_500x500.jpg',
+  'neha kakkar': 'https://c.saavncdn.com/artists/Neha_Kakkar_007_20241212115832_500x500.jpg',
+  'shreya ghoshal': 'https://c.saavncdn.com/artists/Shreya_Ghoshal_007_20241101074144_500x500.jpg',
+  'badshah': 'https://c.saavncdn.com/artists/Badshah_006_20241118064015_500x500.jpg',
+  'karan aujla': 'https://c.saavncdn.com/artists/Karan_Aujla_005_20260925061936_500x500.jpg',
+  'alka yagnik': 'https://c.saavncdn.com/artists/Alka_Yagnik_002_20220314192930_500x500.jpg',
+  'alaka yagnik': 'https://c.saavncdn.com/artists/Alka_Yagnik_002_20220314192930_500x500.jpg',
+  'atif aslam': 'https://cdn-images.dzcdn.net/images/artist/0ea90444148fff9c11d77f06a344724e/1000x1000-000000-80-0-0.jpg',
+  'shubh': 'https://c.saavncdn.com/artists/Shubh_000_20220921112507_500x500.jpg',
+  'ap dhillon': 'https://c.saavncdn.com/artists/AP_Dhillon_004_20251023102150_500x500.jpg',
+  'anuv jain': 'https://c.saavncdn.com/artists/Anuv_Jain_001_20231206073013_500x500.jpg',
+  'kk': 'https://c.saavncdn.com/artists/KK_500x500.jpg',
+  'kumar sanu': 'https://c.saavncdn.com/artists/Kumar_Sanu_500x500.jpg',
+  'udit narayan': 'https://c.saavncdn.com/artists/Udit_Narayan_004_20241029065120_500x500.jpg',
+  'b praak': 'https://c.saavncdn.com/artists/B_Praak_001_20191118112005_500x500.jpg',
+  'vishal mishra': 'https://c.saavncdn.com/artists/Vishal_Mishra_005_20251120085316_500x500.jpg',
+  'darshan raval': 'https://c.saavncdn.com/artists/Darshan_Raval_006_20250807060352_500x500.jpg',
+  'sunidhi chauhan': 'https://c.saavncdn.com/artists/Sunidhi_Chauhan_005_20250515061617_500x500.jpg',
+  'rahat fateh ali khan': 'https://cdn-images.dzcdn.net/images/artist/8263c6e6e75baf8387ad258459021f78/1000x1000-000000-80-0-0.jpg',
+  'king': 'https://c.saavncdn.com/artists/King_004_20240819092014_500x500.jpg',
+  'talha anjum': 'https://cdn-images.dzcdn.net/images/artist/380e0c7629f94b9c75b7745a8990073a/1000x1000-000000-80-0-0.jpg',
+  'mohit chauhan': 'https://c.saavncdn.com/artists/Mohit_Chauhan_500x500.jpg',
+  'pritam': 'https://c.saavncdn.com/artists/Pritam_Chakraborty-20170711073326_500x500.jpg',
+};
+
+export async function fetchOfficialArtistPoster(artistName: string): Promise<string | undefined> {
+  const clean = artistName.trim().toLowerCase();
+  if (!clean) return undefined;
+
+  if (CURATED_ARTIST_POSTERS[clean]) {
+    return CURATED_ARTIST_POSTERS[clean];
+  }
+  const hit = artistPosterCache.get(clean);
+  if (hit) return hit;
+
+  try {
+    // 1. Try JioSaavn Artist Directory first for official Indian/South Asian artist portraits
+    const saavnRes = await fetch(
+      `https://www.jiosaavn.com/api.php?__call=search.getArtistResults&_format=json&_marker=0&api_version=4&ctx=web6dot0&n=5&p=1&q=${encodeURIComponent(
+        artistName.trim()
+      )}`,
+      {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(2200),
+      }
+    );
+    if (saavnRes.ok) {
+      const data = (await saavnRes.json()) as {
+        results?: Array<{ name?: string; image?: string }>;
+      };
+      const items = data.results || [];
+      const exact = items.find(
+        (r) =>
+          r.image &&
+          !r.image.includes('artist-default') &&
+          r.image.includes('/artists/') &&
+          (r.name || '').trim().toLowerCase() === clean
+      );
+      const best =
+        exact ||
+        items.find(
+          (r) =>
+            r.image &&
+            !r.image.includes('artist-default') &&
+            r.image.includes('/artists/') &&
+            (r.name || '').toLowerCase().includes(clean)
+        );
+      if (best?.image) {
+        const hiRes = best.image.replace(/_\d+x\d+\./, '_500x500.');
+        artistPosterCache.set(clean, hiRes);
+        return hiRes;
+      }
+    }
+  } catch {
+    // fallback to Deezer below
+  }
+
+  try {
+    // 2. Fallback to Deezer artist portrait API (1000x1000 studio artist portraits)
+    const dzRes = await fetch(
+      `https://api.deezer.com/search/artist?q=${encodeURIComponent(artistName.trim())}`,
+      { signal: AbortSignal.timeout(2200) }
+    );
+    if (dzRes.ok) {
+      const data = (await dzRes.json()) as {
+        data?: Array<{ name?: string; picture_xl?: string; picture_big?: string }>;
+      };
+      const first = (data.data || []).find(
+        (a) =>
+          (a.picture_xl || a.picture_big) &&
+          !(a.picture_xl || '').includes('/artist//') &&
+          (a.name || '').toLowerCase().includes(clean)
+      );
+      const pic = first?.picture_xl || first?.picture_big;
+      if (pic) {
+        artistPosterCache.set(clean, pic);
+        return pic;
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return undefined;
+}
+

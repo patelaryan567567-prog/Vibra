@@ -521,7 +521,7 @@ export function PersistentPlayer({ onAddToPlaylist }: PersistentPlayerProps) {
                   {drawerTab === 'queue'
                     ? `Up Next (${queue.length})`
                     : drawerTab === 'lyrics'
-                      ? 'Synced Lyrics'
+                      ? 'Lyrics'
                       : 'Related Tracks'}
                 </span>
 
@@ -579,9 +579,14 @@ export function PersistentPlayer({ onAddToPlaylist }: PersistentPlayerProps) {
               >
                 {drawerTab === 'lyrics' && currentTrack ? (
                   <LyricsPanel
+                    key={currentTrack.id}
                     title={currentTrack.title}
                     artist={currentTrack.artist}
-                    durationSeconds={effectiveDuration}
+                    durationSeconds={Math.round(
+                      currentTrack.durationSeconds ||
+                        parseDurationLabel(currentTrack.duration) ||
+                        effectiveDuration
+                    )}
                     currentTime={currentTime}
                     onSeekTo={seekTo}
                     accentHex={ambient.hex}

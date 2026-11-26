@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Globe, Play, RefreshCw, Sparkles } from 'lucide-react';
+import { Globe, Mic2, Play, RefreshCw, Sparkles } from 'lucide-react';
 import { ApiNoticeBanner } from '../components/ApiNoticeBanner';
+import { PopularSingersSection } from '../components/PopularSingersSection';
 import { TrackCard, TrackCardSkeleton } from '../components/TrackCard';
 import {
   DISCOVERY_CATEGORIES,
@@ -8,6 +9,7 @@ import {
   INDIA_LANGUAGE_OPTIONS,
   REGION_OPTIONS,
 } from '../constants/categories';
+import { useArtistNavigation } from '../context/ArtistNavigationContext';
 import { useLibrary } from '../context/LibraryContext';
 import { usePlayer } from '../context/PlayerContext';
 import { ApiError, fetchCategoryTracks, prewarmTrackBatch } from '../services/api';
@@ -36,6 +38,7 @@ const INITIAL_CAT_STATE: Record<CategoryId, CategoryState> = {
 export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
   const { recentlyPlayed } = useLibrary();
   const { playTrack } = usePlayer();
+  const { openArtistPage } = useArtistNavigation();
 
   const [region, setRegion] = useState<string>('IN');
   const [indiaLang, setIndiaLang] = useState<IndiaLanguageFilter>('all');
@@ -189,7 +192,7 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
           <div className="relative z-10 p-5 sm:p-8 max-w-2xl space-y-3 sm:space-y-4">
             <p className="text-xs font-medium text-[#7A90FF]">VIBRA Discovery</p>
             <h2 className="text-lg sm:text-2xl font-bold text-white leading-snug text-balance">
-              Stream trending hits, high-energy mixes, or ask Vibra AI for your exact mood.
+              Stream trending hits, explore complete singer discographies by mood, or ask Vibra AI.
             </h2>
             <div className="flex flex-wrap items-center gap-2.5 sm:gap-3 pt-1">
               <button
@@ -206,6 +209,14 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
               </button>
               <button
                 type="button"
+                onClick={() => openArtistPage('Arijit Singh')}
+                className="h-10 sm:h-11 px-4 sm:px-5 rounded-xl bg-white/10 hover:bg-white/15 backdrop-blur-md border border-white/15 text-white text-xs sm:text-sm font-semibold inline-flex items-center gap-2 whitespace-nowrap transition-colors"
+              >
+                <Mic2 className="w-4 h-4 text-[#7A90FF]" />
+                <span>Popular Singers Hub</span>
+              </button>
+              <button
+                type="button"
                 onClick={() => onNavigate('explore')}
                 className="h-10 sm:h-11 px-4 sm:px-5 rounded-xl bg-white/10 hover:bg-white/15 backdrop-blur-md border border-white/15 text-white text-xs sm:text-sm font-medium inline-flex items-center gap-2 whitespace-nowrap transition-colors"
               >
@@ -216,6 +227,9 @@ export function HomePage({ onAddToPlaylist, onNavigate }: HomePageProps) {
           </div>
         </div>
       </section>
+
+      {/* Popular Singers & Categorized Artist Catalogs (1. Arijit Singh, 2. Yo Yo Honey Singh, 3. Sidhu Moose Wala ... 12. Alka Yagnik & 16+ More) */}
+      <PopularSingersSection />
 
       {/* Missing API Key Honest Banner */}
       {anyMissingYoutubeKey && (

@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Play, RefreshCw } from 'lucide-react';
 import { AiDiscoveryPanel } from '../components/AiDiscoveryPanel';
 import { ApiNoticeBanner } from '../components/ApiNoticeBanner';
+import { PopularSingersSection } from '../components/PopularSingersSection';
 import { TrackCard, TrackCardSkeleton } from '../components/TrackCard';
 import { DISCOVERY_CATEGORIES } from '../constants/categories';
 import { usePlayer } from '../context/PlayerContext';
@@ -57,6 +58,9 @@ export function ExplorePage({ onAddToPlaylist, onRunSearchQuery }: ExplorePagePr
         onAddToPlaylist={onAddToPlaylist}
         onRunSearchQuery={onRunSearchQuery}
       />
+
+      {/* All 28 Popular Singers Directory */}
+      <PopularSingersSection defaultShowAll />
 
       {/* Four Mood Worlds */}
       <section className="space-y-4">

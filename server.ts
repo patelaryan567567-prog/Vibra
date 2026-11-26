@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzip } from 'node:zlib';
 import {
+  getArtistCategorySongs,
   getArtistProfile,
   getCategoryTracks,
   getRelatedTracks,
@@ -355,8 +356,8 @@ async function startServer() {
         res.json({ tracks: [] });
         return;
       }
-      if (!YOUTUBE_VIDEO_ID_RE.test(videoId)) {
-        res.status(400).json({ error: 'INVALID_VIDEO_ID', message: 'Invalid YouTube video ID.' });
+      if (!AUDIO_STREAM_ID_RE.test(videoId)) {
+        res.status(400).json({ error: 'INVALID_VIDEO_ID', message: 'Invalid track ID.' });
         return;
       }
 
@@ -366,8 +367,8 @@ async function startServer() {
       const excludeIds = rawExclude
         .split(',')
         .map((id) => id.trim())
-        .filter((id) => YOUTUBE_VIDEO_ID_RE.test(id))
-        .slice(0, 50);
+        .filter((id) => AUDIO_STREAM_ID_RE.test(id))
+        .slice(0, 120);
 
       const tracks = await getRelatedTracks(videoId, title, artist, excludeIds);
       res.json({ tracks });
@@ -405,6 +406,27 @@ async function startServer() {
       res.status(500).json({
         error: 'INTERNAL_ERROR',
         message: err instanceof Error ? err.message : 'Failed to load artist profile.',
+      });
+    }
+  });
+
+  // Paginated Artist Songs by Category endpoint (all, trending, romantic, sad, chill, energetic, classics, videos)
+  app.get('/api/youtube/artist/songs', async (req, res) => {
+    try {
+      const artist = typeof req.query.artist === 'string' ? req.query.artist.trim().slice(0, 100) : '';
+      const category = typeof req.query.category === 'string' ? req.query.category.trim().slice(0, 32) : 'all';
+      const pageRaw = Number(req.query.page);
+      const page = Number.isFinite(pageRaw) && pageRaw >= 1 ? Math.min(Math.floor(pageRaw), 10) : 1;
+      if (!artist) {
+        res.status(400).json({ error: 'MISSING_ARTIST', message: 'Artist name is required.' });
+        return;
+      }
+      const result = await getArtistCategorySongs({ artistName: artist, category, page });
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({
+        error: 'INTERNAL_ERROR',
+        message: err instanceof Error ? err.message : 'Failed to load artist songs.',
       });
     }
   });
