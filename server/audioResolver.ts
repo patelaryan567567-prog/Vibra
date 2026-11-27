@@ -1374,161 +1374,368 @@ export async function prewarmAudioStreamsBatch(
   return Object.fromEntries(settled);
 }
 
+const saavnArtistIdCache = new Map<string, string>();
+
+async function resolveSaavnArtistId(cleanArtist: string): Promise<string | null> {
+  const key = cleanArtist.trim().toLowerCase();
+  if (!key) return null;
+  const cached = saavnArtistIdCache.get(key);
+  if (cached) return cached;
+
+  try {
+    const res = await fetch(
+      `https://www.jiosaavn.com/api.php?__call=search.getArtistResults&_format=json&_marker=0&api_version=4&ctx=web6dot0&n=5&p=1&q=${encodeURIComponent(
+        cleanArtist
+      )}`,
+      {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(2500),
+      }
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      results?: Array<{ id?: string; name?: string }>;
+    };
+    const list = data.results || [];
+    const exact =
+      list.find((r) => r.id && (r.name || '').trim().toLowerCase() === key) ||
+      list.find((r) => r.id && (r.name || '').toLowerCase().includes(key)) ||
+      list[0];
+    if (exact?.id) {
+      saavnArtistIdCache.set(key, String(exact.id));
+      return String(exact.id);
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+const CATEGORY_ROTATION_SUFFIXES: Record<string, string[]> = {
+  romantic: [
+    'romantic love songs',
+    'ishq dil mohabbat',
+    'pyaar romantic hits',
+    'love melody songs',
+    'dil jaan romantic',
+    'aashiqui love songs',
+    'duet romantic songs',
+    'best love songs',
+  ],
+  sad: [
+    'sad heartbreak songs',
+    'emotional dard songs',
+    'bewafa judai sad',
+    'tanhai broken heart',
+    'rona tears sad song',
+    'alone late night sad',
+    'alvida emotional songs',
+    'painful heartbreak hits',
+  ],
+  chill: [
+    'unplugged acoustic chill',
+    'sufi melody songs',
+    'lofi acoustic version',
+    'peaceful soothing songs',
+    'travel breeze chill',
+    'mtv unplugged coke studio',
+    'soft melody songs',
+    'indie acoustic hits',
+  ],
+  energetic: [
+    'party dance hits',
+    'upbeat club banger',
+    'dance number remix',
+    'bhangra party beat',
+    'high energy workout',
+    'wedding dance songs',
+    'club mix upbeat',
+    'fast beat hit songs',
+  ],
+  classics: [
+    'evergreen classic hits',
+    'best 90s old songs',
+    '2000s golden hits',
+    'retro evergreen songs',
+    'timeless classic melody',
+    'old is gold hits',
+    'superhit classic songs',
+    'vintage golden songs',
+  ],
+  trending: [
+    'top hits popular',
+    'latest superhit songs',
+    'chartbuster viral hits',
+    'most popular songs',
+    'new trending songs',
+    'biggest blockbusters',
+    'best hit songs',
+    'top 50 songs',
+  ],
+};
+
+const CATEGORY_ARTIST_PAGE_OFFSET: Record<string, number> = {
+  all: 0,
+  trending: 0,
+  romantic: 1,
+  sad: 2,
+  chill: 3,
+  energetic: 4,
+  classics: 5,
+};
+
+export function normalizeArtistCatalogTitleKey(title: string): string {
+  return decodeEntities(title || '')
+    .toLowerCase()
+    .replace(/\(.*?\)|\[.*?\]/g, ' ')
+    .replace(/\b(from|feat|ft|official|video|audio|full|song|lyrical|hd|remix|unplugged|lofi)\b/g, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export async function fetchSaavnArtistCatalog(
   artistName: string,
-  options?: { category?: string; page?: number; limit?: number }
+  options?: {
+    category?: string;
+    page?: number;
+    limit?: number;
+    excludeIds?: Set<string> | string[];
+    excludeTitles?: Set<string> | string[];
+  }
 ): Promise<MultiSourceTrackResult[]> {
   const cleanArtist = artistName.trim();
   if (!cleanArtist) return [];
 
   const category = (options?.category || 'all').toLowerCase();
   const page = Math.max(1, options?.page ?? 1);
-  const limit = Math.min(Math.max(options?.limit ?? 48, 8), 80);
+  const limit = Math.min(Math.max(options?.limit ?? 20, 6), 60);
 
   const artistTokens = tokenizeMeaningful(cleanArtist);
 
-  const fetchSaavnPage = async (q: string, p: number, count = 40): Promise<Array<SaavnSearchResultItem & { image?: string }>> => {
+  const seenIds = new Set<string>();
+  if (options?.excludeIds) {
+    for (const id of options.excludeIds) {
+      const trimmed = String(id).trim();
+      if (!trimmed) continue;
+      seenIds.add(trimmed);
+      if (trimmed.startsWith('src_js_')) {
+        seenIds.add(trimmed.slice(7));
+      } else {
+        seenIds.add(`src_js_${trimmed}`);
+      }
+    }
+  }
+
+  const seenTitleKeys = new Set<string>();
+  if (options?.excludeTitles) {
+    for (const t of options.excludeTitles) {
+      const k = normalizeArtistCatalogTitleKey(String(t));
+      if (k) seenTitleKeys.add(k);
+    }
+  }
+
+  type RawSaavnItem = SaavnSearchResultItem & {
+    image?: string;
+    subtitle?: string;
+    more_info?: SaavnSearchResultItem['more_info'] & {
+      artistMap?: {
+        primary_artists?: Array<{ name?: string }>;
+        artists?: Array<{ name?: string }>;
+      };
+    };
+  };
+
+  const fetchSaavnSearchPage = async (
+    q: string,
+    p: number,
+    count = 35
+  ): Promise<RawSaavnItem[]> => {
     try {
       const url = `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&cc=in&p=${p}&n=${count}&q=${encodeURIComponent(
         q
       )}`;
       const res = await fetch(url, {
         headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(3500),
+        signal: AbortSignal.timeout(3200),
       });
       if (!res.ok) return [];
-      const data = (await res.json()) as {
-        results?: Array<SaavnSearchResultItem & { image?: string }>;
-      };
+      const data = (await res.json()) as { results?: RawSaavnItem[] };
       return data.results ?? [];
     } catch {
       return [];
     }
   };
 
-  let queriesToRun: Array<{ q: string; p: number }> = [];
-  if (category === 'all' && page === 1) {
-    queriesToRun = [
-      { q: cleanArtist, p: 1 },
-      { q: cleanArtist, p: 2 },
-      { q: `${cleanArtist} romantic songs`, p: 1 },
-      { q: `${cleanArtist} sad songs`, p: 1 },
-    ];
-  } else if (category === 'all') {
-    queriesToRun = [
-      { q: cleanArtist, p: page * 2 - 1 },
-      { q: cleanArtist, p: page * 2 },
-    ];
-  } else if (category === 'romantic') {
-    queriesToRun = [
-      { q: `${cleanArtist} romantic love songs`, p: page },
-      { q: `${cleanArtist} ishq dil`, p: page },
-    ];
-  } else if (category === 'sad') {
-    queriesToRun = [
-      { q: `${cleanArtist} sad heartbreak songs`, p: page },
-      { q: `${cleanArtist} emotional dard`, p: page },
-    ];
-  } else if (category === 'chill') {
-    queriesToRun = [
-      { q: `${cleanArtist} unplugged acoustic chill`, p: page },
-      { q: `${cleanArtist} sufi melody`, p: page },
-    ];
-  } else if (category === 'energetic') {
-    queriesToRun = [
-      { q: `${cleanArtist} party dance hits`, p: page },
-      { q: `${cleanArtist} upbeat beat`, p: page },
-    ];
-  } else if (category === 'classics') {
-    queriesToRun = [
-      { q: `${cleanArtist} evergreen classic hits`, p: page },
-      { q: `${cleanArtist} best 90s old songs`, p: page },
-    ];
-  } else {
-    queriesToRun = [
-      { q: `${cleanArtist} top hits`, p: page },
-      { q: cleanArtist, p: page },
-    ];
-  }
+  const fetchArtistDiscographyPage = async (
+    artistId: string,
+    pageZeroIndexed: number,
+    sortCat: 'popularity' | 'latest' | 'alphabetical' = 'popularity',
+    sortOrder: 'desc' | 'asc' = 'desc'
+  ): Promise<RawSaavnItem[]> => {
+    try {
+      const url = `https://www.jiosaavn.com/api.php?__call=artist.getArtistPageDetails&_format=json&_marker=0&api_version=4&ctx=web6dot0&artistId=${encodeURIComponent(
+        artistId
+      )}&n_song=50&page=${Math.max(0, pageZeroIndexed)}&sort_order=${sortOrder}&category=${sortCat}`;
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(3200),
+      });
+      if (!res.ok) return [];
+      const data = (await res.json()) as {
+        topSongs?: { songs?: RawSaavnItem[] } | RawSaavnItem[];
+      };
+      if (Array.isArray(data.topSongs)) return data.topSongs;
+      return data.topSongs?.songs ?? [];
+    } catch {
+      return [];
+    }
+  };
 
-  const batches = await Promise.all(queriesToRun.map(({ q, p }) => fetchSaavnPage(q, p, 40)));
-  const rawItems: Array<SaavnSearchResultItem & { image?: string }> = [];
-  for (const batch of batches) {
+  const artistId = await resolveSaavnArtistId(cleanArtist);
+
+  // Build search queries that rotate across page 1, 2, 3, 4... so every page fetches different queries & pages
+  const suffixes =
+    CATEGORY_ROTATION_SUFFIXES[category] || CATEGORY_ROTATION_SUFFIXES.trending;
+  const suffixA = suffixes[(page * 2 - 2) % suffixes.length];
+  const suffixB = suffixes[(page * 2 - 1) % suffixes.length];
+  const searchPageNum = Math.floor((page - 1) / 2) + 1;
+
+  const queriesToRun: Array<{ q: string; p: number }> =
+    category === 'all' && page === 1
+      ? [
+          { q: cleanArtist, p: 1 },
+          { q: `${cleanArtist} romantic sad chill party songs`, p: 1 },
+        ]
+      : [
+          { q: `${cleanArtist} ${suffixA}`, p: searchPageNum },
+          { q: `${cleanArtist} ${suffixB}`, p: searchPageNum },
+          { q: cleanArtist, p: page + (CATEGORY_ARTIST_PAGE_OFFSET[category] || 0) },
+        ];
+
+  const catOffset = CATEGORY_ARTIST_PAGE_OFFSET[category] ?? 0;
+  const discogPageA = (page - 1) * 2 + catOffset;
+  const discogPageB = discogPageA + 1;
+  const sortModes: Array<'popularity' | 'latest' | 'alphabetical'> = [
+    'popularity',
+    'latest',
+    'alphabetical',
+  ];
+  const activeSort = sortModes[(page - 1) % sortModes.length];
+
+  const [searchBatches, discogBatchA, discogBatchB] = await Promise.all([
+    Promise.all(queriesToRun.map(({ q, p }) => fetchSaavnSearchPage(q, p, 35))),
+    artistId ? fetchArtistDiscographyPage(artistId, discogPageA, 'popularity', 'desc') : Promise.resolve([]),
+    artistId ? fetchArtistDiscographyPage(artistId, discogPageB, activeSort, page % 2 === 0 ? 'asc' : 'desc') : Promise.resolve([]),
+  ]);
+
+  const rawItems: RawSaavnItem[] = [];
+  for (const batch of searchBatches) {
     rawItems.push(...batch);
   }
+  rawItems.push(...discogBatchA, ...discogBatchB);
 
-  const seenIds = new Set<string>();
-  const seenTitleKeys = new Set<string>();
   const results: MultiSourceTrackResult[] = [];
 
-  for (const item of rawItems) {
-    if (!item.id) continue;
-    const cleanId = String(item.id).replace(/[^a-zA-Z0-9_-]/g, '');
-    if (!cleanId || seenIds.has(cleanId)) continue;
+  const appendValidItems = (items: RawSaavnItem[]) => {
+    for (const item of items) {
+      if (results.length >= limit) break;
+      if (!item?.id) continue;
+      const cleanId = String(item.id).replace(/[^a-zA-Z0-9_-]/g, '');
+      const trackId = `src_js_${cleanId}`;
+      if (!cleanId || seenIds.has(cleanId) || seenIds.has(trackId)) continue;
 
-    const title = decodeEntities(item.song || item.title || '').trim();
-    if (!title || HARD_JUNK_RE.test(title)) continue;
+      const title = decodeEntities(item.song || item.title || '').trim();
+      if (!title || HARD_JUNK_RE.test(title)) continue;
 
-    const artistsStr = decodeEntities(
-      [item.primary_artists, item.singers, item.music].filter(Boolean).join(', ')
-    ).trim();
-    const combinedLower = `${artistsStr} ${title}`.toLowerCase();
+      const mapArtists = [
+        ...(item.more_info?.artistMap?.primary_artists?.map((a) => a.name) || []),
+        ...(item.more_info?.artistMap?.artists?.map((a) => a.name) || []),
+      ].filter(Boolean);
 
-    // Verify artist match so unrelated songs never pollute an artist's discography
-    const matchedTokens = artistTokens.filter((tok) => combinedLower.includes(tok));
-    if (artistTokens.length > 0 && matchedTokens.length === 0) continue;
-    if (artistTokens.length >= 2 && matchedTokens.length < Math.min(2, artistTokens.length)) continue;
+      const artistsStr = decodeEntities(
+        [item.primary_artists, item.singers, item.music, ...mapArtists, item.subtitle]
+          .filter(Boolean)
+          .join(', ')
+      ).trim();
+      const combinedLower = `${artistsStr} ${title}`.toLowerCase();
 
-    const dur = Number(item.duration || item.more_info?.duration || 0);
-    if (dur > 0 && dur < 65) continue;
+      // Verify artist match so unrelated songs never pollute an artist's discography
+      const matchedTokens = artistTokens.filter((tok) => combinedLower.includes(tok));
+      if (artistTokens.length > 0 && matchedTokens.length === 0) continue;
+      if (artistTokens.length >= 2 && matchedTokens.length < Math.min(2, artistTokens.length)) {
+        continue;
+      }
 
-    const titleKey = title
-      .toLowerCase()
-      .replace(/\(.*?\)|\[.*?\]/g, ' ')
-      .replace(/[^a-z0-9\s]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-    if (titleKey && seenTitleKeys.has(titleKey)) continue;
+      const dur = Number(item.duration || item.more_info?.duration || 0);
+      if (dur > 0 && dur < 65) continue;
 
-    seenIds.add(cleanId);
-    if (titleKey) seenTitleKeys.add(titleKey);
+      const titleKey = normalizeArtistCatalogTitleKey(title);
+      if (titleKey && seenTitleKeys.has(titleKey)) continue;
 
-    const trackId = `src_js_${cleanId}`;
-    const encUrl = item.encrypted_media_url || item.more_info?.encrypted_media_url || '';
-    const thumb = (item.image || '').replace('150x150', '500x500').replace('http://', 'https://');
-    const displayArtist = artistsStr ? artistsStr.split(',')[0].trim() || cleanArtist : cleanArtist;
+      seenIds.add(cleanId);
+      seenIds.add(trackId);
+      if (titleKey) seenTitleKeys.add(titleKey);
 
-    const existing = resolvedCache.get(trackId);
-    if (!existing || existing.expiresAt <= Date.now()) {
-      resolvedCache.set(trackId, {
-        result: {
-          mode: 'proxy',
-          provider: 'jiosaavn',
-          streamUrl: `/api/audio/stream?videoId=${encodeURIComponent(trackId)}`,
-          matchedTitle: title,
-          matchedArtist: artistsStr || cleanArtist,
-          durationSeconds: dur || undefined,
-        },
-        saavnEncUrl: encUrl || undefined,
-        saavnSongId: cleanId,
-        upstreamKind: 'direct-url',
-        expiresAt: Date.now() + 60 * 60 * 1000,
+      const encUrl = item.encrypted_media_url || item.more_info?.encrypted_media_url || '';
+      const thumb = (item.image || '')
+        .replace(/_\d+x\d+\./, '_500x500.')
+        .replace(/-\d+x\d+\./, '-500x500.')
+        .replace('150x150', '500x500')
+        .replace('http://', 'https://');
+      const primaryDisplay =
+        decodeEntities(
+          item.primary_artists ||
+            item.more_info?.artistMap?.primary_artists?.[0]?.name ||
+            artistsStr.split(',')[0] ||
+            cleanArtist
+        ).trim() || cleanArtist;
+
+      const existing = resolvedCache.get(trackId);
+      if (!existing || existing.expiresAt <= Date.now()) {
+        resolvedCache.set(trackId, {
+          result: {
+            mode: 'proxy',
+            provider: 'jiosaavn',
+            streamUrl: `/api/audio/stream?videoId=${encodeURIComponent(trackId)}`,
+            matchedTitle: title,
+            matchedArtist: artistsStr || cleanArtist,
+            durationSeconds: dur || undefined,
+          },
+          saavnEncUrl: encUrl || undefined,
+          saavnSongId: cleanId,
+          upstreamKind: 'direct-url',
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        });
+      }
+
+      results.push({
+        id: trackId,
+        title,
+        artist: primaryDisplay,
+        duration: formatDurLabel(dur),
+        durationSeconds: dur,
+        thumbnail: thumb,
+        thumbnailHigh: thumb,
+        provider: 'jiosaavn',
+        sourceLabel: 'JioSaavn 320kbps',
       });
     }
+  };
 
-    results.push({
-      id: trackId,
-      title,
-      artist: displayArtist,
-      duration: formatDurLabel(dur),
-      durationSeconds: dur,
-      thumbnail: thumb,
-      thumbnailHigh: thumb,
-      provider: 'jiosaavn',
-      sourceLabel: 'JioSaavn 320kbps',
-    });
+  appendValidItems(rawItems);
 
-    if (results.length >= limit) break;
+  // If the user has already loaded many songs and we still need more new songs to reach `limit`, probe deeper pages automatically!
+  if (results.length < Math.min(limit, 14) && artistId) {
+    const deepPages = await Promise.all([
+      fetchArtistDiscographyPage(artistId, discogPageB + 1, 'popularity', 'desc'),
+      fetchArtistDiscographyPage(artistId, discogPageB + 2, 'latest', 'desc'),
+      fetchSaavnSearchPage(`${cleanArtist} songs`, page + 3, 40),
+    ]);
+    for (const deepBatch of deepPages) {
+      appendValidItems(deepBatch);
+      if (results.length >= limit) break;
+    }
   }
 
   return results;

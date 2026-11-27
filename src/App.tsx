@@ -624,16 +624,16 @@ function VibraShell() {
       {/* Main Content Shell */}
       <div className="flex-1 md:pl-[76px] lg:pl-56 xl:pl-64 flex flex-col min-w-0">
         {/* Sticky Top Bar */}
-        <header className="sticky top-0 z-30 h-13 md:h-14 lg:h-16 px-3.5 sm:px-6 lg:px-8 bg-[#090A0F]/85 backdrop-blur-xl border-b border-white/[0.06] flex items-center justify-between gap-3 sm:gap-6">
+        <header className="sticky top-0 z-30 h-13 md:h-14 lg:h-16 px-2.5 sm:px-6 lg:px-8 bg-[#090A0F]/85 backdrop-blur-xl border-b border-white/[0.06] flex items-center justify-between gap-1.5 sm:gap-6">
           {/* Mobile Brand Mark */}
           <button
             type="button"
             onClick={handleBrandLogoClick}
             title="VIBRA"
-            className="md:hidden flex items-center gap-2 whitespace-nowrap shrink-0"
+            className="md:hidden flex items-center gap-1.5 sm:gap-2 whitespace-nowrap shrink-0"
           >
             <VibraLogo size="sm" />
-            <span className="font-display text-base font-extrabold tracking-tight text-white">
+            <span className="font-display text-sm sm:text-base font-extrabold tracking-tight text-white">
               VIBRA
             </span>
           </button>
@@ -652,14 +652,14 @@ function VibraShell() {
           </form>
 
           {/* Primary Action */}
-          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+          <div className="flex items-center gap-1 sm:gap-2 shrink-0 min-w-0">
             <button
               type="button"
               onClick={() => setActiveTab('search')}
               aria-label="Open search"
-              className="md:hidden min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-slate-300 hover:text-white hover:bg-white/5"
+              className="md:hidden h-8 w-8 sm:min-h-[44px] sm:min-w-[44px] flex items-center justify-center rounded-lg sm:rounded-xl text-slate-300 hover:text-white hover:bg-white/5 shrink-0"
             >
-              <Search className="w-5 h-5" />
+              <Search className="w-4 h-4 sm:w-5 sm:h-5" />
             </button>
 
             <PWAInstallButton />
@@ -667,22 +667,22 @@ function VibraShell() {
             <button
               type="button"
               onClick={() => openArtistPage(selectedArtist?.name || 'Arijit Singh')}
-              className={`h-9 sm:h-10 px-3 sm:px-3.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
+              className={`h-8 sm:h-10 px-2 sm:px-3.5 rounded-lg sm:rounded-xl border text-[11px] sm:text-xs font-semibold inline-flex items-center gap-1 sm:gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
                 activeTab === 'artist'
                   ? 'bg-[#4F6BFF]/20 border-[#4F6BFF]/50 text-white'
                   : 'bg-[#11131A] hover:bg-[#181B26] border-white/10 text-slate-200 hover:text-white'
               }`}
             >
-              <Mic2 className="w-3.5 h-3.5 text-[#7A90FF]" />
+              <Mic2 className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-[#7A90FF] shrink-0" />
               <span>Singers</span>
             </button>
 
             <button
               type="button"
               onClick={() => setActiveTab('explore')}
-              className="h-9 sm:h-10 px-3 sm:px-4 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-xs font-semibold inline-flex items-center gap-1.5 sm:gap-2 whitespace-nowrap shrink-0 transition-colors"
+              className="h-8 sm:h-10 px-2.5 sm:px-4 rounded-lg sm:rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-[11px] sm:text-xs font-semibold inline-flex items-center gap-1 sm:gap-2 whitespace-nowrap shrink-0 transition-colors"
             >
-              <Sparkles className="w-3.5 h-3.5" />
+              <Sparkles className="w-3 h-3 sm:w-3.5 sm:h-3.5 shrink-0" />
               <span>AI Discovery</span>
             </button>
           </div>

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'vibra-offline-shell-v2';
+const CACHE_NAME = 'vibra-offline-shell-v3';
 const SHELL_ASSETS = [
   '/',
   '/manifest.webmanifest',
@@ -9,82 +9,108 @@ const SHELL_ASSETS = [
   '/apple-touch-icon.png',
 ];
 
-self.addEventListener('install', (event) => {
+self.addEventListener('install', function (event) {
   event.waitUntil(
     caches
       .open(CACHE_NAME)
-      .then((cache) => cache.addAll(SHELL_ASSETS))
-      .catch(() => {})
-      .finally(() => self.skipWaiting())
+      .then(function (cache) {
+        return cache.addAll(SHELL_ASSETS);
+      })
+      .catch(function () {})
+      .then(function () {
+        return self.skipWaiting();
+      })
   );
 });
 
-self.addEventListener('activate', (event) => {
+self.addEventListener('activate', function (event) {
   event.waitUntil(
     Promise.all([
       self.clients.claim(),
       caches
         .keys()
-        .then((keys) =>
-          Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
-        )
-        .catch(() => {}),
-      self.registration
-        .getNotifications({ tag: 'vibra-now-playing' })
-        .then((list) => list.forEach((n) => n.close()))
-        .catch(() => {}),
+        .then(function (keys) {
+          return Promise.all(
+            keys
+              .filter(function (k) {
+                return k !== CACHE_NAME;
+              })
+              .map(function (k) {
+                return caches.delete(k);
+              })
+          );
+        })
+        .catch(function () {}),
+      self.registration && self.registration.getNotifications
+        ? self.registration
+            .getNotifications({ tag: 'vibra-now-playing' })
+            .then(function (list) {
+              list.forEach(function (n) {
+                n.close();
+              });
+            })
+            .catch(function () {})
+        : Promise.resolve(),
     ])
   );
 });
 
-self.addEventListener('fetch', (event) => {
-  const { request } = event;
-  if (request.method !== 'GET') return;
+self.addEventListener('fetch', function (event) {
+  var request = event.request;
+  if (!request || request.method !== 'GET') return;
 
-  const url = new URL(request.url);
+  var url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
 
-  // Never intercept /api/ requests (allows clean HTTP 206 byte-range audio streaming)
-  if (url.pathname.startsWith('/api/')) return;
+  // Never intercept /api/ or /jio-f220b.js requests
+  if (url.pathname.indexOf('/api/') === 0 || url.pathname.indexOf('/jio-f220b.js') === 0) return;
 
-  // Navigation requests: network-first with cached app shell fallback for offline mode
   if (request.mode === 'navigate') {
     event.respondWith(
       fetch(request)
-        .then((res) => {
+        .then(function (res) {
           if (res && res.ok) {
-            const copy = res.clone();
-            void caches.open(CACHE_NAME).then((cache) => cache.put('/', copy)).catch(() => {});
+            var copy = res.clone();
+            caches
+              .open(CACHE_NAME)
+              .then(function (cache) {
+                cache.put('/', copy);
+              })
+              .catch(function () {});
           }
           return res;
         })
-        .catch(async () => {
-          const cached = await caches.match('/');
-          return cached || Response.error();
+        .catch(function () {
+          return caches.match('/').then(function (cached) {
+            return cached || Response.error();
+          });
         })
     );
     return;
   }
 
-  // Static app assets (/assets/*, JS, CSS, SVG, PNG, manifest): network-first in dev or cache-with-revalidate
-  const isAsset =
-    url.pathname.startsWith('/assets/') ||
+  var isAsset =
+    url.pathname.indexOf('/assets/') === 0 ||
     /\.(js|css|svg|png|ico|webmanifest|woff2?)$/i.test(url.pathname);
 
   if (isAsset) {
     event.respondWith(
-      caches.open(CACHE_NAME).then(async (cache) => {
-        const cached = await cache.match(request);
-        const networkPromise = fetch(request)
-          .then((res) => {
-            if (res && res.ok) {
-              void cache.put(request, res.clone());
-            }
-            return res;
-          })
-          .catch(() => cached);
-        return cached || networkPromise;
+      caches.open(CACHE_NAME).then(function (cache) {
+        return cache.match(request).then(function (cached) {
+          var networkPromise = fetch(request)
+            .then(function (res) {
+              if (res && res.ok) {
+                cache.put(request, res.clone());
+              }
+              return res;
+            })
+            .catch(function () {
+              return cached;
+            });
+          return cached || networkPromise;
+        });
       })
     );
   }
 });
+

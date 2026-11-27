@@ -56,7 +56,7 @@ export function PWAInstallButton() {
         type="button"
         onClick={() => void handleInstall()}
         title="Install VIBRA app for smooth background playback"
-        className="h-9 sm:h-10 px-3 rounded-xl bg-white/[0.06] hover:bg-white/[0.12] border border-white/10 text-slate-200 text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
+        className="h-8 sm:h-10 px-2 sm:px-3 rounded-lg sm:rounded-xl bg-white/[0.06] hover:bg-white/[0.12] border border-white/10 text-slate-200 text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
       >
         <Download className="w-3.5 h-3.5 text-[#7A90FF]" />
         <span className="hidden sm:inline">Install App</span>
@@ -71,7 +71,7 @@ export function PWAInstallButton() {
           type="button"
           onClick={() => setShowIOSGuide(true)}
           title="Install VIBRA on Home Screen for background play"
-          className="h-9 px-2.5 rounded-xl bg-white/[0.06] hover:bg-white/[0.12] border border-white/10 text-slate-200 text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
+          className="h-8 sm:h-9 px-2 sm:px-2.5 rounded-lg sm:rounded-xl bg-white/[0.06] hover:bg-white/[0.12] border border-white/10 text-slate-200 text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
         >
           <Download className="w-3.5 h-3.5 text-[#7A90FF]" />
           <span className="hidden sm:inline">Install</span>

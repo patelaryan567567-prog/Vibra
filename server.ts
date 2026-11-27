@@ -411,17 +411,50 @@ async function startServer() {
   });
 
   // Paginated Artist Songs by Category endpoint (all, trending, romantic, sad, chill, energetic, classics, videos)
-  app.get('/api/youtube/artist/songs', async (req, res) => {
+  const handleArtistCategorySongs = async (req: express.Request, res: express.Response) => {
     try {
-      const artist = typeof req.query.artist === 'string' ? req.query.artist.trim().slice(0, 100) : '';
-      const category = typeof req.query.category === 'string' ? req.query.category.trim().slice(0, 32) : 'all';
-      const pageRaw = Number(req.query.page);
-      const page = Number.isFinite(pageRaw) && pageRaw >= 1 ? Math.min(Math.floor(pageRaw), 10) : 1;
+      const rawArtist = req.body?.artist ?? req.query.artist;
+      const rawCategory = req.body?.category ?? req.query.category;
+      const rawPage = req.body?.page ?? req.query.page;
+      const artist = typeof rawArtist === 'string' ? rawArtist.trim().slice(0, 100) : '';
+      const category = typeof rawCategory === 'string' ? rawCategory.trim().slice(0, 32) : 'all';
+      const pageNum = Number(rawPage);
+      const page = Number.isFinite(pageNum) && pageNum >= 1 ? Math.min(Math.floor(pageNum), 35) : 1;
+
       if (!artist) {
         res.status(400).json({ error: 'MISSING_ARTIST', message: 'Artist name is required.' });
         return;
       }
-      const result = await getArtistCategorySongs({ artistName: artist, category, page });
+
+      let excludeIds: string[] = [];
+      if (Array.isArray(req.body?.excludeIds)) {
+        excludeIds = req.body.excludeIds
+          .map((x: unknown) => String(x || '').trim())
+          .filter(Boolean)
+          .slice(0, 600);
+      } else if (typeof req.query.excludeIds === 'string' && req.query.excludeIds) {
+        excludeIds = req.query.excludeIds
+          .split(',')
+          .map((x) => x.trim())
+          .filter(Boolean)
+          .slice(0, 600);
+      }
+
+      let excludeTitles: string[] = [];
+      if (Array.isArray(req.body?.excludeTitles)) {
+        excludeTitles = req.body.excludeTitles
+          .map((x: unknown) => String(x || '').trim().slice(0, 120))
+          .filter(Boolean)
+          .slice(0, 600);
+      }
+
+      const result = await getArtistCategorySongs({
+        artistName: artist,
+        category,
+        page,
+        excludeIds,
+        excludeTitles,
+      });
       res.json(result);
     } catch (err) {
       res.status(500).json({
@@ -429,7 +462,10 @@ async function startServer() {
         message: err instanceof Error ? err.message : 'Failed to load artist songs.',
       });
     }
-  });
+  };
+
+  app.get('/api/youtube/artist/songs', handleArtistCategorySongs);
+  app.post('/api/youtube/artist/songs', handleArtistCategorySongs);
 
   // Synced & Plain Lyrics endpoint (LRCLIB + Lyrics.ovh + Web/Gemini AI)
   app.get('/api/lyrics', async (req, res) => {

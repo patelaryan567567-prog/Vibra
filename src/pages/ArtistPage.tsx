@@ -58,42 +58,49 @@ type ArtistViewTab = 'categorized' | ArtistSongCategory;
 const MOOD_SECTION_ORDER: Array<{
   id: Exclude<ArtistSongCategory, 'all' | 'videos'>;
   title: string;
+  shortName: string;
   subtitle: string;
   accentClass: string;
 }> = [
   {
     id: 'trending',
     title: 'Trending & Signature Hits',
+    shortName: 'Trending',
     subtitle: 'Most streamed chartbusters and iconic tracks',
     accentClass: 'text-amber-300',
   },
   {
     id: 'romantic',
     title: 'Romantic & Love Songs',
+    shortName: 'Romantic',
     subtitle: 'Heartfelt melodies, love ballads, and soulful duets',
     accentClass: 'text-rose-300',
   },
   {
     id: 'sad',
     title: 'Sad & Heartbreak',
+    shortName: 'Sad',
     subtitle: 'Emotional, intense, and late-night heartbreak anthems',
     accentClass: 'text-indigo-300',
   },
   {
     id: 'chill',
     title: 'Chill, Acoustic & Unplugged',
+    shortName: 'Chill',
     subtitle: 'Relaxed vibes, acoustic sessions, and smooth listening',
     accentClass: 'text-emerald-300',
   },
   {
     id: 'energetic',
     title: 'Party, Beats & High Energy',
+    shortName: 'Party',
     subtitle: 'Upbeat dance tracks, Punjabi bangers, and workout anthems',
     accentClass: 'text-orange-300',
   },
   {
     id: 'classics',
     title: 'Evergreen Classics & Golden Hits',
+    shortName: 'Classics',
     subtitle: 'Timeless originals and unforgettable melodies',
     accentClass: 'text-sky-300',
   },
@@ -113,6 +120,7 @@ function normalizeSongKey(title: string): string {
   return title
     .toLowerCase()
     .replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')
+    .replace(/\b(from|feat|ft|official|video|audio|full|song|lyrical|hd|remix|unplugged|lofi)\b/g, ' ')
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
 }
@@ -125,9 +133,9 @@ function mergeUniqueArtistTracks(existing: Track[], incoming: Track[]): Track[] 
   for (const track of [...existing, ...incoming]) {
     if (!track?.id || seenIds.has(track.id)) continue;
     const tKey = normalizeSongKey(track.title);
-    if (tKey.length >= 4 && seenTitles.has(tKey)) continue;
+    if (tKey.length >= 3 && seenTitles.has(tKey)) continue;
     seenIds.add(track.id);
-    if (tKey.length >= 4) seenTitles.add(tKey);
+    if (tKey.length >= 3) seenTitles.add(tKey);
     merged.push(track);
   }
   return merged;
@@ -152,9 +160,14 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
     Partial<Record<ArtistSongCategory, Track[]>>
   >({});
   const [categoryPages, setCategoryPages] = useState<Partial<Record<ArtistSongCategory, number>>>({});
+  const [loadingByCategory, setLoadingByCategory] = useState<
+    Partial<Record<ArtistSongCategory, boolean>>
+  >({});
+  const [hasMoreByCategory, setHasMoreByCategory] = useState<
+    Partial<Record<ArtistSongCategory, boolean>>
+  >({});
+
   const [loading, setLoading] = useState<boolean>(true);
-  const [loadingMore, setLoadingMore] = useState<boolean>(false);
-  const [loadingCategoryTab, setLoadingCategoryTab] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [imgError, setImgError] = useState(false);
 
@@ -173,7 +186,18 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
       setImgError(false);
       setExtraTracks([]);
       setCategorySpecificTracks({});
-      setCategoryPages({ all: 1 });
+      setCategoryPages({});
+      setLoadingByCategory({});
+      setHasMoreByCategory({
+        all: true,
+        trending: true,
+        romantic: true,
+        sad: true,
+        chill: true,
+        energetic: true,
+        classics: true,
+        videos: true,
+      });
       setSongQuery('');
       setExpandedMoodSections({});
 
@@ -210,88 +234,156 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
     return () => controller.abort();
   }, [loadProfile]);
 
-  // When a specific mood category tab is selected, proactively fetch deep category tracks for that singer
+  const allCatalogTracks = useMemo<Track[]>(() => {
+    const base = profile?.topTracks || [];
+    return mergeUniqueArtistTracks(base, extraTracks);
+  }, [profile?.topTracks, extraTracks]);
+
+  const musicVideos = useMemo<Track[]>(() => {
+    const base = profile?.musicVideos || [];
+    const more = categorySpecificTracks.videos || [];
+    return mergeUniqueArtistTracks(base, more);
+  }, [profile?.musicVideos, categorySpecificTracks.videos]);
+
+  const relatedArtists = profile?.relatedArtists || [];
+
+  // Classify initial starter tracks into mood categories and merge per-category loaded tracks
+  const categorizedMap = useMemo(() => {
+    const buckets: Record<Exclude<ArtistSongCategory, 'all' | 'videos'>, Track[]> = {
+      trending: [],
+      romantic: [],
+      sad: [],
+      chill: [],
+      energetic: [],
+      classics: [],
+    };
+
+    const starterTracks = profile?.topTracks || [];
+    starterTracks.forEach((track, idx) => {
+      const cats = classifyArtistTrackCategories(track.title, track.artist, idx);
+      cats.forEach((c) => {
+        if (c !== 'all' && c !== 'videos' && buckets[c]) {
+          buckets[c].push(track);
+        }
+      });
+    });
+
+    (Object.keys(buckets) as Array<Exclude<ArtistSongCategory, 'all' | 'videos'>>).forEach(
+      (catKey) => {
+        const direct = categorySpecificTracks[catKey] || [];
+        if (direct.length > 0) {
+          buckets[catKey] = mergeUniqueArtistTracks(buckets[catKey], direct);
+        }
+      }
+    );
+
+    return buckets;
+  }, [profile?.topTracks, categorySpecificTracks]);
+
+  // Independent per-category Load More handler that sends all already-loaded IDs & titles so every click loads 100% NEW songs
+  const handleLoadMoreForCategory = useCallback(
+    async (targetCategory: ArtistSongCategory) => {
+      if (!isOnline || loadingByCategory[targetCategory]) return;
+
+      const currentPage = categoryPages[targetCategory] || 0;
+      const nextPage = currentPage + 1;
+
+      // Collect every track already loaded on this artist page so the server never returns duplicates!
+      const alreadyLoadedTracks =
+        targetCategory === 'videos'
+          ? musicVideos
+          : mergeUniqueArtistTracks(
+              allCatalogTracks,
+              targetCategory !== 'all' ? categorizedMap[targetCategory] || [] : []
+            );
+
+      const excludeIds = alreadyLoadedTracks.map((t) => t.id);
+      const excludeTitles = alreadyLoadedTracks.map((t) => t.title);
+
+      setLoadingByCategory((prev) => ({ ...prev, [targetCategory]: true }));
+      try {
+        const res = await fetchArtistCategorySongs({
+          artist: resolvedArtistName,
+          category: targetCategory,
+          page: nextPage,
+          excludeIds,
+          excludeTitles,
+        });
+
+        const freshTracks = (res.tracks || []).filter((t) => {
+          const tKey = normalizeSongKey(t.title);
+          return !alreadyLoadedTracks.some(
+            (existing) => existing.id === t.id || (tKey && normalizeSongKey(existing.title) === tKey)
+          );
+        });
+
+        setCategoryPages((prev) => ({
+          ...prev,
+          [targetCategory]: nextPage,
+        }));
+        setHasMoreByCategory((prev) => ({
+          ...prev,
+          [targetCategory]: res.hasMore && freshTracks.length > 0,
+        }));
+
+        if (freshTracks.length > 0) {
+          if (targetCategory !== 'videos') {
+            setExtraTracks((prev) => mergeUniqueArtistTracks(prev, freshTracks));
+          }
+          if (targetCategory !== 'all') {
+            setCategorySpecificTracks((prev) => ({
+              ...prev,
+              [targetCategory]: mergeUniqueArtistTracks(prev[targetCategory] || [], freshTracks),
+            }));
+            // Automatically expand this category section so all newly loaded songs are visible immediately
+            setExpandedMoodSections((prev) => ({
+              ...prev,
+              [targetCategory]: true,
+            }));
+          }
+        }
+      } catch {
+        // Keep existing tracks
+      } finally {
+        setLoadingByCategory((prev) => ({ ...prev, [targetCategory]: false }));
+      }
+    },
+    [
+      allCatalogTracks,
+      categorizedMap,
+      categoryPages,
+      isOnline,
+      loadingByCategory,
+      musicVideos,
+      resolvedArtistName,
+    ]
+  );
+
+  // When a user switches to a specific mood category tab for the first time and it has < 8 starter songs, load page 1 for that category
   useEffect(() => {
     if (
       !isOnline ||
+      loading ||
       activeTab === 'categorized' ||
       activeTab === 'all' ||
       activeTab === 'videos'
     ) {
       return;
     }
-    if (categorySpecificTracks[activeTab] && (categorySpecificTracks[activeTab]?.length || 0) > 0) {
-      return;
+    const alreadyFetchedPage = categoryPages[activeTab] || 0;
+    const currentBucketLen = categorizedMap[activeTab]?.length || 0;
+    if (alreadyFetchedPage === 0 && currentBucketLen < 8 && !loadingByCategory[activeTab]) {
+      void handleLoadMoreForCategory(activeTab);
     }
-
-    const controller = new AbortController();
-    setLoadingCategoryTab(true);
-    fetchArtistCategorySongs({
-      artist: resolvedArtistName,
-      category: activeTab,
-      page: 1,
-      signal: controller.signal,
-    })
-      .then((res) => {
-        if (controller.signal.aborted) return;
-        const fetchedTracks = res.tracks || [];
-        setCategorySpecificTracks((prev) => ({
-          ...prev,
-          [activeTab]: fetchedTracks,
-        }));
-        setCategoryPages((prev) => ({
-          ...prev,
-          [activeTab]: 1,
-        }));
-        setExtraTracks((prev) => mergeUniqueArtistTracks(prev, fetchedTracks));
-      })
-      .catch(() => {
-        // Non-fatal: already have classified tracks from initial catalog
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) {
-          setLoadingCategoryTab(false);
-        }
-      });
-
-    return () => controller.abort();
-  }, [activeTab, categorySpecificTracks, isOnline, resolvedArtistName]);
-
-  const handleLoadMoreSongs = async (targetCategory?: ArtistSongCategory) => {
-    if (!isOnline || loadingMore) return;
-    const cat: ArtistSongCategory =
-      targetCategory ||
-      (activeTab === 'categorized' || activeTab === 'videos' ? 'all' : activeTab);
-    const currentPage = categoryPages[cat] || 1;
-    const nextPage = currentPage + 1;
-
-    setLoadingMore(true);
-    try {
-      const res = await fetchArtistCategorySongs({
-        artist: resolvedArtistName,
-        category: cat,
-        page: nextPage,
-      });
-      const moreTracks = res.tracks || [];
-      setCategoryPages((prev) => ({
-        ...prev,
-        [cat]: nextPage,
-      }));
-      if (moreTracks.length > 0) {
-        setExtraTracks((prev) => mergeUniqueArtistTracks(prev, moreTracks));
-        if (cat !== 'all') {
-          setCategorySpecificTracks((prev) => ({
-            ...prev,
-            [cat]: mergeUniqueArtistTracks(prev[cat] || [], moreTracks),
-          }));
-        }
-      }
-    } catch {
-      // Keep existing tracks
-    } finally {
-      setLoadingMore(false);
-    }
-  };
+  }, [
+    activeTab,
+    categorizedMap,
+    categoryPages,
+    handleLoadMoreForCategory,
+    isOnline,
+    loading,
+    loadingByCategory,
+  ]);
 
   const normName = normalizeArtistKey(resolvedArtistName);
 
@@ -335,47 +427,6 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
     return combined;
   }, [favourites, playlists, normName]);
 
-  const allCatalogTracks = useMemo<Track[]>(() => {
-    const base = profile?.topTracks || [];
-    return mergeUniqueArtistTracks(base, extraTracks);
-  }, [profile?.topTracks, extraTracks]);
-
-  const musicVideos = profile?.musicVideos || [];
-  const relatedArtists = profile?.relatedArtists || [];
-
-  // Classify every track in the artist's catalog into mood categories (Romantic, Sad, Chill, Energetic, Classics, Trending)
-  const categorizedMap = useMemo(() => {
-    const buckets: Record<Exclude<ArtistSongCategory, 'all' | 'videos'>, Track[]> = {
-      trending: [],
-      romantic: [],
-      sad: [],
-      chill: [],
-      energetic: [],
-      classics: [],
-    };
-
-    allCatalogTracks.forEach((track, idx) => {
-      const cats = classifyArtistTrackCategories(track.title, track.artist, idx);
-      cats.forEach((c) => {
-        if (c !== 'all' && c !== 'videos' && buckets[c]) {
-          buckets[c].push(track);
-        }
-      });
-    });
-
-    // Also merge any category-specific fetched tracks directly into their respective bucket
-    (Object.keys(buckets) as Array<Exclude<ArtistSongCategory, 'all' | 'videos'>>).forEach(
-      (catKey) => {
-        const direct = categorySpecificTracks[catKey] || [];
-        if (direct.length > 0) {
-          buckets[catKey] = mergeUniqueArtistTracks(buckets[catKey], direct);
-        }
-      }
-    );
-
-    return buckets;
-  }, [allCatalogTracks, categorySpecificTracks]);
-
   // Filter tracks by in-artist search query
   const filterByQuery = useCallback(
     (tracks: Track[]): Track[] => {
@@ -401,7 +452,7 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
     return filterByQuery(categorizedMap[activeTab] || []);
   }, [activeTab, allCatalogTracks, categorizedMap, filterByQuery, musicVideos]);
 
-  // Always prioritize the singer's official portrait/poster over any YouTube channel avatar (so T-Series/label logos never replace Arijit Singh's photo)
+  // Always prioritize the singer's official portrait/poster over any YouTube channel avatar
   const heroImage =
     featuredMeta?.posterUrl ||
     profile?.avatarUrl ||
@@ -523,12 +574,12 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
               className="min-h-[40px] px-3.5 rounded-xl bg-white/[0.06] hover:bg-white/[0.12] border border-white/10 text-xs font-medium text-slate-200 inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
             >
               <RefreshCw className="w-3.5 h-3.5" />
-              <span>Refresh Catalog</span>
+              <span>Reset Starter Catalog</span>
             </button>
           )}
         </div>
 
-        {/* Instant Horizontal Quick-Switch Bar for All 28 Popular Singers (#1 Arijit Singh to #12 Alka Yagnik & More) */}
+        {/* Instant Horizontal Quick-Switch Bar for All 28 Popular Singers */}
         <div className="rounded-2xl bg-[#11131A] border border-white/[0.07] p-2.5">
           <div className="flex items-center gap-2 overflow-x-auto no-scrollbar">
             <span className="text-[11px] font-semibold text-slate-400 px-2 whitespace-nowrap shrink-0">
@@ -568,7 +619,7 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
           <div className="rounded-2xl bg-[#0D0F17] border border-white/10 p-4 sm:p-5">
             <PopularSingersSection
               title="Switch to Any Popular Singer"
-              subtitle="Click any singer below to load their complete song catalog divided into Sad, Romantic, Chill, Party, and Classics"
+              subtitle="Click any singer below to explore their songs divided into Sad, Romantic, Chill, Party, and Classics with per-category Load More"
               defaultShowAll
               activeArtistName={displayName}
             />
@@ -583,7 +634,6 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
           backgroundImage: `radial-gradient(circle at 18% 25%, ${ambient.glowStrong} 0%, ${ambient.glowSoft} 38%, rgba(17,19,26,0.98) 82%)`,
         }}
       >
-        {/* Subtle Blurred Artist Poster Backdrop */}
         {heroImage && !imgError && (
           <img
             src={heroImage}
@@ -622,7 +672,7 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
               <p className="text-xs font-semibold text-[#7A90FF]">
                 {featuredMeta
                   ? `Featured Singer #${featuredMeta.rank} · ${featuredMeta.primaryLanguage} Music`
-                  : 'Artist & Complete Categorized Discography'}
+                  : 'Artist & Categorized Discography'}
               </p>
               <h1 className="text-2xl sm:text-4xl font-extrabold text-white tracking-tight break-words mt-0.5">
                 {displayName}
@@ -658,6 +708,10 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
               <span className="font-mono-tabular text-orange-300">
                 {categorizedMap.energetic.length} Party
               </span>
+              <span aria-hidden="true" className="text-slate-500">·</span>
+              <span className="font-mono-tabular text-sky-300">
+                {categorizedMap.classics.length} Classics
+              </span>
               {personalArtistStat && (
                 <>
                   <span aria-hidden="true" className="text-slate-500">·</span>
@@ -680,7 +734,7 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
                   >
                     <Play className="w-4 h-4 fill-current" />
                     <span>
-                      Play {activeTab !== 'categorized' && activeTab !== 'all' ? 'Category' : 'All'} (
+                      Play {activeTab !== 'categorized' && activeTab !== 'all' ? 'Category' : 'Loaded'} (
                       {playableQueue.length})
                     </span>
                   </button>
@@ -691,7 +745,7 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
                     className="min-h-[40px] px-4 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 text-white text-xs font-medium inline-flex items-center gap-2 whitespace-nowrap transition-colors"
                   >
                     <Shuffle className="w-4 h-4" />
-                    <span>Shuffle Songs</span>
+                    <span>Shuffle Loaded</span>
                   </button>
                 </>
               )}
@@ -709,22 +763,6 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
                     <span>Non-Stop Artist Radio</span>
                   </button>
                 )}
-
-              {isOnline && (
-                <button
-                  type="button"
-                  onClick={() => void handleLoadMoreSongs('all')}
-                  disabled={loadingMore}
-                  className="min-h-[40px] px-4 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 text-white text-xs font-semibold inline-flex items-center gap-2 whitespace-nowrap transition-colors disabled:opacity-50"
-                >
-                  {loadingMore ? (
-                    <Loader2 className="w-4 h-4 animate-spin text-[#7A90FF]" />
-                  ) : (
-                    <PlusCircle className="w-4 h-4 text-[#7A90FF]" />
-                  )}
-                  <span>Load More Songs</span>
-                </button>
-              )}
 
               {isOnline && downloadableTracks.length > 0 && (
                 <button
@@ -752,7 +790,7 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
                   ) : (
                     <>
                       <Download className="w-4 h-4" />
-                      <span>Download Songs ({Math.min(40, downloadableTracks.length)})</span>
+                      <span>Download Loaded ({Math.min(40, downloadableTracks.length)})</span>
                     </>
                   )}
                 </button>
@@ -821,7 +859,7 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
             })}
           </div>
 
-          {/* Search Within Singer's Songs */}
+          {/* Search Within Singer's Loaded Songs */}
           <div className="relative w-full md:w-64 shrink-0">
             <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
             <input
@@ -870,12 +908,12 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
         </section>
       )}
 
-      {/* Main Content Area: Loading / Error / Divided By Mood Categories / Single Category Full List */}
+      {/* Main Content Area: Loading / Error / Divided By Mood Categories / Single Category Tab */}
       {loading ? (
         <section className="space-y-4">
           <div className="h-5 w-44 rounded bg-white/10 animate-pulse" />
           <div className="space-y-2">
-            {Array.from({ length: 8 }).map((_, i) => (
+            {Array.from({ length: 6 }).map((_, i) => (
               <div
                 key={i}
                 className="h-16 rounded-xl bg-[#11131A] border border-white/[0.06] animate-pulse"
@@ -907,16 +945,15 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
           )}
         </div>
       ) : activeTab === 'categorized' ? (
-        /* DIVIDED BY MOOD CATEGORIES VIEW: Romantic, Sad, Chill, Party, Classics, Trending + Complete All Songs List */
-        <div className="space-y-8">
+        /* DIVIDED BY MOOD CATEGORIES VIEW: Each category loads a starter batch and has its OWN "Load More <Category> Songs" button! */
+        <div className="space-y-7">
           {MOOD_SECTION_ORDER.map((section) => {
             const sectionTracks = filterByQuery(categorizedMap[section.id] || []);
-            if (sectionTracks.length === 0) return null;
-
+            const isCatLoading = Boolean(loadingByCategory[section.id]);
             const isSectionExpanded = Boolean(expandedMoodSections[section.id]);
             const visibleTracks = isSectionExpanded
               ? sectionTracks
-              : sectionTracks.slice(0, 10);
+              : sectionTracks.slice(0, 6);
 
             return (
               <section
@@ -930,7 +967,7 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
                       <h2 className="text-lg sm:text-xl font-bold text-white">
                         {displayName} · {section.title}{' '}
                         <span className="font-mono-tabular text-sm text-slate-400 font-normal">
-                          ({sectionTracks.length})
+                          ({sectionTracks.length} loaded)
                         </span>
                       </h2>
                     </div>
@@ -938,23 +975,27 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => handlePlayAll(sectionTracks)}
-                      className="h-9 px-3.5 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
-                    >
-                      <Play className="w-3.5 h-3.5 fill-current" />
-                      <span>Play {section.id === 'energetic' ? 'Party' : section.id}</span>
-                    </button>
+                    {sectionTracks.length > 0 && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => handlePlayAll(sectionTracks)}
+                          className="h-9 px-3.5 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                        >
+                          <Play className="w-3.5 h-3.5 fill-current" />
+                          <span>Play {section.shortName}</span>
+                        </button>
 
-                    <button
-                      type="button"
-                      onClick={() => handleShuffle(sectionTracks)}
-                      className="h-9 px-3 rounded-xl bg-white/[0.07] hover:bg-white/[0.13] border border-white/10 text-white text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
-                    >
-                      <Shuffle className="w-3.5 h-3.5" />
-                      <span>Shuffle</span>
-                    </button>
+                        <button
+                          type="button"
+                          onClick={() => handleShuffle(sectionTracks)}
+                          className="h-9 px-3 rounded-xl bg-white/[0.07] hover:bg-white/[0.13] border border-white/10 text-white text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                        >
+                          <Shuffle className="w-3.5 h-3.5" />
+                          <span>Shuffle</span>
+                        </button>
+                      </>
+                    )}
 
                     <button
                       type="button"
@@ -962,56 +1003,79 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
                       className="h-9 px-3 rounded-xl bg-white/[0.05] hover:bg-white/[0.11] border border-white/10 text-slate-200 hover:text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
                     >
                       <Compass className="w-3.5 h-3.5 text-[#7A90FF]" />
-                      <span>Open Full Category</span>
+                      <span>Open Tab</span>
                     </button>
                   </div>
                 </div>
 
-                <div className="space-y-2">
-                  {visibleTracks.map((track, idx) => (
-                    <TrackRow
-                      key={`${section.id}_${track.id}`}
-                      track={track}
-                      index={idx}
-                      queueContext={sectionTracks}
-                      onAddToPlaylist={onAddToPlaylist}
-                    />
-                  ))}
-                </div>
-
-                {sectionTracks.length > 10 && (
-                  <div className="pt-1 flex flex-wrap items-center justify-between gap-2">
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setExpandedMoodSections((prev) => ({
-                          ...prev,
-                          [section.id]: !prev[section.id],
-                        }))
-                      }
-                      className="h-9 px-4 rounded-xl bg-white/[0.06] hover:bg-white/[0.12] border border-white/10 text-xs font-semibold text-white inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
-                    >
-                      <span>
-                        {isSectionExpanded
-                          ? 'Show Fewer'
-                          : `Show All ${sectionTracks.length} ${section.title}`}
-                      </span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => setActiveTab(section.id)}
-                      className="text-xs font-semibold text-[#7A90FF] hover:text-white transition-colors whitespace-nowrap"
-                    >
-                      Load even more {section.title.toLowerCase()} →
-                    </button>
+                {visibleTracks.length > 0 ? (
+                  <div className="space-y-2">
+                    {visibleTracks.map((track, idx) => (
+                      <TrackRow
+                        key={`${section.id}_${track.id}`}
+                        track={track}
+                        index={idx}
+                        queueContext={sectionTracks}
+                        onAddToPlaylist={onAddToPlaylist}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-xl bg-[#0D0F16] border border-white/[0.05] px-4 py-5 text-center text-xs text-slate-400">
+                    Click &ldquo;Load More {section.shortName} Songs&rdquo; below to fetch {displayName}&apos;s{' '}
+                    {section.shortName.toLowerCase()} tracks.
                   </div>
                 )}
+
+                {/* Per-Category Expand + Independent "Load More New <Category> Songs" Controls */}
+                <div className="pt-1 flex flex-wrap items-center justify-between gap-2.5 border-t border-white/[0.06]">
+                  <div className="flex items-center gap-2">
+                    {sectionTracks.length > 6 && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setExpandedMoodSections((prev) => ({
+                            ...prev,
+                            [section.id]: !prev[section.id],
+                          }))
+                        }
+                        className="h-9 px-3.5 rounded-xl bg-white/[0.06] hover:bg-white/[0.12] border border-white/10 text-xs font-semibold text-slate-200 hover:text-white inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                      >
+                        <span>
+                          {isSectionExpanded
+                            ? 'Collapse List'
+                            : `Show All ${sectionTracks.length} Loaded`}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+
+                  {isOnline && hasMoreByCategory[section.id] !== false && (
+                    <button
+                      type="button"
+                      onClick={() => void handleLoadMoreForCategory(section.id)}
+                      disabled={isCatLoading}
+                      className="min-h-[38px] px-4 rounded-xl bg-[#4F6BFF]/15 hover:bg-[#4F6BFF]/25 border border-[#4F6BFF]/40 text-xs font-semibold text-white inline-flex items-center gap-2 whitespace-nowrap transition-colors disabled:opacity-50"
+                    >
+                      {isCatLoading ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin text-[#7A90FF]" />
+                          <span>Loading New {section.shortName} Songs...</span>
+                        </>
+                      ) : (
+                        <>
+                          <PlusCircle className="w-3.5 h-3.5 text-[#7A90FF]" />
+                          <span>Load More {section.shortName} Songs (+New)</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                </div>
               </section>
             );
           })}
 
-          {/* Complete A-to-Z All Songs Section at Bottom of Categorized View */}
+          {/* All Songs Combined Section with Independent Load More */}
           {allCatalogTracks.length > 0 && (
             <section className="rounded-2xl bg-[#11131A]/90 border border-white/[0.08] p-4 sm:p-6 space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -1019,11 +1083,11 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
                   <h2 className="text-lg sm:text-xl font-bold text-white flex items-center gap-2">
                     <ListMusic className="w-5 h-5 text-[#7A90FF]" />
                     <span>
-                      All Songs by {displayName} ({filterByQuery(allCatalogTracks).length})
+                      All Loaded Songs by {displayName} ({filterByQuery(allCatalogTracks).length})
                     </span>
                   </h2>
                   <p className="text-xs text-slate-400 mt-0.5">
-                    Complete combined catalog · Use &ldquo;Load More Songs&rdquo; to fetch even more tracks
+                    Every &ldquo;Load More&rdquo; click fetches a fresh batch of unrepeated songs from {displayName}&apos;s 500+ song catalog
                   </p>
                 </div>
 
@@ -1040,23 +1104,26 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
                   {isOnline && (
                     <button
                       type="button"
-                      onClick={() => void handleLoadMoreSongs('all')}
-                      disabled={loadingMore}
+                      onClick={() => void handleLoadMoreForCategory('all')}
+                      disabled={Boolean(loadingByCategory.all)}
                       className="h-9 px-3.5 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap transition-colors disabled:opacity-50"
                     >
-                      {loadingMore ? (
+                      {loadingByCategory.all ? (
                         <Loader2 className="w-3.5 h-3.5 animate-spin text-[#7A90FF]" />
                       ) : (
                         <PlusCircle className="w-3.5 h-3.5 text-[#7A90FF]" />
                       )}
-                      <span>Load More Songs</span>
+                      <span>Load More Songs (+New)</span>
                     </button>
                   )}
                 </div>
               </div>
 
               <div className="space-y-2">
-                {filterByQuery(allCatalogTracks).map((track, idx) => (
+                {(expandedMoodSections.all
+                  ? filterByQuery(allCatalogTracks)
+                  : filterByQuery(allCatalogTracks).slice(0, 12)
+                ).map((track, idx) => (
                   <TrackRow
                     key={`all_${track.id}`}
                     track={track}
@@ -1067,39 +1134,70 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
                 ))}
               </div>
 
-              {isOnline && (
-                <div className="pt-2 flex justify-center">
+              <div className="pt-2 flex flex-wrap items-center justify-between gap-3 border-t border-white/[0.06]">
+                {filterByQuery(allCatalogTracks).length > 12 && (
                   <button
                     type="button"
-                    onClick={() => void handleLoadMoreSongs('all')}
-                    disabled={loadingMore}
-                    className="min-h-[42px] px-6 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-xs font-semibold inline-flex items-center gap-2 whitespace-nowrap transition-colors disabled:opacity-50"
+                    onClick={() =>
+                      setExpandedMoodSections((prev) => ({ ...prev, all: !prev.all }))
+                    }
+                    className="h-10 px-4 rounded-xl bg-white/[0.06] hover:bg-white/[0.12] border border-white/10 text-xs font-semibold text-white inline-flex items-center gap-2 whitespace-nowrap transition-colors"
                   >
-                    {loadingMore ? (
+                    <span>
+                      {expandedMoodSections.all
+                        ? 'Collapse List'
+                        : `View All ${filterByQuery(allCatalogTracks).length} Loaded Songs`}
+                    </span>
+                  </button>
+                )}
+
+                {isOnline && (
+                  <button
+                    type="button"
+                    onClick={() => void handleLoadMoreForCategory('all')}
+                    disabled={Boolean(loadingByCategory.all)}
+                    className="min-h-[42px] px-5 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-xs font-semibold inline-flex items-center gap-2 whitespace-nowrap transition-colors disabled:opacity-50"
+                  >
+                    {loadingByCategory.all ? (
                       <>
                         <Loader2 className="w-4 h-4 animate-spin" />
-                        <span>Fetching more songs by {displayName}...</span>
+                        <span>Loading new songs by {displayName}...</span>
                       </>
                     ) : (
                       <>
                         <PlusCircle className="w-4 h-4" />
-                        <span>Load More {displayName} Songs</span>
+                        <span>Load More {displayName} Songs (+New Batch)</span>
                       </>
                     )}
                   </button>
-                </div>
-              )}
+                )}
+              </div>
             </section>
           )}
         </div>
       ) : activeTab === 'videos' ? (
-        /* Music Videos Grid Tab */
+        /* Music Videos Grid Tab with Load More */
         <section className="space-y-4">
-          <div className="flex items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-lg font-bold text-white flex items-center gap-2">
               <Tv className="w-4 h-4 text-[#7A90FF]" />
               <span>Music Videos ({activeCategoryTracks.length})</span>
             </h2>
+            {isOnline && hasMoreByCategory.videos !== false && (
+              <button
+                type="button"
+                onClick={() => void handleLoadMoreForCategory('videos')}
+                disabled={Boolean(loadingByCategory.videos)}
+                className="h-9 px-3.5 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap transition-colors disabled:opacity-50"
+              >
+                {loadingByCategory.videos ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-[#7A90FF]" />
+                ) : (
+                  <PlusCircle className="w-3.5 h-3.5 text-[#7A90FF]" />
+                )}
+                <span>Load More Videos</span>
+              </button>
+            )}
           </div>
           {activeCategoryTracks.length === 0 ? (
             <div className="rounded-2xl bg-[#11131A] border border-white/[0.07] p-8 text-center text-xs text-slate-400">
@@ -1119,7 +1217,7 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
           )}
         </section>
       ) : (
-        /* Single Selected Category Tab (All Songs, Trending, Romantic, Sad, Chill, Party, Classics) */
+        /* Single Selected Category Tab (All Songs, Trending, Romantic, Sad, Chill, Party, Classics) with Dedicated Load More */
         <section className="space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
@@ -1134,11 +1232,11 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
                 <span>
                   {displayName} ·{' '}
                   {ARTIST_SONG_CATEGORIES.find((c) => c.id === activeTab)?.label || 'Songs'} (
-                  {activeCategoryTracks.length})
+                  {activeCategoryTracks.length} loaded)
                 </span>
               </h2>
               <p className="text-xs text-slate-400 mt-0.5">
-                {ARTIST_SONG_CATEGORIES.find((c) => c.id === activeTab)?.description}
+                {ARTIST_SONG_CATEGORIES.find((c) => c.id === activeTab)?.description} · Click &ldquo;Load More&rdquo; for fresh unrepeated songs
               </p>
             </div>
 
@@ -1167,22 +1265,22 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
               {isOnline && (
                 <button
                   type="button"
-                  onClick={() => void handleLoadMoreSongs(activeTab)}
-                  disabled={loadingMore || loadingCategoryTab}
+                  onClick={() => void handleLoadMoreForCategory(activeTab)}
+                  disabled={Boolean(loadingByCategory[activeTab])}
                   className="h-9 px-3.5 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap transition-colors disabled:opacity-50"
                 >
-                  {loadingMore || loadingCategoryTab ? (
+                  {loadingByCategory[activeTab] ? (
                     <Loader2 className="w-3.5 h-3.5 animate-spin text-[#7A90FF]" />
                   ) : (
                     <PlusCircle className="w-3.5 h-3.5 text-[#7A90FF]" />
                   )}
-                  <span>Load More in Category</span>
+                  <span>Load More (+New Songs)</span>
                 </button>
               )}
             </div>
           </div>
 
-          {loadingCategoryTab && activeCategoryTracks.length === 0 ? (
+          {loadingByCategory[activeTab] && activeCategoryTracks.length === 0 ? (
             <div className="space-y-2">
               {Array.from({ length: 6 }).map((_, i) => (
                 <div
@@ -1218,17 +1316,17 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
           ) : (
             <div className="rounded-2xl bg-[#11131A] border border-white/[0.07] p-8 text-center space-y-3">
               <p className="text-sm font-medium text-white">
-                No songs matched this filter yet
+                Click below to load {displayName}&apos;s songs in this category
               </p>
               {isOnline && (
                 <button
                   type="button"
-                  onClick={() => void handleLoadMoreSongs(activeTab)}
-                  disabled={loadingMore}
+                  onClick={() => void handleLoadMoreForCategory(activeTab)}
+                  disabled={Boolean(loadingByCategory[activeTab])}
                   className="min-h-[40px] px-4 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-xs font-semibold text-white inline-flex items-center gap-1.5"
                 >
                   <PlusCircle className="w-3.5 h-3.5" />
-                  <span>Fetch More Songs from Online Catalog</span>
+                  <span>Load Songs for Category</span>
                 </button>
               )}
             </div>
@@ -1238,19 +1336,23 @@ export function ArtistPage({ artistName, seedTrack, onAddToPlaylist, onBack }: A
             <div className="pt-2 flex justify-center">
               <button
                 type="button"
-                onClick={() => void handleLoadMoreSongs(activeTab)}
-                disabled={loadingMore}
+                onClick={() => void handleLoadMoreForCategory(activeTab)}
+                disabled={Boolean(loadingByCategory[activeTab])}
                 className="min-h-[42px] px-6 rounded-xl bg-[#4F6BFF] hover:bg-[#415CE6] text-white text-xs font-semibold inline-flex items-center gap-2 whitespace-nowrap transition-colors disabled:opacity-50"
               >
-                {loadingMore ? (
+                {loadingByCategory[activeTab] ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Loading more songs...</span>
+                    <span>Loading new unrepeated songs...</span>
                   </>
                 ) : (
                   <>
                     <PlusCircle className="w-4 h-4" />
-                    <span>Load More Songs ({activeCategoryTracks.length} loaded so far)</span>
+                    <span>
+                      Load More{' '}
+                      {ARTIST_SONG_CATEGORIES.find((c) => c.id === activeTab)?.shortLabel || ''}{' '}
+                      Songs ({activeCategoryTracks.length} loaded so far)
+                    </span>
                   </>
                 )}
               </button>

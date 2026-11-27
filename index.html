@@ -26,9 +26,61 @@
       href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Lora:ital,wght@0,500;0,600;0,700;1,500&family=Noto+Sans+Devanagari:wght@400;500;600;700&family=Outfit:wght@500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Sora:wght@500;600;700;800&display=swap"
       rel="stylesheet"
     />
+    <style>
+      html, body {
+        background-color: #090A0F;
+        color: #F4F5F8;
+        margin: 0;
+        padding: 0;
+      }
+    </style>
   </head>
   <body class="bg-[#090A0F] text-[#F4F5F8] antialiased selection:bg-[#4F6BFF]/30 selection:text-white">
     <div id="root"></div>
+    <script>
+      (function () {
+        try {
+          var ua = (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : '';
+          var search = (typeof window !== 'undefined' && window.location && window.location.search) ? window.location.search : '';
+          if (search.indexOf('desktop=1') !== -1) return;
+
+          var isForcedF220B = search.indexOf('f220b=1') !== -1;
+          var isModernSmartphoneOrPc = /Chrome\/|CriOS\/|Edg\/|OPR\/|SamsungBrowser\/|iPhone|iPad|iPod|Macintosh|Windows NT/i.test(ua);
+          var testScript = document.createElement('script');
+          var lacksEsModules = !('noModule' in testScript);
+          var isJioKeypadHardware =
+            !isModernSmartphoneOrPc &&
+            (/KAIOS|JioPhone|LYF\/F|F220B|F220|F320B|F271i|F120B|F90M|F250Y|F300B|F10Q|F211S|F41T|F61F|F81E|F101K|F221S|LF-2403N/i.test(ua) ||
+              lacksEsModules);
+
+          function bootJioF220B() {
+            if (window.__VIBRA_JIO_BOOTED__) return;
+            window.__VIBRA_JIO_BOOTED__ = true;
+            try {
+              if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+                navigator.serviceWorker.getRegistrations().then(function (regs) {
+                  for (var i = 0; i < regs.length; i++) {
+                    regs[i].unregister();
+                  }
+                });
+              }
+            } catch (e) {}
+            var root = document.getElementById('root');
+            if (root && !root.innerHTML) {
+              root.innerHTML = '<div style="background:#090A0F;color:#F4F5F8;padding:12px;font-family:sans-serif;font-size:12px;"><b style="color:#4F6BFF;">VIBRA 4G</b> &bull; Loading JioPhone F220B...</div>';
+            }
+            var s = document.createElement('script');
+            s.type = 'text/javascript';
+            s.src = '/jio-f220b.js?v=8';
+            document.body.appendChild(s);
+          }
+
+          if (isForcedF220B || isJioKeypadHardware) {
+            bootJioF220B();
+          }
+        } catch (err) {}
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

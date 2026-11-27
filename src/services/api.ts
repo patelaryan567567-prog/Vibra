@@ -425,9 +425,9 @@ export async function fetchArtistProfile(params: {
   if (!artist) {
     return { artistName: 'Unknown Artist', topTracks: [], musicVideos: [], relatedArtists: [] };
   }
-  const cacheKey = `artist_v3:${artist.toLowerCase()}:${params.seedVideoId || ''}`;
+  const cacheKey = `artist_v4:${artist.toLowerCase()}:${params.seedVideoId || ''}`;
   const hit = getClientCache<ArtistProfileResponse>(cacheKey);
-  if (hit && hit.topTracks.length >= 25) return hit;
+  if (hit && hit.topTracks.length >= 12) return hit;
 
   const sp = new URLSearchParams({ artist });
   if (params.seedVideoId && !params.seedVideoId.startsWith('dl_') && !params.seedVideoId.startsWith('local_') && !params.seedVideoId.startsWith('src_')) {
@@ -445,28 +445,30 @@ export async function fetchArtistCategorySongs(params: {
   artist: string;
   category: string;
   page?: number;
+  excludeIds?: string[];
+  excludeTitles?: string[];
   signal?: AbortSignal;
 }): Promise<{ tracks: Track[]; hasMore: boolean }> {
   const artist = params.artist.trim();
   if (!artist) return { tracks: [], hasMore: false };
   const category = (params.category || 'all').toLowerCase();
   const page = Math.max(1, params.page ?? 1);
+  const excludeIds = params.excludeIds || [];
+  const excludeTitles = params.excludeTitles || [];
 
-  const cacheKey = `artist_songs_v1:${artist.toLowerCase()}:${category}:${page}`;
-  const hit = getClientCache<{ tracks: Track[]; hasMore: boolean }>(cacheKey);
-  if (hit && hit.tracks.length > 0) return hit;
-
-  const sp = new URLSearchParams({
-    artist,
-    category,
-    page: String(page),
+  const res = await fetch('/api/youtube/artist/songs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      artist,
+      category,
+      page,
+      excludeIds,
+      excludeTitles,
+    }),
+    signal: params.signal,
   });
-  const res = await fetch(`/api/youtube/artist/songs?${sp.toString()}`, { signal: params.signal });
-  const data = await handleResponse<{ tracks: Track[]; hasMore: boolean }>(res);
-  if (data.tracks.length > 0) {
-    setClientCache(cacheKey, data, 30 * 60 * 1000);
-  }
-  return data;
+  return handleResponse<{ tracks: Track[]; hasMore: boolean }>(res);
 }
 
 

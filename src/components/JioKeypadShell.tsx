@@ -86,14 +86,13 @@ export function isJioKeypadDevice(): boolean {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
   const search = window.location.search || '';
   if (search.indexOf('desktop=1') !== -1) return false;
-  if (search.indexOf('jio=1') !== -1 || search.indexOf('kaios=1') !== -1) return true;
-  if (/KAIOS|JioPhone|JioBrowser|LYF\/|F220B|F320B|F271i|F120B|F90M|F250Y|F300B/i.test(ua)) {
-    return true;
+  if (search.indexOf('f220b=1') !== -1) return true;
+  if (/Chrome\/|CriOS\/|Edg\/|OPR\/|SamsungBrowser\/|iPhone|iPad|iPod|Macintosh|Windows NT/i.test(ua)) {
+    return false;
   }
-  // Standard JioPhone 4G / KaiOS screen width is 240px (QVGA 240x320) or landscape 320x240
-  const w = window.innerWidth || document.documentElement.clientWidth || 1024;
-  const h = window.innerHeight || document.documentElement.clientHeight || 768;
-  return w <= 265 || (w <= 330 && h <= 260);
+  return /KAIOS|JioPhone|LYF\/F|F220B|F220|F320B|F271i|F120B|F90M|F250Y|F300B|F10Q|F211S|F41T|F61F|F81E|F101K|F221S|LF-2403N/i.test(
+    ua
+  );
 }
 
 export function JioKeypadShell({ onExitJioMode }: { onExitJioMode?: () => void }) {
@@ -442,56 +441,11 @@ export function JioKeypadShell({ onExitJioMode }: { onExitJioMode?: () => void }
       const tag = activeEl?.tagName?.toLowerCase();
       const isTyping = tag === 'input' || tag === 'textarea';
 
-      // Allow D-Pad Up/Down to leave search input so keypad users aren't trapped in input box
-      if (isTyping && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
-        e.preventDefault();
-        activeEl?.blur();
-      } else if (isTyping) {
+      if (isTyping) {
         return;
       }
 
-      const focusables = Array.from(
-        containerRef.current?.querySelectorAll<HTMLElement>('[data-jio-focus="true"]') ?? []
-      ).filter((el) => !el.hasAttribute('disabled') && el.offsetParent !== null);
-
-      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-        e.preventDefault();
-        if (focusables.length === 0) return;
-        const curIdx = activeEl ? focusables.indexOf(activeEl) : -1;
-        const nextIdx =
-          e.key === 'ArrowDown'
-            ? curIdx < focusables.length - 1
-              ? curIdx + 1
-              : 0
-            : curIdx > 0
-              ? curIdx - 1
-              : focusables.length - 1;
-        const target = focusables[nextIdx];
-        if (target) {
-          target.focus();
-          target.scrollIntoView({ block: 'nearest' });
-        }
-        return;
-      }
-
-      if (e.key === 'ArrowLeft') {
-        if (tab === 'player') {
-          e.preventDefault();
-          seekBy(-10);
-          showNotice('-10s');
-        }
-        return;
-      }
-
-      if (e.key === 'ArrowRight') {
-        if (tab === 'player') {
-          e.preventDefault();
-          seekBy(10);
-          showNotice('+10s');
-        }
-        return;
-      }
-
+      // Let D-Pad arrows, OK (Enter), and Menu/Softkeys work natively with the JioPhone browser cursor and browser menu.
       // JioPhone Hardware Numeric Keypad Shortcuts
       switch (e.key) {
         case '1':
@@ -500,12 +454,12 @@ export function JioKeypadShell({ onExitJioMode }: { onExitJioMode?: () => void }
           break;
         case '2':
           e.preventDefault();
-          setTab('search');
-          window.setTimeout(() => searchInputRef.current?.focus(), 60);
+          window.scrollBy(0, -140);
           break;
         case '3':
           e.preventDefault();
-          setTab('player');
+          setTab('search');
+          window.setTimeout(() => searchInputRef.current?.focus(), 60);
           break;
         case '4':
           e.preventDefault();
@@ -513,11 +467,8 @@ export function JioKeypadShell({ onExitJioMode }: { onExitJioMode?: () => void }
           showNotice('Previous Song');
           break;
         case '5':
-        case ' ':
-          if (tag !== 'button') {
-            e.preventDefault();
-            togglePlay();
-          }
+          e.preventDefault();
+          togglePlay();
           break;
         case '6':
           e.preventDefault();
@@ -531,7 +482,7 @@ export function JioKeypadShell({ onExitJioMode }: { onExitJioMode?: () => void }
           break;
         case '8':
           e.preventDefault();
-          setTab('lyrics');
+          window.scrollBy(0, 140);
           break;
         case '9':
           e.preventDefault();
@@ -540,11 +491,7 @@ export function JioKeypadShell({ onExitJioMode }: { onExitJioMode?: () => void }
           break;
         case '0':
           e.preventDefault();
-          if (currentTrack) {
-            toggleFavourite(currentTrack);
-          } else {
-            setTab('saved');
-          }
+          setTab('home');
           break;
         case '*':
           e.preventDefault();
@@ -554,26 +501,6 @@ export function JioKeypadShell({ onExitJioMode }: { onExitJioMode?: () => void }
           e.preventDefault();
           changeVolume(10);
           break;
-        case 'SoftLeft':
-        case 'F1':
-          e.preventDefault();
-          setTab((prev) =>
-            prev === 'home'
-              ? 'search'
-              : prev === 'search'
-                ? 'player'
-                : prev === 'player'
-                  ? 'lyrics'
-                  : prev === 'lyrics'
-                    ? 'saved'
-                    : 'home'
-          );
-          break;
-        case 'SoftRight':
-        case 'F2':
-          e.preventDefault();
-          togglePlay();
-          break;
         default:
           break;
       }
@@ -581,7 +508,7 @@ export function JioKeypadShell({ onExitJioMode }: { onExitJioMode?: () => void }
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [changeVolume, currentTrack, playNext, playPrev, seekBy, showNotice, tab, toggleFavourite, togglePlay]);
+  }, [changeVolume, currentTrack, isPlaying, playNext, playPrev, seekBy, showNotice, toggleFavourite, togglePlay]);
 
   const activeLyricIndex = useMemo(() => {
     const lines = lyrics?.syncedLines ?? [];

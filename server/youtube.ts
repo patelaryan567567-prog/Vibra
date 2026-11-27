@@ -1899,9 +1899,9 @@ export async function getArtistProfile(
     };
   }
 
-  const cacheKey = `v3::${artistName.toLowerCase()}::${seedVideoId || ''}`;
-  const cached = artistCache.get(cacheKey) || artistCache.get(`v3::${artistName.toLowerCase()}::`);
-  if (cached && cached.topTracks.length >= 25) {
+  const cacheKey = `v4::${artistName.toLowerCase()}::${seedVideoId || ''}`;
+  const cached = artistCache.get(cacheKey) || artistCache.get(`v4::${artistName.toLowerCase()}::`);
+  if (cached && cached.topTracks.length >= 12) {
     return cached;
   }
 
@@ -1912,11 +1912,11 @@ export async function getArtistProfile(
     let channelTitle: string | undefined;
     let uploadsPlaylistId: string | null = null;
 
-    // Fetch deep JioSaavn catalog (60-80 songs) AND verified official artist portrait in parallel
+    // Load a fast, balanced initial starter batch (24 songs) instead of dumping 90 songs at once
     const saavnCatalogPromise = fetchSaavnArtistCatalog(artistName, {
       category: 'all',
       page: 1,
-      limit: 72,
+      limit: 24,
     }).catch(() => []);
     const officialPosterPromise = fetchOfficialArtistPoster(artistName).catch(() => undefined);
 
@@ -2078,17 +2078,17 @@ export async function getArtistProfile(
       (a, b) => scoreTrackQuality(b, artistName) - scoreTrackQuality(a, artistName)
     );
 
-    // Combine YouTube top tracks and JioSaavn studio catalog (up to 90 unique songs!)
-    const topTracks = cleanTrackPool([...ytCleaned.slice(0, 20), ...saavnTracks, ...ytCleaned.slice(20)]).slice(
+    // Initial starter catalog: 24 unique tracks (users load more per category on demand!)
+    const topTracks = cleanTrackPool([...saavnTracks.slice(0, 18), ...ytCleaned.slice(0, 12)]).slice(
       0,
-      90
+      24
     );
 
     const musicVideosRaw =
       searchedVideos.length > 0
         ? searchedVideos
         : ytCleaned.filter((t) => /\b(official\s*(music\s*)?video|full\s*video)\b/i.test(t.title));
-    const musicVideos = cleanTrackPool(musicVideosRaw, true).slice(0, 16);
+    const musicVideos = cleanTrackPool(musicVideosRaw, true).slice(0, 12);
 
     const officialPoster = await officialPosterPromise;
     if (officialPoster) {
@@ -2125,7 +2125,7 @@ export async function getArtistProfile(
     };
 
     artistCache.set(cacheKey, profile);
-    artistCache.set(`v3::${artistName.toLowerCase()}::`, profile);
+    artistCache.set(`v4::${artistName.toLowerCase()}::`, profile);
     return profile;
   });
 }
@@ -2134,25 +2134,34 @@ export async function getArtistCategorySongs(options: {
   artistName: string;
   category?: string;
   page?: number;
+  excludeIds?: string[];
+  excludeTitles?: string[];
 }): Promise<{ tracks: Track[]; hasMore: boolean }> {
   const artistName = decodeHtmlEntities(options.artistName || '').trim().slice(0, 100);
   if (!artistName) return { tracks: [], hasMore: false };
 
   const category = (options.category || 'all').toLowerCase();
   const page = Math.max(1, options.page ?? 1);
+  const excludeIdSet = new Set<string>((options.excludeIds || []).map((id) => String(id).trim()).filter(Boolean));
+  const excludeTitleSet = new Set<string>(
+    (options.excludeTitles || []).map((t) => normalizeSongKey(String(t))).filter(Boolean)
+  );
 
   if (category === 'videos') {
     if (hasConfiguredYoutubeKeys() && hasAvailableSearchKey()) {
       try {
         const ytVideos = await searchYouTubeTracks({
-          query: `${artistName} official music video`,
+          query: `${artistName} official music video ${page > 1 ? `hits vol ${page}` : ''}`.trim(),
           type: 'videos',
-          maxResults: 20,
+          maxResults: 16,
           skipLanguageBias: true,
         });
+        const filtered = ytVideos
+          .filter((t) => !excludeIdSet.has(t.id) && !excludeTitleSet.has(normalizeSongKey(t.title)))
+          .map((t) => ({ ...t, isVideo: true }));
         return {
-          tracks: ytVideos.map((t) => ({ ...t, isVideo: true })),
-          hasMore: false,
+          tracks: filtered,
+          hasMore: filtered.length >= 6 && page < 10,
         };
       } catch {
         // fallback below
@@ -2161,35 +2170,14 @@ export async function getArtistCategorySongs(options: {
     return { tracks: [], hasMore: false };
   }
 
-  const saavnPromise = fetchSaavnArtistCatalog(artistName, {
+  const saavnItems = await fetchSaavnArtistCatalog(artistName, {
     category,
     page,
-    limit: 52,
+    limit: 18,
+    excludeIds: excludeIdSet,
+    excludeTitles: options.excludeTitles || [],
   }).catch(() => []);
 
-  let ytTracks: Track[] = [];
-  if (page === 1 && category !== 'all' && hasConfiguredYoutubeKeys() && hasAvailableSearchKey()) {
-    const moodSuffix =
-      category === 'romantic'
-        ? 'romantic love songs'
-        : category === 'sad'
-          ? 'sad heartbreak songs'
-          : category === 'chill'
-            ? 'chill unplugged acoustic songs'
-            : category === 'energetic'
-              ? 'party upbeat dance songs'
-              : category === 'classics'
-                ? 'evergreen classic 90s songs'
-                : 'top hit songs';
-    ytTracks = await searchYouTubeTracks({
-      query: `${artistName} ${moodSuffix}`,
-      type: 'songs',
-      maxResults: 16,
-      skipLanguageBias: true,
-    }).catch(() => []);
-  }
-
-  const saavnItems = await saavnPromise;
   const saavnTracks: Track[] = saavnItems.map((item) => ({
     id: item.id,
     title: item.title,
@@ -2201,11 +2189,11 @@ export async function getArtistCategorySongs(options: {
     durationSeconds: item.durationSeconds,
   }));
 
-  const seenIds = new Set<string>();
-  const seenKeys = new Set<string>();
+  const seenIds = new Set<string>(excludeIdSet);
+  const seenKeys = new Set<string>(excludeTitleSet);
   const combined: Track[] = [];
 
-  for (const t of [...saavnTracks, ...ytTracks]) {
+  for (const t of saavnTracks) {
     if (seenIds.has(t.id)) continue;
     if (isPhonkTrack(t.title, t.channelTitle) || isShortOrSnippetClip(t)) continue;
     if (COMPILATION_TITLE_RE.test(t.title)) continue;
@@ -2218,7 +2206,7 @@ export async function getArtistCategorySongs(options: {
 
   return {
     tracks: combined,
-    hasMore: saavnItems.length >= 16 && page < 6,
+    hasMore: combined.length >= 4 && page < 35,
   };
 }
 
